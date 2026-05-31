@@ -41,11 +41,12 @@ impl EdgeId {
     }
 }
 
-/// A basic edge in the spanning tree with its active flow.
+/// A basic edge in the spanning tree with its active flow and static cost.
 #[derive(Debug, Clone)]
 pub struct BasicEdge {
     pub id: EdgeId,
     pub flow: f64,
+    pub cost: f64,
 }
 
 /// An entry in the adjacency list representing a spanning tree edge.
@@ -202,10 +203,9 @@ impl SparseReconciler {
     }
 
     /// Rebuilds parents, depths, potentials, and child lists from `basis_edges` using BFS.
-    fn rebuild_tree<F>(&mut self, cost_fn: &F)
-    where
-        F: Fn(usize, usize) -> f64,
-    {
+    ///
+    /// This runs completely allocation-free and uses static stored costs inside `basis_edges`.
+    fn rebuild_tree(&mut self) {
         let root = self.dummy_source();
 
         for child_list in &mut self.children {
@@ -254,7 +254,7 @@ impl SparseReconciler {
                     self.depth[v] = self.depth[u] + 1;
                     self.children[u].push(v);
 
-                    let cost = self.edge_cost(self.basis_edges[entry.edge_idx].id, cost_fn);
+                    let cost = self.basis_edges[entry.edge_idx].cost;
                     if entry.is_forward_from_curr {
                         self.potentials[v] = self.potentials[u] + cost;
                     } else {
@@ -403,24 +403,29 @@ impl SparseReconciler {
             for u in 0..m {
                 let user_idx = self.source_map[u];
                 let val = self.supplies[user_idx];
+                let penalty = self.unmatched_penalties[user_idx];
                 basis_edges.push(BasicEdge {
                     id: EdgeId::SourceToDummySink { source: u },
                     flow: val,
+                    cost: penalty,
                 });
             }
             
             for v in 0..n {
                 let user_idx = self.sink_map[v];
                 let val = self.supplies[user_idx].abs();
+                let penalty = self.unmatched_penalties[user_idx];
                 basis_edges.push(BasicEdge {
                     id: EdgeId::DummySourceToSink { sink: m + v },
                     flow: val,
+                    cost: penalty,
                 });
             }
             
             basis_edges.push(BasicEdge {
                 id: EdgeId::DummySourceToDummySink,
                 flow: 0.0,
+                cost: 0.0,
             });
             
             self.basis_edges = basis_edges;
@@ -439,7 +444,7 @@ impl SparseReconciler {
             }
             iterations += 1;
 
-            self.rebuild_tree(&cost_fn);
+            self.rebuild_tree();
 
             let entering = self.find_entering_arc(&cost_fn);
             if entering.is_none() {
@@ -530,9 +535,11 @@ impl SparseReconciler {
                 }
             }
 
+            let entering_cost = self.edge_cost(entering, &cost_fn);
             self.basis_edges[lei] = BasicEdge {
                 id: entering,
                 flow: theta,
+                cost: entering_cost,
             };
         }
 
