@@ -22,7 +22,11 @@ use std::time::Instant;
 struct IntercoTx {
     row: usize,
     policy: Policy,
+    co: String,
+    objsub: String,
+    icp: String,
     reference: String,
+    description: String,
     business_unit: String,
     gl_date_days: i64,
     usd_amt: f64,
@@ -44,7 +48,11 @@ impl IntercoTx {
             _ => return None,
         };
 
+        let co = record.get(3)?.trim().to_string();
+        let objsub = record.get(6)?.trim().to_string();
+        let icp = record.get(13)?.trim().to_string();
         let reference = record.get(20)?.trim().to_string();
+        let description = record.get(22)?.trim().to_string();
         let business_unit = record.get(37)?.trim().to_string();
 
         let fc_amt: f64 = record.get(27)?.parse().ok()?;
@@ -68,7 +76,11 @@ impl IntercoTx {
         Some(IntercoTx {
             row,
             policy,
+            co,
+            objsub,
+            icp,
             reference,
+            description,
             business_unit,
             gl_date_days,
             usd_amt: signed_usd,
@@ -119,46 +131,51 @@ fn compute_cost(a: &IntercoTx, b: &IntercoTx) -> f64 {
         return f64::MAX;
     }
 
-    let mut cost = 0.0;
+    // Start with baseline metadata cost
+    let mut metadata_cost = 100.0;
 
-    // Reference match — only if BOTH have meaningful, non-generic references
+    // 1. if (co,icp) on one side = (icp,co) on the other side, high prior
+    // Normalize by trimming and stripping leading zeroes to ensure robust match (e.g. "1" vs "001")
+    let co_a = a.co.trim().trim_start_matches('0');
+    let icp_a = a.icp.trim().trim_start_matches('0');
+    let co_b = b.co.trim().trim_start_matches('0');
+    let icp_b = b.icp.trim().trim_start_matches('0');
+    if !co_a.is_empty() && !icp_a.is_empty() && co_a == icp_b && icp_a == co_b {
+        metadata_cost *= 0.05; // 95% discount
+    }
+
+    // 2. if (objsub) = (objsub), high prior
+    let objsub_a = a.objsub.trim();
+    let objsub_b = b.objsub.trim();
+    if !objsub_a.is_empty() && objsub_a == objsub_b {
+        metadata_cost *= 0.1; // 90% discount
+    }
+
+    // 3. if reference equal, high prior (but less so than the above)
     let ref_a = a.reference.trim();
     let ref_b = b.reference.trim();
     let is_meaningful = |r: &str| !r.is_empty() && r != "nan" && r != "AGGREGATED OPENING BALANCE";
-
-    let ref_match = is_meaningful(ref_a) && is_meaningful(ref_b) && ref_a == ref_b;
-    if ref_match {
-        cost += 0.01;
-    } else {
-        cost += 100.0;
+    if is_meaningful(ref_a) && is_meaningful(ref_b) && ref_a == ref_b {
+        metadata_cost *= 0.2; // 80% discount
     }
 
-    // Partial prefix match
-    if !ref_match && is_meaningful(ref_a) && is_meaningful(ref_b) {
-        let pre_a = ref_a.split('/').next().unwrap_or("");
-        let pre_b = ref_b.split('/').next().unwrap_or("");
-        if !pre_a.is_empty() && pre_a == pre_b {
-            cost -= 30.0;
-        }
+    // 4. if (reference) = (description), high prior
+    let desc_a = a.description.trim();
+    let desc_b = b.description.trim();
+    if (is_meaningful(ref_a) && !desc_b.is_empty() && ref_a == desc_b) ||
+       (is_meaningful(ref_b) && !desc_a.is_empty() && ref_b == desc_a) {
+        metadata_cost *= 0.2; // 80% discount
     }
 
-    // Business unit prefix (first 3 chars = company code)
-    if a.business_unit.len() >= 3 && b.business_unit.len() >= 3 {
-        if a.business_unit[..3] == b.business_unit[..3] {
-            cost += 1.0;
-        } else {
-            cost += 50.0;
-        }
-    }
-
-    // Value similarity
-    cost += log_value_difference(a.usd_amt.abs(), b.usd_amt.abs()) * 10.0;
+    // Value based costs: simple log based
+    let value_cost = log_value_difference(a.usd_amt.abs(), b.usd_amt.abs()) * 10.0;
 
     // Date proximity
     let date_diff = (a.gl_date_days - b.gl_date_days).abs() as f64;
-    cost += date_diff.min(365.0);
+    let date_cost = date_diff.min(365.0);
 
-    cost.max(0.0)
+    // Final cost = metadata_cost (multiplicative) + value_cost + date_cost
+    (metadata_cost + value_cost + date_cost).max(0.0)
 }
 
 // ---------------------------------------------------------------------------
