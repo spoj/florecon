@@ -333,8 +333,12 @@ impl SparseReconciler {
                     if self.basic_sinks[u].contains(&sink_node) {
                         continue;
                     }
+                    let pot_diff = self.potentials[sink_node] - self.potentials[u];
+                    if pot_diff <= -best_rc {
+                        continue;
+                    }
                     let cost = cost_fn(u_user, self.sink_map[v]);
-                    let rc = cost - self.potentials[sink_node] + self.potentials[u];
+                    let rc = cost - pot_diff;
                     if rc < best_rc {
                         best_rc = rc;
                         best_edge = Some(EdgeId::Real { source: u, sink: sink_node });
