@@ -555,8 +555,14 @@ fn main() {
         .unwrap_or("data/ledger.csv");
     let filter_co = args.get(2).cloned();
 
+    let filter_cos: Option<Vec<String>> = filter_co.as_ref().map(|s| {
+        s.split(',')
+            .map(|part| part.trim().to_string())
+            .collect()
+    });
+
     if let Some(ref filter) = filter_co {
-        println!("Loading intercompany data from: {} (filtered by company: {})", path, filter);
+        println!("Loading intercompany data from: {} (filtered by company list: {})", path, filter);
     } else {
         println!("Loading intercompany data from: {}", path);
     }
@@ -575,9 +581,12 @@ fn main() {
             let row = row_res.expect("Failed to read Parquet row");
             if let Some(tx) = IntercoTx::from_parquet_row(row_idx, &row) {
                 if tx.usd_amt.abs() > 0.01 {
-                    if let Some(ref filter) = filter_co {
-                        let filter_clean = filter.trim().trim_start_matches('0');
-                        if tx.co_cleaned == filter_clean || tx.co.trim() == filter.trim() {
+                    if let Some(ref filters) = filter_cos {
+                        let matched = filters.iter().any(|filter| {
+                            let filter_clean = filter.trim_start_matches('0');
+                            tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
+                        });
+                        if matched {
                             transactions.push(tx);
                         }
                     } else {
@@ -593,9 +602,12 @@ fn main() {
             let record = result.expect("Failed to read CSV record");
             if let Some(tx) = IntercoTx::from_csv_record(row_idx + 2, &record) {
                 if tx.usd_amt.abs() > 0.01 {
-                    if let Some(ref filter) = filter_co {
-                        let filter_clean = filter.trim().trim_start_matches('0');
-                        if tx.co_cleaned == filter_clean || tx.co.trim() == filter.trim() {
+                    if let Some(ref filters) = filter_cos {
+                        let matched = filters.iter().any(|filter| {
+                            let filter_clean = filter.trim_start_matches('0');
+                            tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
+                        });
+                        if matched {
                             transactions.push(tx);
                         }
                     } else {
