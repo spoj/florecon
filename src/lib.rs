@@ -57,7 +57,7 @@ pub struct AdjEntry {
     pub is_forward_from_curr: bool,
 }
 
-/// A stateful dense/all-to-all reconciler that expects a cost closure.
+/// A stateful sparse reconciler that expects user-specified candidate edges.
 ///
 /// This maintains an optimal basis tree and flow solution from previous runs, allowing
 /// incremental re-optimization (warm start) when given a new cost function.
@@ -77,7 +77,6 @@ pub struct SparseReconciler {
     children: Vec<Vec<usize>>,
     
     // Pricing state
-    next_source_to_scan: usize,
     has_run: bool,
 
     // Reusable allocation-free buffers
@@ -90,82 +89,178 @@ pub struct SparseReconciler {
     dummy_source_to_dummy_sink_basic: bool,
     path_u: Vec<usize>,
     path_v: Vec<usize>,
+
+    // Sparse custom-edge pricing state storing (u_internal, v_internal, cost)
+    candidate_edges: Vec<(usize, usize, f64)>,
+    next_edge_to_scan: usize,
+}
+
+impl Default for SparseReconciler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SparseReconciler {
-    /// Create a new stateful solver instance.
-    ///
-    /// - `supplies`: Supply or demand values for each node.
-    /// - `unmatched_penalties`: The penalty for leaving each node unmatched.
-    pub fn new(
-        supplies: Vec<f64>,
-        unmatched_penalties: Vec<f64>,
-    ) -> Self {
-        assert_eq!(
-            supplies.len(),
-            unmatched_penalties.len(),
-            "supplies and unmatched_penalties must have the same length"
-        );
-        let sanitized_penalties: Vec<f64> = unmatched_penalties
-            .iter()
-            .map(|&p| p.max(0.0))
-            .collect();
+    /// Create a new empty stateful solver instance.
+    pub fn new() -> Self {
+        Self {
+            supplies: Vec::new(),
+            unmatched_penalties: Vec::new(),
+            source_map: Vec::new(),
+            sink_map: Vec::new(),
+            basis_edges: Vec::new(),
+            potentials: Vec::new(),
+            parent: Vec::new(),
+            parent_edge_idx: Vec::new(),
+            parent_direction_forward: Vec::new(),
+            depth: Vec::new(),
+            children: Vec::new(),
+            has_run: false,
+            adj: Vec::new(),
+            visited: Vec::new(),
+            queue: std::collections::VecDeque::new(),
+            basic_sinks: Vec::new(),
+            source_to_dummy_sink_basic: Vec::new(),
+            dummy_source_to_sink_basic: Vec::new(),
+            dummy_source_to_dummy_sink_basic: false,
+            path_u: Vec::new(),
+            path_v: Vec::new(),
+            candidate_edges: Vec::new(),
+            next_edge_to_scan: 0,
+        }
+    }
 
-        let mut source_map = Vec::new();
-        let mut sink_map = Vec::new();
+    /// Safely updates the entire solver input dataset in one atomic, validated operation.
+    /// Returns Some(()) if valid, or None if any input invariant is violated.
+    pub fn update(
+        &mut self,
+        supplies: &[f64],
+        penalties: &[f64],
+        edges: &[(usize, usize, f64)],
+    ) -> Option<()> {
+        // 1. INVARIANT CHECK: Supplies and penalties must be equal in length
+        if supplies.len() != penalties.len() {
+            return None;
+        }
 
-        for (idx, &val) in supplies.iter().enumerate() {
-            if val > 0.0 {
-                source_map.push(idx);
-            } else if val < 0.0 {
-                sink_map.push(idx);
+        // 2. INVARIANT CHECK: Validate all user-facing edge indices and signs
+        let n_nodes = supplies.len();
+        for &(u_user, v_user, _cost) in edges {
+            if u_user >= n_nodes || v_user >= n_nodes {
+                return None; // Out of bounds
+            }
+            if supplies[u_user] <= 0.0 || supplies[v_user] >= 0.0 {
+                return None; // u_user must be a source, v_user must be a sink
             }
         }
 
-        let m = source_map.len();
-        let n = sink_map.len();
-        let num_nodes = m + n + 2;
-
-        let potentials = vec![0.0; num_nodes];
-        let parent = vec![0; num_nodes];
-        let parent_edge_idx = vec![0; num_nodes];
-        let parent_direction_forward = vec![true; num_nodes];
-        let depth = vec![0; num_nodes];
-        let children = vec![Vec::new(); num_nodes];
-
-        let adj = vec![Vec::new(); num_nodes];
-        let visited = vec![false; num_nodes];
-        let queue = std::collections::VecDeque::with_capacity(num_nodes);
-        let basic_sinks = vec![Vec::new(); m];
-        let source_to_dummy_sink_basic = vec![false; m];
-        let dummy_source_to_sink_basic = vec![false; n];
-        let path_u = Vec::with_capacity(num_nodes);
-        let path_v = Vec::with_capacity(num_nodes);
-
-        Self {
-            supplies,
-            unmatched_penalties: sanitized_penalties,
-            source_map,
-            sink_map,
-            basis_edges: Vec::new(),
-            potentials,
-            parent,
-            parent_edge_idx,
-            parent_direction_forward,
-            depth,
-            children,
-            next_source_to_scan: 0,
-            has_run: false,
-            adj,
-            visited,
-            queue,
-            basic_sinks,
-            source_to_dummy_sink_basic,
-            dummy_source_to_sink_basic,
-            dummy_source_to_dummy_sink_basic: false,
-            path_u,
-            path_v,
+        // 3. Build new node mappings based on the new supplies
+        let mut new_source_map = Vec::new();
+        let mut new_sink_map = Vec::new();
+        for (idx, &val) in supplies.iter().enumerate() {
+            if val > 0.0 {
+                new_source_map.push(idx);
+            } else if val < 0.0 {
+                new_sink_map.push(idx);
+            }
         }
+
+        // 4. Check if the active node structure has changed
+        let node_mapping_identical = (new_source_map == self.source_map) && (new_sink_map == self.sink_map);
+        
+        // Check if supply values actually changed
+        let supplies_changed = self.supplies != supplies;
+
+        if !node_mapping_identical || supplies_changed {
+            // A change in node structure or supplies requires rebuilding the initial basis tree (cold start)
+            self.has_run = false;
+        }
+
+        if !node_mapping_identical {
+            self.source_map = new_source_map;
+            self.sink_map = new_sink_map;
+
+            // Re-allocate / resize internal buffers to match the new dimensions
+            let m = self.source_map.len();
+            let n = self.sink_map.len();
+            let num_nodes = m + n + 2;
+
+            self.potentials.resize(num_nodes, 0.0);
+            self.parent.resize(num_nodes, 0);
+            self.parent_edge_idx.resize(num_nodes, 0);
+            self.parent_direction_forward.resize(num_nodes, true);
+            self.depth.resize(num_nodes, 0);
+            self.children.resize(num_nodes, Vec::new());
+
+            self.adj.resize(num_nodes, Vec::new());
+            self.visited.resize(num_nodes, false);
+            self.queue = std::collections::VecDeque::with_capacity(num_nodes);
+            self.basic_sinks.resize(m, Vec::new());
+            self.source_to_dummy_sink_basic.resize(m, false);
+            self.dummy_source_to_sink_basic.resize(n, false);
+            self.path_u = Vec::with_capacity(num_nodes);
+            self.path_v = Vec::with_capacity(num_nodes);
+        }
+
+        // 5. Update local buffers (zero-allocation copy)
+        self.supplies.clear();
+        self.supplies.extend_from_slice(supplies);
+
+        self.unmatched_penalties.clear();
+        let sanitized_penalties: Vec<f64> = penalties
+            .iter()
+            .map(|&p| p.max(0.0))
+            .collect();
+        self.unmatched_penalties.extend_from_slice(&sanitized_penalties);
+
+        // 6. Map and cache new candidate edges
+        self.candidate_edges.clear();
+        for &(u_user, v_user, cost) in edges {
+            let u = self.source_map.binary_search(&u_user).unwrap();
+            let v = self.sink_map.binary_search(&v_user).unwrap();
+            self.candidate_edges.push((u, v, cost));
+        }
+        self.next_edge_to_scan = 0;
+
+        // 7. WARM-START REPAIR (If node mapping did not change and we are reusing basis)
+        if node_mapping_identical && self.has_run {
+            let m = self.source_map.len();
+            
+            // Re-map basis edge costs using the new static candidate costs
+            for edge in &mut self.basis_edges {
+                match edge.id {
+                    EdgeId::Real { source, sink } => {
+                        if let Some(cand_idx) = self.candidate_edges.iter().position(|&(u, v, _)| u == source && v == sink - m) {
+                            edge.cost = self.candidate_edges[cand_idx].2;
+                        }
+                    }
+                    EdgeId::DummySourceToSink { sink } => {
+                        let v_user = self.sink_map[sink - m];
+                        edge.cost = self.unmatched_penalties[v_user];
+                    }
+                    EdgeId::SourceToDummySink { source } => {
+                        let u_user = self.source_map[source];
+                        edge.cost = self.unmatched_penalties[u_user];
+                    }
+                    EdgeId::DummySourceToDummySink => {
+                        edge.cost = 0.0;
+                    }
+                }
+            }
+        }
+
+        Some(())
+    }
+
+    /// Returns the original user-facing indices of all registered source nodes.
+    pub fn sources(&self) -> &[usize] {
+        &self.source_map
+    }
+
+    /// Returns the original user-facing indices of all registered sink nodes.
+    pub fn sinks(&self) -> &[usize] {
+        &self.sink_map
     }
 
     #[inline]
@@ -179,16 +274,15 @@ impl SparseReconciler {
     }
 
     #[inline]
-    fn edge_cost<F>(&self, id: EdgeId, cost_fn: &F) -> f64
-    where
-        F: Fn(usize, usize) -> f64,
-    {
+    fn edge_cost(&self, id: EdgeId) -> f64 {
         let m = self.source_map.len();
         match id {
             EdgeId::Real { source, sink } => {
-                let u_user = self.source_map[source];
-                let v_user = self.sink_map[sink - m];
-                cost_fn(u_user, v_user)
+                if let Some(pos) = self.candidate_edges.iter().position(|&(u, v, _)| u == source && v == sink) {
+                    self.candidate_edges[pos].2
+                } else {
+                    0.0
+                }
             }
             EdgeId::DummySourceToSink { sink } => {
                 let v_user = self.sink_map[sink - m];
@@ -267,11 +361,8 @@ impl SparseReconciler {
         }
     }
 
-    /// Finds an entering arc using rolling block partial-pricing.
-    fn find_entering_arc<F>(&mut self, cost_fn: &F) -> Option<EdgeId>
-    where
-        F: Fn(usize, usize) -> f64,
-    {
+    /// Finds an entering arc using rolling block partial-pricing over user-specified sparse candidate edges.
+    fn find_entering_arc(&mut self) -> Option<EdgeId> {
         let m = self.source_map.len();
         let n = self.sink_map.len();
         let dummy_src = self.dummy_source();
@@ -301,52 +392,37 @@ impl SparseReconciler {
             }
         }
 
-        let block_size = (65_536 / n).max(1).min(16).min(m);
+        let num_candidates = self.candidate_edges.len();
         let mut best_edge = None;
         let mut best_rc = -1e-12;
 
-        let gcd = |mut x: usize, mut y: usize| {
-            while y != 0 {
-                let temp = y;
-                y = x % y;
-                x = temp;
-            }
-            x
-        };
+        if num_candidates > 0 {
+            let block_size = 256.min(num_candidates);
+            let mut edges_scanned = 0;
+            while edges_scanned < num_candidates {
+                let start = self.next_edge_to_scan;
+                let end = (start + block_size).min(num_candidates);
+                let chunk_len = end - start;
 
-        let mut a_prime = 999983;
-        while gcd(a_prime, m) != 1 {
-            a_prime += 1;
-        }
-
-        let mut sources_scanned = 0;
-        while sources_scanned < m {
-            let start = self.next_source_to_scan;
-            let end = (start + block_size).min(m);
-            let chunk_len = end - start;
-
-            for k in start..end {
-                let u = (k * a_prime) % m;
-                let u_user = self.source_map[u];
-                for v in 0..n {
+                for k in start..end {
+                    let (u, v, cost) = self.candidate_edges[k];
                     let sink_node = m + v;
                     if self.basic_sinks[u].contains(&sink_node) {
                         continue;
                     }
-                    let cost = cost_fn(u_user, self.sink_map[v]);
                     let rc = cost - self.potentials[sink_node] + self.potentials[u];
                     if rc < best_rc {
                         best_rc = rc;
                         best_edge = Some(EdgeId::Real { source: u, sink: sink_node });
                     }
                 }
-            }
 
-            self.next_source_to_scan = if end == m { 0 } else { end };
-            sources_scanned += chunk_len;
+                self.next_edge_to_scan = if end == num_candidates { 0 } else { end };
+                edges_scanned += chunk_len;
 
-            if best_edge.is_some() {
-                return best_edge;
+                if best_edge.is_some() {
+                    return best_edge;
+                }
             }
         }
 
@@ -383,13 +459,8 @@ impl SparseReconciler {
         best_edge
     }
 
-    /// Solves or re-solves the transportation problem.
-    ///
-    /// Uses the warm start solution if it was already run.
-    pub fn solve<F>(&mut self, cost_fn: F) -> Vec<SparseMatch>
-    where
-        F: Fn(usize, usize) -> f64,
-    {
+    /// Solves the transportation problem statefully based on the current validated input dataset.
+    pub fn solve(&mut self) -> Vec<SparseMatch> {
         let m = self.source_map.len();
         let n = self.sink_map.len();
 
@@ -397,6 +468,7 @@ impl SparseReconciler {
             return Vec::new();
         }
 
+        // Safety check: If solver has never run, or node mapping changed, we must build the initial basis tree
         if !self.has_run {
             let mut basis_edges = Vec::with_capacity(m + n + 1);
             
@@ -446,7 +518,7 @@ impl SparseReconciler {
 
             self.rebuild_tree();
 
-            let entering = self.find_entering_arc(&cost_fn);
+            let entering = self.find_entering_arc();
             if entering.is_none() {
                 debug!("Optimal after {} iterations (incremental)", iterations);
                 break;
@@ -535,7 +607,7 @@ impl SparseReconciler {
                 }
             }
 
-            let entering_cost = self.edge_cost(entering, &cost_fn);
+            let entering_cost = self.edge_cost(entering);
             self.basis_edges[lei] = BasicEdge {
                 id: entering,
                 flow: theta,
@@ -545,8 +617,8 @@ impl SparseReconciler {
 
         let mut matches = Vec::new();
         for edge in &self.basis_edges {
-            if edge.flow > 1e-9 {
-                if let EdgeId::Real { source, sink } = edge.id {
+            if edge.flow > 1e-9
+                && let EdgeId::Real { source, sink } = edge.id {
                     let source_idx = self.source_map[source];
                     let sink_idx = self.sink_map[sink - m];
                     matches.push(SparseMatch {
@@ -555,7 +627,6 @@ impl SparseReconciler {
                         flow: edge.flow,
                     });
                 }
-            }
         }
 
         matches
@@ -575,8 +646,9 @@ mod tests {
         let supplies = vec![100.0, -100.0];
         let penalties = vec![1e6, 1e6];
 
-        let mut recon = SparseReconciler::new(supplies, penalties);
-        let matches = recon.solve(|_i, _j| 1.0);
+        let mut recon = SparseReconciler::new();
+        recon.update(&supplies, &penalties, &[(0, 1, 1.0)]).unwrap();
+        let matches = recon.solve();
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].source_idx, 0);
@@ -589,8 +661,9 @@ mod tests {
         let supplies = vec![100.0, -50.0];
         let penalties = vec![1e6, 1e6];
 
-        let mut recon = SparseReconciler::new(supplies, penalties);
-        let matches = recon.solve(|_i, _j| 1.0);
+        let mut recon = SparseReconciler::new();
+        recon.update(&supplies, &penalties, &[(0, 1, 1.0)]).unwrap();
+        let matches = recon.solve();
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].source_idx, 0);
@@ -603,22 +676,42 @@ mod tests {
         let supplies = vec![100.0, 50.0, -100.0, -50.0];
         let penalties = vec![10000.0; 4];
 
-        let mut recon = SparseReconciler::new(supplies, penalties);
+        let mut recon = SparseReconciler::new();
+        let all_edges = vec![(0, 2, 10.0), (0, 3, 10.0), (1, 2, 10.0), (1, 3, 10.0)];
+        recon.update(&supplies, &penalties, &all_edges).unwrap();
         
-        let matches1 = recon.solve(|_i, _j| 10.0);
+        let matches1 = recon.solve();
         assert!(matches1.len() == 2 || matches1.len() == 3);
 
-        let matches2 = recon.solve(|i, j| {
-            if (i == 0 && j == 2) || (i == 1 && j == 3) {
-                1.0
-            } else {
-                10.0
-            }
-        });
+        let new_edges = vec![(0, 2, 1.0), (0, 3, 10.0), (1, 2, 10.0), (1, 3, 1.0)];
+        recon.update(&supplies, &penalties, &new_edges).unwrap();
+        let matches2 = recon.solve();
+        println!("matches2: {:?}", matches2);
         assert_eq!(matches2.len(), 2);
         
         let mut match_map = std::collections::HashMap::new();
         for m in matches2 {
+            match_map.insert(m.source_idx, m.sink_idx);
+        }
+        assert_eq!(match_map.get(&0), Some(&2));
+        assert_eq!(match_map.get(&1), Some(&3));
+    }
+
+    #[test]
+    fn test_solve_sparse() {
+        let supplies = vec![100.0, 50.0, -100.0, -50.0];
+        let penalties = vec![10000.0; 4];
+
+        let mut recon = SparseReconciler::new();
+        let allowed_edges = vec![(0, 2, 10.0), (1, 3, 10.0)];
+        recon.update(&supplies, &penalties, &allowed_edges).unwrap();
+        
+        let matches = recon.solve();
+        
+        assert_eq!(matches.len(), 2);
+        
+        let mut match_map = std::collections::HashMap::new();
+        for m in matches {
             match_map.insert(m.source_idx, m.sink_idx);
         }
         assert_eq!(match_map.get(&0), Some(&2));

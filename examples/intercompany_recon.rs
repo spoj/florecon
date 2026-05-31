@@ -18,6 +18,7 @@ use std::time::Instant;
 // Client-side Data Model
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct IntercoTx {
     row: usize,
@@ -325,18 +326,26 @@ fn print_report(matches: &[florecon::SparseMatch], txs: &[IntercoTx], unmatched_
         .sum();
     let total_input_abs: f64 = txs.iter().map(|t| t.usd_amt.abs()).sum();
 
+    let mut matched_set = HashSet::new();
+    for m in matches {
+        matched_set.insert(m.source_idx);
+        matched_set.insert(m.sink_idx);
+    }
+    let matched_rows_count = matched_set.len();
+    let unmatched_rows_count = txs.len() - matched_rows_count;
+
     println!("\n  📊 SUMMARY");
     println!("  ──────────────────────────────────────────────────────────────────────────");
     println!("  Total input rows:        {:>5}", txs.len());
     println!(
         "  Matched rows:            {:>5}  ({:.1}%)",
-        matches.len() * 2,
-        100.0 * (matches.len() * 2) as f64 / txs.len() as f64
+        matched_rows_count,
+        100.0 * matched_rows_count as f64 / txs.len() as f64
     );
     println!(
         "  Unmatched rows:          {:>5}  ({:.1}%)",
-        unmatched_indices.len(),
-        100.0 * unmatched_indices.len() as f64 / txs.len() as f64
+        unmatched_rows_count,
+        100.0 * unmatched_rows_count as f64 / txs.len() as f64
     );
     println!("  Total matches found:     {:>5}", matches.len());
     println!(
@@ -554,6 +563,10 @@ fn main() {
         .map(|s| s.as_str())
         .unwrap_or("data/ledger.csv");
     let filter_co = args.get(2).cloned();
+    let row_offset: usize = args
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
 
     let filter_cos: Option<Vec<String>> = filter_co.as_ref().map(|s| {
         s.split(',')
@@ -562,9 +575,9 @@ fn main() {
     });
 
     if let Some(ref filter) = filter_co {
-        println!("Loading intercompany data from: {} (filtered by company list: {})", path, filter);
+        println!("Loading intercompany data from: {} (filtered by company list: {}, row offset: {})", path, filter, row_offset);
     } else {
-        println!("Loading intercompany data from: {}", path);
+        println!("Loading intercompany data from: {} (row offset: {})", path, row_offset);
     }
 
     let mut transactions: Vec<IntercoTx> = Vec::new();
@@ -574,18 +587,26 @@ fn main() {
         let file = std::fs::File::open(path).expect("Failed to open Parquet file");
         let reader = parquet::file::reader::SerializedFileReader::new(file)
             .expect("Failed to create Parquet reader");
-        let mut row_iter = reader.get_row_iter(None).expect("Failed to get row iterator");
+        let row_iter = reader.get_row_iter(None).expect("Failed to get row iterator");
         
-        let mut row_idx = 0;
-        while let Some(row_res) = row_iter.next() {
+        for (row_idx, row_res) in row_iter.enumerate() {
             let row = row_res.expect("Failed to read Parquet row");
-            if let Some(tx) = IntercoTx::from_parquet_row(row_idx, &row) {
-                if tx.usd_amt.abs() > 0.01 {
+            if let Some(tx) = IntercoTx::from_parquet_row(row_idx, &row)
+                && tx.usd_amt.abs() > 0.01 {
                     if let Some(ref filters) = filter_cos {
-                        let matched = filters.iter().any(|filter| {
+                        let co_matched = filters.iter().any(|filter| {
                             let filter_clean = filter.trim_start_matches('0');
                             tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
                         });
+                        let icp_matched = filters.iter().any(|filter| {
+                            let filter_clean = filter.trim_start_matches('0');
+                            tx.icp_cleaned == filter_clean || tx.icp.trim() == filter.as_str()
+                        });
+                        let matched = if filters.len() > 1 {
+                            co_matched && icp_matched
+                        } else {
+                            co_matched
+                        };
                         if matched {
                             transactions.push(tx);
                         }
@@ -593,20 +614,27 @@ fn main() {
                         transactions.push(tx);
                     }
                 }
-            }
-            row_idx += 1;
         }
     } else {
         let mut rdr = csv::Reader::from_path(path).expect("Failed to open CSV");
         for (row_idx, result) in rdr.records().enumerate() {
             let record = result.expect("Failed to read CSV record");
-            if let Some(tx) = IntercoTx::from_csv_record(row_idx + 2, &record) {
-                if tx.usd_amt.abs() > 0.01 {
+            if let Some(tx) = IntercoTx::from_csv_record(row_idx + 2, &record)
+                && tx.usd_amt.abs() > 0.01 {
                     if let Some(ref filters) = filter_cos {
-                        let matched = filters.iter().any(|filter| {
+                        let co_matched = filters.iter().any(|filter| {
                             let filter_clean = filter.trim_start_matches('0');
                             tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
                         });
+                        let icp_matched = filters.iter().any(|filter| {
+                            let filter_clean = filter.trim_start_matches('0');
+                            tx.icp_cleaned == filter_clean || tx.icp.trim() == filter.as_str()
+                        });
+                        let matched = if filters.len() > 1 {
+                            co_matched && icp_matched
+                        } else {
+                            co_matched
+                        };
                         if matched {
                             transactions.push(tx);
                         }
@@ -614,12 +642,19 @@ fn main() {
                         transactions.push(tx);
                     }
                 }
-            }
         }
     }
 
     let n = transactions.len();
     println!("Loaded {} transactions", n);
+
+    // 1. Sort the transactions by gl_date_days, and secondarily by signed usd_amt.
+    transactions.sort_by(|a, b| {
+        a.gl_date_days.cmp(&b.gl_date_days)
+            .then_with(|| {
+                a.usd_amt.partial_cmp(&b.usd_amt).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
 
     let ar_count = transactions
         .iter()
@@ -661,26 +696,42 @@ fn main() {
     let supplies: Vec<f64> = transactions.iter().map(|t| t.usd_amt).collect();
     let penalties = vec![1_000_000.0; n];
 
+    // 2. Generate sparse candidate edges within configurable row offset with pre-computed costs
+    let mut candidate_edges = Vec::new();
+    for i in 0..n {
+        if transactions[i].usd_amt > 0.0 {
+            let start = i.saturating_sub(row_offset);
+            let end = (i + row_offset).min(n - 1);
+            for j in start..=end {
+                if transactions[j].usd_amt < 0.0 {
+                    let s = &transactions[i];
+                    let t = &transactions[j];
+
+                    // Compute cost
+                    let mut cost = compute_cost(s, t);
+
+                    // Apply date-diff and value-ratio filters
+                    if (s.gl_date_days - t.gl_date_days).abs() > max_date_diff {
+                        cost = 1_000_000_000.0;
+                    }
+                    let ratio = s.usd_amt.abs().max(t.usd_amt.abs())
+                        / s.usd_amt.abs().min(t.usd_amt.abs()).max(0.01);
+                    if ratio > max_value_ratio {
+                        cost = 1_000_000_000.0;
+                    }
+
+                    candidate_edges.push((i, j, cost));
+                }
+            }
+        }
+    }
+
     // --- Solve ---
-    println!("  Solving transportation sparse graph with Network Simplex...");
+    println!("  Solving transportation sparse graph with Network Simplex (edges limit = {}, row offset = {})...", candidate_edges.len(), row_offset);
     let t_solve_start = Instant::now();
-    let mut reconciler = SparseReconciler::new(supplies, penalties);
-    let matches = reconciler.solve(|si, ti| {
-        let s = &transactions[si];
-        let t = &transactions[ti];
-
-        // Apply date-diff and value-ratio filters by returning a high cost
-        if (s.gl_date_days - t.gl_date_days).abs() > max_date_diff {
-            return 1_000_000_000.0;
-        }
-        let ratio = s.usd_amt.abs().max(t.usd_amt.abs())
-            / s.usd_amt.abs().min(t.usd_amt.abs()).max(0.01);
-        if ratio > max_value_ratio {
-            return 1_000_000_000.0;
-        }
-
-        compute_cost(s, t)
-    });
+    let mut reconciler = SparseReconciler::new();
+    reconciler.update(&supplies, &penalties, &candidate_edges).unwrap();
+    let matches = reconciler.solve();
     let t_solve = t_solve_start.elapsed();
     println!("  Solve complete! Took: {:?}", t_solve);
 

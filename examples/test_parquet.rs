@@ -11,12 +11,11 @@ fn main() {
     if let Some(row_res) = row_iter.next() {
         let row = row_res.expect("Row error");
         for (name, field) in row.get_column_iter() {
-            if name == "as_of_date" {
-                if let Field::Date(val) = field {
+            if name == "as_of_date"
+                && let Field::Date(val) = field {
                     let val_typed: i32 = *val; // verify it is i32
                     println!("as_of_date is a u32: {}", val_typed);
                 }
-            }
         }
     }
 }

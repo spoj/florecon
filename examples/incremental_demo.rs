@@ -19,11 +19,18 @@ fn main() {
 
     // Create the stateful solver instance
     println!("Initializing stateful solver...");
-    let mut recon = SparseReconciler::new(supplies, penalties);
+    let mut recon = SparseReconciler::new();
 
     // 1. Initial run: all real edges are expensive ($10.0 cost)
     let t1 = Instant::now();
-    let matches1 = recon.solve(|_i, _j| 10.0);
+    let initial_edges = vec![
+        (0, 2, 10.0),
+        (0, 3, 10.0),
+        (1, 2, 10.0),
+        (1, 3, 10.0),
+    ];
+    recon.update(&supplies, &penalties, &initial_edges).unwrap();
+    let matches1 = recon.solve();
     let duration1 = t1.elapsed();
 
     println!("Run 1 completed in {:?}", duration1);
@@ -43,13 +50,14 @@ fn main() {
 
     println!("Rerunning stateful solver incrementally (warm start)...");
     let t2 = Instant::now();
-    let matches2 = recon.solve(|i, j| {
-        if (i == 0 && j == 2) || (i == 1 && j == 3) {
-            1.0
-        } else {
-            10.0
-        }
-    });
+    let updated_edges = vec![
+        (0, 2, 1.0),
+        (0, 3, 10.0),
+        (1, 2, 10.0),
+        (1, 3, 1.0),
+    ];
+    recon.update(&supplies, &penalties, &updated_edges).unwrap();
+    let matches2 = recon.solve();
     let duration2 = t2.elapsed();
 
     println!("Incremental Run 2 completed in {:?}", duration2);
