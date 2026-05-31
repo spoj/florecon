@@ -30,6 +30,12 @@ struct IntercoTx {
     business_unit: String,
     gl_date_days: i64,
     usd_amt: f64,
+    co_cleaned: String,
+    icp_cleaned: String,
+    objsub_cleaned: String,
+    ref_cleaned: String,
+    desc_cleaned: String,
+    log_value: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,6 +79,13 @@ impl IntercoTx {
         let gl_date_str = record.get(28)?;
         let gl_date_days = parse_date(gl_date_str).unwrap_or(0);
 
+        let co_cleaned = co.trim().trim_start_matches('0').to_string();
+        let icp_cleaned = icp.trim().trim_start_matches('0').to_string();
+        let objsub_cleaned = objsub.trim().to_string();
+        let ref_cleaned = reference.trim().to_string();
+        let desc_cleaned = description.trim().to_string();
+        let log_value = signed_usd.abs().ln_1p();
+
         Some(IntercoTx {
             row,
             policy,
@@ -84,6 +97,133 @@ impl IntercoTx {
             business_unit,
             gl_date_days,
             usd_amt: signed_usd,
+            co_cleaned,
+            icp_cleaned,
+            objsub_cleaned,
+            ref_cleaned,
+            desc_cleaned,
+            log_value,
+        })
+    }
+
+    fn from_parquet_row(row_idx: usize, row: &parquet::record::Row) -> Option<Self> {
+        let mut policy = None;
+        let mut co = String::new();
+        let mut objsub = String::new();
+        let mut icp = String::new();
+        let mut reference = String::new();
+        let mut description = String::new();
+        let mut business_unit = String::new();
+        let mut fc_amt = 0.0;
+        let mut usd_amt = 0.0;
+        let mut gl_date_days = 0;
+
+        for (name, field) in row.get_column_iter() {
+            match name.as_str() {
+                "source_policy" => {
+                    if let parquet::record::Field::Str(s) = field {
+                        policy = match s.as_str() {
+                            "AR" => Some(Policy::AR),
+                            "AP" => Some(Policy::AP),
+                            "GA" => Some(Policy::GA),
+                            _ => None,
+                        };
+                    }
+                }
+                "company" => {
+                    if let parquet::record::Field::Str(s) = field {
+                        co = s.trim().to_string();
+                    }
+                }
+                "objsub" => {
+                    if let parquet::record::Field::Str(s) = field {
+                        objsub = s.trim().to_string();
+                    }
+                }
+                "icp" => {
+                    if let parquet::record::Field::Str(s) = field {
+                        icp = s.trim().to_string();
+                    }
+                }
+                "reference" => {
+                    if let parquet::record::Field::Str(s) = field {
+                        reference = s.trim().to_string();
+                    }
+                }
+                "description" => {
+                    if let parquet::record::Field::Str(s) = field {
+                        description = s.trim().to_string();
+                    }
+                }
+                "business_unit" => {
+                    if let parquet::record::Field::Str(s) = field {
+                        business_unit = s.trim().to_string();
+                    }
+                }
+                "fc_amt" => {
+                    fc_amt = match field {
+                        parquet::record::Field::Double(d) => *d,
+                        parquet::record::Field::Float(f) => *f as f64,
+                        parquet::record::Field::Int(i) => *i as f64,
+                        parquet::record::Field::Long(l) => *l as f64,
+                        _ => 0.0,
+                    };
+                }
+                "indicative_usd_amt" => {
+                    usd_amt = match field {
+                        parquet::record::Field::Double(d) => *d,
+                        parquet::record::Field::Float(f) => *f as f64,
+                        parquet::record::Field::Int(i) => *i as f64,
+                        parquet::record::Field::Long(l) => *l as f64,
+                        _ => 0.0,
+                    };
+                }
+                "gl_date" => {
+                    if let parquet::record::Field::Date(days) = field {
+                        gl_date_days = *days as i64;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let policy = policy?;
+
+        let signed_usd = match policy {
+            Policy::AR => usd_amt.abs(),
+            Policy::AP => -usd_amt.abs(),
+            Policy::GA => {
+                if fc_amt >= 0.0 {
+                    usd_amt.abs()
+                } else {
+                    -usd_amt.abs()
+                }
+            }
+        };
+
+        let co_cleaned = co.trim().trim_start_matches('0').to_string();
+        let icp_cleaned = icp.trim().trim_start_matches('0').to_string();
+        let objsub_cleaned = objsub.trim().to_string();
+        let ref_cleaned = reference.trim().to_string();
+        let desc_cleaned = description.trim().to_string();
+
+        Some(IntercoTx {
+            row: row_idx + 2,
+            policy,
+            co,
+            objsub,
+            icp,
+            reference,
+            description,
+            business_unit,
+            gl_date_days,
+            usd_amt: signed_usd,
+            co_cleaned,
+            icp_cleaned,
+            objsub_cleaned,
+            ref_cleaned,
+            desc_cleaned,
+            log_value: signed_usd.abs().ln_1p(),
         })
     }
 }
@@ -135,35 +275,24 @@ fn compute_cost(a: &IntercoTx, b: &IntercoTx) -> f64 {
     let mut metadata_cost = 100.0;
 
     // 1. if (co,icp) on one side = (icp,co) on the other side, high prior
-    // Normalize by trimming and stripping leading zeroes to ensure robust match (e.g. "1" vs "001")
-    let co_a = a.co.trim().trim_start_matches('0');
-    let icp_a = a.icp.trim().trim_start_matches('0');
-    let co_b = b.co.trim().trim_start_matches('0');
-    let icp_b = b.icp.trim().trim_start_matches('0');
-    if !co_a.is_empty() && !icp_a.is_empty() && co_a == icp_b && icp_a == co_b {
+    if !a.co_cleaned.is_empty() && !a.icp_cleaned.is_empty() && a.co_cleaned == b.icp_cleaned && a.icp_cleaned == b.co_cleaned {
         metadata_cost *= 0.05; // 95% discount
     }
 
     // 2. if (objsub) = (objsub), high prior
-    let objsub_a = a.objsub.trim();
-    let objsub_b = b.objsub.trim();
-    if !objsub_a.is_empty() && objsub_a == objsub_b {
+    if !a.objsub_cleaned.is_empty() && a.objsub_cleaned == b.objsub_cleaned {
         metadata_cost *= 0.1; // 90% discount
     }
 
     // 3. if reference equal, high prior (but less so than the above)
-    let ref_a = a.reference.trim();
-    let ref_b = b.reference.trim();
     let is_meaningful = |r: &str| !r.is_empty() && r != "nan" && r != "AGGREGATED OPENING BALANCE";
-    if is_meaningful(ref_a) && is_meaningful(ref_b) && ref_a == ref_b {
+    if is_meaningful(&a.ref_cleaned) && is_meaningful(&b.ref_cleaned) && a.ref_cleaned == b.ref_cleaned {
         metadata_cost *= 0.2; // 80% discount
     }
 
     // 4. if (reference) = (description), high prior
-    let desc_a = a.description.trim();
-    let desc_b = b.description.trim();
-    if (is_meaningful(ref_a) && !desc_b.is_empty() && ref_a == desc_b) ||
-       (is_meaningful(ref_b) && !desc_a.is_empty() && ref_b == desc_a) {
+    if (is_meaningful(&a.ref_cleaned) && !b.desc_cleaned.is_empty() && a.ref_cleaned == b.desc_cleaned) ||
+       (is_meaningful(&b.ref_cleaned) && !a.desc_cleaned.is_empty() && b.ref_cleaned == a.desc_cleaned) {
         metadata_cost *= 0.2; // 80% discount
     }
 
@@ -422,18 +551,56 @@ fn main() {
         .get(1)
         .map(|s| s.as_str())
         .unwrap_or("data/ledger.csv");
+    let filter_co = args.get(2).cloned();
 
-    println!("Loading intercompany data from: {}", path);
+    if let Some(ref filter) = filter_co {
+        println!("Loading intercompany data from: {} (filtered by company: {})", path, filter);
+    } else {
+        println!("Loading intercompany data from: {}", path);
+    }
 
-    let mut rdr = csv::Reader::from_path(path).expect("Failed to open CSV");
     let mut transactions: Vec<IntercoTx> = Vec::new();
 
-    for (row_idx, result) in rdr.records().enumerate() {
-        let record = result.expect("Failed to read CSV record");
-        if let Some(tx) = IntercoTx::from_csv_record(row_idx + 2, &record)
-            && tx.usd_amt.abs() > 0.01
-        {
-            transactions.push(tx);
+    if path.to_lowercase().ends_with(".parquet") {
+        use parquet::file::reader::FileReader;
+        let file = std::fs::File::open(path).expect("Failed to open Parquet file");
+        let reader = parquet::file::reader::SerializedFileReader::new(file)
+            .expect("Failed to create Parquet reader");
+        let mut row_iter = reader.get_row_iter(None).expect("Failed to get row iterator");
+        
+        let mut row_idx = 0;
+        while let Some(row_res) = row_iter.next() {
+            let row = row_res.expect("Failed to read Parquet row");
+            if let Some(tx) = IntercoTx::from_parquet_row(row_idx, &row) {
+                if tx.usd_amt.abs() > 0.01 {
+                    if let Some(ref filter) = filter_co {
+                        let filter_clean = filter.trim().trim_start_matches('0');
+                        if tx.co_cleaned == filter_clean || tx.co.trim() == filter.trim() {
+                            transactions.push(tx);
+                        }
+                    } else {
+                        transactions.push(tx);
+                    }
+                }
+            }
+            row_idx += 1;
+        }
+    } else {
+        let mut rdr = csv::Reader::from_path(path).expect("Failed to open CSV");
+        for (row_idx, result) in rdr.records().enumerate() {
+            let record = result.expect("Failed to read CSV record");
+            if let Some(tx) = IntercoTx::from_csv_record(row_idx + 2, &record) {
+                if tx.usd_amt.abs() > 0.01 {
+                    if let Some(ref filter) = filter_co {
+                        let filter_clean = filter.trim().trim_start_matches('0');
+                        if tx.co_cleaned == filter_clean || tx.co.trim() == filter.trim() {
+                            transactions.push(tx);
+                        }
+                    } else {
+                        transactions.push(tx);
+                    }
+                }
+            }
         }
     }
 
@@ -473,62 +640,8 @@ fn main() {
     println!("  GA: {:>3} rows, total = {:>15.2}", ga_count, ga_sum);
     println!("  Net imbalance: {:>15.2}", ar_sum + ap_sum + ga_sum);
 
-    // --- SOTA Sparse Blocker (Candidate Generation) ---
-    // Only generate edges if:
-    // 1. They are opposite signs.
-    // 2. Either they share a reference prefix, OR they are within 90 days
-    //    and have a similar amount (max value ratio <= 10.0).
-    println!("\n  Building sparse match candidates...");
-    let t_start = Instant::now();
-
-    let mut edges = Vec::new();
-    let mut sources = Vec::new();
-    let mut sinks = Vec::new();
-
-    for (idx, tx) in transactions.iter().enumerate() {
-        if tx.usd_amt > 0.0 {
-            sources.push(idx);
-        } else {
-            sinks.push(idx);
-        }
-    }
-
     let max_date_diff = 90;
     let max_value_ratio = 10.0;
-    let mut skipped = 0;
-
-    for &si in &sources {
-        let s = &transactions[si];
-        for &ti in &sinks {
-            let t = &transactions[ti];
-
-            // Prune by date
-            if (s.gl_date_days - t.gl_date_days).abs() > max_date_diff {
-                skipped += 1;
-                continue;
-            }
-
-            // Prune by value ratio
-            let ratio = s.usd_amt.abs().max(t.usd_amt.abs())
-                / s.usd_amt.abs().min(t.usd_amt.abs()).max(0.01);
-            if ratio > max_value_ratio {
-                skipped += 1;
-                continue;
-            }
-
-            // Plausible candidate!
-            let cost = compute_cost(s, t);
-            edges.push((si, ti, cost));
-        }
-    }
-
-    let t_block = t_start.elapsed();
-    println!(
-        "  Pruned candidate edges: {} ({}% skipped)",
-        edges.len(),
-        100 * skipped / (sources.len() * sinks.len())
-    );
-    println!("  Candidate generation took: {:?}", t_block);
 
     // Supplies and Unmatched Penalties
     let supplies: Vec<f64> = transactions.iter().map(|t| t.usd_amt).collect();
@@ -537,8 +650,23 @@ fn main() {
     // --- Solve ---
     println!("  Solving transportation sparse graph with Network Simplex...");
     let t_solve_start = Instant::now();
-    let mut reconciler = SparseReconciler::new(supplies, edges, penalties);
-    let matches = reconciler.solve();
+    let mut reconciler = SparseReconciler::new(supplies, penalties);
+    let matches = reconciler.solve(|si, ti| {
+        let s = &transactions[si];
+        let t = &transactions[ti];
+
+        // Apply date-diff and value-ratio filters by returning a high cost
+        if (s.gl_date_days - t.gl_date_days).abs() > max_date_diff {
+            return 1_000_000_000.0;
+        }
+        let ratio = s.usd_amt.abs().max(t.usd_amt.abs())
+            / s.usd_amt.abs().min(t.usd_amt.abs()).max(0.01);
+        if ratio > max_value_ratio {
+            return 1_000_000_000.0;
+        }
+
+        compute_cost(s, t)
+    });
     let t_solve = t_solve_start.elapsed();
     println!("  Solve complete! Took: {:?}", t_solve);
 
