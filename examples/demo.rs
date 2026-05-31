@@ -26,7 +26,7 @@ fn main() {
     let penalties = vec![10000.0; 4];
 
     // Solve the transportation problem
-    let reconciler = SparseReconciler::new(supplies, edges, penalties);
+    let mut reconciler = SparseReconciler::new(supplies, edges, penalties);
     let matches = reconciler.solve();
 
     println!("\nMatches found: {}", matches.len());

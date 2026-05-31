@@ -537,7 +537,7 @@ fn main() {
     // --- Solve ---
     println!("  Solving transportation sparse graph with Network Simplex...");
     let t_solve_start = Instant::now();
-    let reconciler = SparseReconciler::new(supplies, edges, penalties);
+    let mut reconciler = SparseReconciler::new(supplies, edges, penalties);
     let matches = reconciler.solve();
     let t_solve = t_solve_start.elapsed();
     println!("  Solve complete! Took: {:?}", t_solve);
