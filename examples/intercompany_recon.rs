@@ -275,28 +275,28 @@ fn compute_cost(a: &IntercoTx, b: &IntercoTx) -> f64 {
     }
 
     // Start with baseline metadata cost
-    let mut metadata_cost = 100.0;
+    let mut metadata_cost = 30.0;
 
     // 1. if (co,icp) on one side = (icp,co) on the other side, high prior
     if !a.co_cleaned.is_empty() && !a.icp_cleaned.is_empty() && a.co_cleaned == b.icp_cleaned && a.icp_cleaned == b.co_cleaned {
-        metadata_cost *= 0.05; // 95% discount
+        metadata_cost *= 0.7; 
     }
 
     // 2. if (objsub) = (objsub), high prior
     if !a.objsub_cleaned.is_empty() && a.objsub_cleaned == b.objsub_cleaned {
-        metadata_cost *= 0.1; // 90% discount
+        metadata_cost *= 0.5; 
     }
 
     // 3. if reference equal, high prior (but less so than the above)
     let is_meaningful = |r: &str| !r.is_empty() && r != "nan" && r != "AGGREGATED OPENING BALANCE";
     if is_meaningful(&a.ref_cleaned) && is_meaningful(&b.ref_cleaned) && a.ref_cleaned == b.ref_cleaned {
-        metadata_cost *= 0.2; // 80% discount
+        metadata_cost *= 0.3; 
     }
 
     // 4. if (reference) = (description), high prior
     if (is_meaningful(&a.ref_cleaned) && !b.desc_cleaned.is_empty() && a.ref_cleaned == b.desc_cleaned) ||
        (is_meaningful(&b.ref_cleaned) && !a.desc_cleaned.is_empty() && b.ref_cleaned == a.desc_cleaned) {
-        metadata_cost *= 0.2; // 80% discount
+        metadata_cost *= 0.3;
     }
 
     // Value based costs: simple log based
@@ -729,8 +729,8 @@ fn main() {
     // --- Solve ---
     println!("  Solving transportation sparse graph with Network Simplex (edges limit = {}, row offset = {})...", candidate_edges.len(), row_offset);
     let t_solve_start = Instant::now();
-    let mut reconciler = SparseReconciler::new();
-    reconciler.update(&supplies, &penalties, &candidate_edges).unwrap();
+    let mut reconciler = SparseReconciler::new(supplies);
+    reconciler.update_costs(&penalties, &candidate_edges).unwrap();
     let matches = reconciler.solve();
     let t_solve = t_solve_start.elapsed();
     println!("  Solve complete! Took: {:?}", t_solve);

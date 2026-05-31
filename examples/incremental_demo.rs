@@ -19,7 +19,7 @@ fn main() {
 
     // Create the stateful solver instance
     println!("Initializing stateful solver...");
-    let mut recon = SparseReconciler::new();
+    let mut recon = SparseReconciler::new(supplies);
 
     // 1. Initial run: all real edges are expensive ($10.0 cost)
     let t1 = Instant::now();
@@ -29,7 +29,7 @@ fn main() {
         (1, 2, 10.0),
         (1, 3, 10.0),
     ];
-    recon.update(&supplies, &penalties, &initial_edges).unwrap();
+    recon.update_costs(&penalties, &initial_edges).unwrap();
     let matches1 = recon.solve();
     let duration1 = t1.elapsed();
 
@@ -56,7 +56,7 @@ fn main() {
         (1, 2, 10.0),
         (1, 3, 1.0),
     ];
-    recon.update(&supplies, &penalties, &updated_edges).unwrap();
+    recon.update_costs(&penalties, &updated_edges).unwrap();
     let matches2 = recon.solve();
     let duration2 = t2.elapsed();
 
