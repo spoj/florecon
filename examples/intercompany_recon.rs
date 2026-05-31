@@ -37,6 +37,8 @@ struct IntercoTx {
     ref_cleaned: String,
     desc_cleaned: String,
     log_value: f64,
+    trx_currency: String,
+    trx_amt: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,6 +82,12 @@ impl IntercoTx {
         let gl_date_str = record.get(28)?;
         let gl_date_days = parse_date(gl_date_str).unwrap_or(0);
 
+        let trx_currency = record
+            .get(25)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let trx_amt: f64 = record.get(26).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
         let co_cleaned = co.trim().trim_start_matches('0').to_string();
         let icp_cleaned = icp.trim().trim_start_matches('0').to_string();
         let objsub_cleaned = objsub.trim().to_string();
@@ -104,6 +112,8 @@ impl IntercoTx {
             ref_cleaned,
             desc_cleaned,
             log_value,
+            trx_currency,
+            trx_amt,
         })
     }
 
@@ -118,6 +128,8 @@ impl IntercoTx {
         let mut fc_amt = 0.0;
         let mut usd_amt = 0.0;
         let mut gl_date_days = 0;
+        let mut trx_currency = String::new();
+        let mut trx_amt = 0.0;
 
         for (name, field) in row.get_column_iter() {
             match name.as_str() {
@@ -179,6 +191,20 @@ impl IntercoTx {
                         _ => 0.0,
                     };
                 }
+                "trx_currency" => {
+                    if let parquet::record::Field::Str(s) = field {
+                        trx_currency = s.trim().to_string();
+                    }
+                }
+                "trx_amt" => {
+                    trx_amt = match field {
+                        parquet::record::Field::Double(d) => *d,
+                        parquet::record::Field::Float(f) => *f as f64,
+                        parquet::record::Field::Int(i) => *i as f64,
+                        parquet::record::Field::Long(l) => *l as f64,
+                        _ => 0.0,
+                    };
+                }
                 "gl_date" => {
                     if let parquet::record::Field::Date(days) = field {
                         gl_date_days = *days as i64;
@@ -225,6 +251,8 @@ impl IntercoTx {
             ref_cleaned,
             desc_cleaned,
             log_value: signed_usd.abs().ln_1p(),
+            trx_currency,
+            trx_amt,
         })
     }
 }
@@ -262,67 +290,97 @@ fn parse_date(s: &str) -> Option<i64> {
 // Client-side Cost Function
 // ---------------------------------------------------------------------------
 
-fn log_value_difference(a: f64, b: f64) -> f64 {
-    let exp_a = ((a.abs().max(0.01).to_bits() >> 52) & 0x7FF) as i32;
-    let exp_b = ((b.abs().max(0.01).to_bits() >> 52) & 0x7FF) as i32;
-    (exp_a - exp_b).abs() as f64
-}
-
-fn compute_cost(a: &IntercoTx, b: &IntercoTx, ref_counts: &HashMap<String, usize>, total_txs: usize) -> f64 {
+fn compute_cost(
+    a: &IntercoTx,
+    b: &IntercoTx,
+    ref_counts: &HashMap<String, usize>,
+    total_txs: usize,
+) -> f64 {
     // Only connect opposite signs
     if a.usd_amt.signum() == b.usd_amt.signum() {
         return f64::MAX;
     }
 
-    // Start with baseline metadata cost
-    let mut metadata_cost = 30.0;
+    let exact_val = (a.usd_amt + b.usd_amt).abs() < 0.01;
 
-    // 1. if (co,icp) on one side = (icp,co) on the other side, high prior
-    if !a.co_cleaned.is_empty() && !a.icp_cleaned.is_empty() && a.co_cleaned == b.icp_cleaned && a.icp_cleaned == b.co_cleaned {
-        metadata_cost *= 0.7; 
+    let exact_trx_val = !a.trx_currency.is_empty()
+        && a.trx_currency == b.trx_currency
+        && (a.trx_amt + b.trx_amt).abs() < 0.01;
+
+    let date_within_3_days = (a.gl_date_days - b.gl_date_days).abs() <= 3;
+
+    // 1. Identify if we have a text link (ref-ref, or ref-desc cross match)
+    let matched_ref_str = Some(&a.ref_cleaned);
+
+    // 2. Calculate the IDF "Quality" of the reference (0.0 = garbage/common, 1.0 = highly unique)
+    let mut ref_quality = 0.0;
+    if let Some(ref_str) = matched_ref_str {
+        // Fallback to 1 if not found (meaning it's extremely rare)
+        let count = *ref_counts.get(ref_str).unwrap_or(&1);
+
+        // IDF = ln(N / frequency)
+        let idf = (total_txs as f64 / count as f64).ln().max(0.0);
+        // Max theoretical IDF happens when a reference appears exactly twice (a perfect pair)
+        let max_idf = (total_txs as f64 / 2.0).max(2.0).ln();
+
+        ref_quality = (idf / max_idf).clamp(0.0, 1.0);
     }
 
-    // 2. if (objsub) = (objsub), high prior
-    if !a.objsub_cleaned.is_empty() && a.objsub_cleaned == b.objsub_cleaned {
-        metadata_cost *= 0.5; 
-    }
+    let exact_ref = matched_ref_str.is_some();
 
-    // Helper to calculate the IDF-scaled reference discount factor.
-    // If the matching term is rare (low cardinality), we apply a high prior discount (up to 70% off, i.e. 0.3 multiplier).
-    // If the matching term is extremely common (high cardinality), we apply little to no discount.
-    let get_ref_discount = |matching_ref: &str| -> f64 {
-        if let Some(&count) = ref_counts.get(matching_ref) {
-            let idf = (total_txs as f64 / (1.0 + count as f64)).ln().max(0.0);
-            let max_idf = (total_txs as f64 / 2.0).ln().max(1.0);
-            let idf_factor = (idf / max_idf).min(1.0).max(0.0);
-            // Interpolate multiplier: 0.3 (full 70% discount) when rare, up to 1.0 (no discount) when extremely common
-            1.0 - 0.7 * idf_factor
-        } else {
-            0.3
-        }
+    // 3. Establish base cost using the Reference Quality
+    let mut base_cost = if exact_trx_val && exact_ref && date_within_3_days {
+        // Exact transaction currency and transaction amount, exact reference, within 3 days
+        1.0
+    } else if exact_val && exact_ref && date_within_3_days {
+        // Exact USD value and exact reference, within 3 days
+        1.0
+    } else if exact_val && date_within_3_days {
+        // Exact USD value and exact reference, within 3 days
+        5.0
+    } else if exact_trx_val && date_within_3_days {
+        // Exact USD value and exact reference, within 3 days
+        5.0
+    } else if exact_val && exact_ref {
+        // Holy Grail: Exact value AND exact reference.
+        // If ref is highly unique, cost is 1.0. If ref is generic "NA", cost scales up to 10.0.
+        1.0 + ((1.0 - ref_quality) * 9.0)
+    } else if exact_ref {
+        // Partial/Split value, but references match.
+        // If ref is highly unique, cost is 5.0. If ref is generic, cost scales up to 50.0
+        // (making it highly unlikely to group partials based on a garbage reference).
+        5.0 + ((1.0 - ref_quality) * 45.0)
+    } else if exact_val {
+        // Values match perfectly, but no text links them.
+        50.0
+    } else {
+        // Desperation match: Nothing matches.
+        200.0
     };
 
-    // 3. if reference equal, high prior (but less so than the above)
-    if a.ref_cleaned == b.ref_cleaned {
-        metadata_cost *= get_ref_discount(&a.ref_cleaned); 
+    // 4. Metadata Discounts (if co/icp or objsub match, reduce the base cost)
+    if !a.co_cleaned.is_empty()
+        && !a.icp_cleaned.is_empty()
+        && a.co_cleaned == b.icp_cleaned
+        && a.icp_cleaned == b.co_cleaned
+    {
+        base_cost *= 0.5;
+    }
+    if !a.objsub_cleaned.is_empty() && a.objsub_cleaned == b.objsub_cleaned {
+        base_cost *= 0.7;
     }
 
-    // 4. if (reference) = (description), high prior
-    if a.ref_cleaned == b.desc_cleaned {
-        metadata_cost *= get_ref_discount(&a.ref_cleaned);
-    } else if b.ref_cleaned == a.desc_cleaned {
-        metadata_cost *= get_ref_discount(&b.ref_cleaned);
-    }
+    // 5. Absolute Value Penalty
+    // Adds $0.10 of cost for every $1.00 of residual mismatch.
+    // This strictly punishes leaving messy unmatched residuals!
+    let val_diff = (a.usd_amt.abs() - b.usd_amt.abs()).abs();
+    let value_penalty = val_diff * 0.10;
 
-    // Value based costs: simple log based
-    let value_cost = log_value_difference(a.usd_amt.abs(), b.usd_amt.abs()) * 10.0;
-
-    // Date proximity
+    // 6. Date Proximity Penalty (5.0 cost units per day apart)
     let date_diff = (a.gl_date_days - b.gl_date_days).abs() as f64;
-    let date_cost = date_diff.min(365.0);
+    let date_penalty = date_diff * 0.5;
 
-    // Final cost = metadata_cost (multiplicative) + value_cost + date_cost
-    (metadata_cost + value_cost + date_cost).max(0.0)
+    base_cost + value_penalty + date_penalty
 }
 
 // ---------------------------------------------------------------------------
@@ -586,21 +644,22 @@ fn main() {
         .map(|s| s.as_str())
         .unwrap_or("data/ledger.csv");
     let filter_co = args.get(2).cloned();
-    let row_offset: usize = args
-        .get(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+    let row_offset: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2);
 
-    let filter_cos: Option<Vec<String>> = filter_co.as_ref().map(|s| {
-        s.split(',')
-            .map(|part| part.trim().to_string())
-            .collect()
-    });
+    let filter_cos: Option<Vec<String>> = filter_co
+        .as_ref()
+        .map(|s| s.split(',').map(|part| part.trim().to_string()).collect());
 
     if let Some(ref filter) = filter_co {
-        println!("Loading intercompany data from: {} (filtered by company list: {}, row offset: {})", path, filter, row_offset);
+        println!(
+            "Loading intercompany data from: {} (filtered by company list: {}, row offset: {})",
+            path, filter, row_offset
+        );
     } else {
-        println!("Loading intercompany data from: {} (row offset: {})", path, row_offset);
+        println!(
+            "Loading intercompany data from: {} (row offset: {})",
+            path, row_offset
+        );
     }
 
     let mut transactions: Vec<IntercoTx> = Vec::new();
@@ -610,61 +669,65 @@ fn main() {
         let file = std::fs::File::open(path).expect("Failed to open Parquet file");
         let reader = parquet::file::reader::SerializedFileReader::new(file)
             .expect("Failed to create Parquet reader");
-        let row_iter = reader.get_row_iter(None).expect("Failed to get row iterator");
-        
+        let row_iter = reader
+            .get_row_iter(None)
+            .expect("Failed to get row iterator");
+
         for (row_idx, row_res) in row_iter.enumerate() {
             let row = row_res.expect("Failed to read Parquet row");
             if let Some(tx) = IntercoTx::from_parquet_row(row_idx, &row)
-                && tx.usd_amt.abs() > 0.01 {
-                    if let Some(ref filters) = filter_cos {
-                        let co_matched = filters.iter().any(|filter| {
-                            let filter_clean = filter.trim_start_matches('0');
-                            tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
-                        });
-                        let icp_matched = filters.iter().any(|filter| {
-                            let filter_clean = filter.trim_start_matches('0');
-                            tx.icp_cleaned == filter_clean || tx.icp.trim() == filter.as_str()
-                        });
-                        let matched = if filters.len() > 1 {
-                            co_matched && icp_matched
-                        } else {
-                            co_matched
-                        };
-                        if matched {
-                            transactions.push(tx);
-                        }
+                && tx.usd_amt.abs() > 0.01
+            {
+                if let Some(ref filters) = filter_cos {
+                    let co_matched = filters.iter().any(|filter| {
+                        let filter_clean = filter.trim_start_matches('0');
+                        tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
+                    });
+                    let icp_matched = filters.iter().any(|filter| {
+                        let filter_clean = filter.trim_start_matches('0');
+                        tx.icp_cleaned == filter_clean || tx.icp.trim() == filter.as_str()
+                    });
+                    let matched = if filters.len() > 1 {
+                        co_matched && icp_matched
                     } else {
+                        co_matched
+                    };
+                    if matched {
                         transactions.push(tx);
                     }
+                } else {
+                    transactions.push(tx);
                 }
+            }
         }
     } else {
         let mut rdr = csv::Reader::from_path(path).expect("Failed to open CSV");
         for (row_idx, result) in rdr.records().enumerate() {
             let record = result.expect("Failed to read CSV record");
             if let Some(tx) = IntercoTx::from_csv_record(row_idx + 2, &record)
-                && tx.usd_amt.abs() > 0.01 {
-                    if let Some(ref filters) = filter_cos {
-                        let co_matched = filters.iter().any(|filter| {
-                            let filter_clean = filter.trim_start_matches('0');
-                            tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
-                        });
-                        let icp_matched = filters.iter().any(|filter| {
-                            let filter_clean = filter.trim_start_matches('0');
-                            tx.icp_cleaned == filter_clean || tx.icp.trim() == filter.as_str()
-                        });
-                        let matched = if filters.len() > 1 {
-                            co_matched && icp_matched
-                        } else {
-                            co_matched
-                        };
-                        if matched {
-                            transactions.push(tx);
-                        }
+                && tx.usd_amt.abs() > 0.01
+            {
+                if let Some(ref filters) = filter_cos {
+                    let co_matched = filters.iter().any(|filter| {
+                        let filter_clean = filter.trim_start_matches('0');
+                        tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
+                    });
+                    let icp_matched = filters.iter().any(|filter| {
+                        let filter_clean = filter.trim_start_matches('0');
+                        tx.icp_cleaned == filter_clean || tx.icp.trim() == filter.as_str()
+                    });
+                    let matched = if filters.len() > 1 {
+                        co_matched && icp_matched
                     } else {
+                        co_matched
+                    };
+                    if matched {
                         transactions.push(tx);
                     }
+                } else {
+                    transactions.push(tx);
                 }
+            }
         }
     }
 
@@ -673,10 +736,12 @@ fn main() {
 
     // 1. Sort the transactions by gl_date_days, and secondarily by signed usd_amt.
     transactions.sort_by(|a, b| {
-        a.gl_date_days.cmp(&b.gl_date_days)
-            .then_with(|| {
-                a.usd_amt.partial_cmp(&b.usd_amt).unwrap_or(std::cmp::Ordering::Equal)
-            })
+        a.gl_date_days.cmp(&b.gl_date_days).then_with(|| {
+            a.usd_amt
+                .abs()
+                .partial_cmp(&b.usd_amt.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
 
     let ar_count = transactions
@@ -758,10 +823,16 @@ fn main() {
     }
 
     // --- Solve ---
-    println!("  Solving transportation sparse graph with Network Simplex (edges limit = {}, row offset = {})...", candidate_edges.len(), row_offset);
+    println!(
+        "  Solving transportation sparse graph with Network Simplex (edges limit = {}, row offset = {})...",
+        candidate_edges.len(),
+        row_offset
+    );
     let t_solve_start = Instant::now();
     let mut reconciler = SparseReconciler::new(supplies);
-    reconciler.update_costs(&penalties, &candidate_edges).unwrap();
+    reconciler
+        .update_costs(&penalties, &candidate_edges)
+        .unwrap();
     let matches = reconciler.solve();
     let t_solve = t_solve_start.elapsed();
     println!("  Solve complete! Took: {:?}", t_solve);

@@ -3,8 +3,8 @@ use log::{debug, warn};
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const FLOW_THRESHOLD: f64 = 1e-9;
-const PRICING_TOLERANCE: f64 = -1e-12;
+const FLOW_THRESHOLD: f64 = 1e-7;
+const PRICING_TOLERANCE: f64 = -1e-7;
 const BIG_M_PENALTY_DELTA: f64 = 1000.0;
 const PRICING_BLOCK_SIZE: usize = 65536;
 
@@ -524,7 +524,7 @@ impl SparseReconciler {
                 let idx = self.parent_edge_idx[w];
                 if self.parent_direction_forward[w] {
                     let flow = basis_edges[idx].flow;
-                    if flow < min_theta {
+                    if flow <= min_theta {
                         min_theta = flow;
                         leaving_edge_basis_idx = Some(idx);
                     }
@@ -535,7 +535,7 @@ impl SparseReconciler {
                 let idx = self.parent_edge_idx[w];
                 if !self.parent_direction_forward[w] {
                     let flow = basis_edges[idx].flow;
-                    if flow < min_theta {
+                    if flow <= min_theta {
                         min_theta = flow;
                         leaving_edge_basis_idx = Some(idx);
                     }
@@ -559,7 +559,7 @@ impl SparseReconciler {
             for &w in &self.path_v {
                 let idx = self.parent_edge_idx[w];
                 if self.parent_direction_forward[w] {
-                    basis_edges[idx].flow -= theta;
+                    basis_edges[idx].flow = (basis_edges[idx].flow - theta).max(0.0); // Clamp
                 } else {
                     basis_edges[idx].flow += theta;
                 }
@@ -570,7 +570,7 @@ impl SparseReconciler {
                 if self.parent_direction_forward[w] {
                     basis_edges[idx].flow += theta;
                 } else {
-                    basis_edges[idx].flow -= theta;
+                    basis_edges[idx].flow = (basis_edges[idx].flow - theta).max(0.0); // Clamp
                 }
             }
 
@@ -584,8 +584,12 @@ impl SparseReconciler {
                         self.is_candidate_basic[idx] = false;
                     }
                 }
-                EdgeId::SourceToDummySink { source } => self.source_to_dummy_sink_basic[source] = false,
-                EdgeId::DummySourceToSink { sink } => self.dummy_source_to_sink_basic[sink - m] = false,
+                EdgeId::SourceToDummySink { source } => {
+                    self.source_to_dummy_sink_basic[source] = false
+                }
+                EdgeId::DummySourceToSink { sink } => {
+                    self.dummy_source_to_sink_basic[sink - m] = false
+                }
                 EdgeId::DummySourceToDummySink => self.dummy_source_to_dummy_sink_basic = false,
             }
 
@@ -596,8 +600,12 @@ impl SparseReconciler {
                         self.is_candidate_basic[idx] = true;
                     }
                 }
-                EdgeId::SourceToDummySink { source } => self.source_to_dummy_sink_basic[source] = true,
-                EdgeId::DummySourceToSink { sink } => self.dummy_source_to_sink_basic[sink - m] = true,
+                EdgeId::SourceToDummySink { source } => {
+                    self.source_to_dummy_sink_basic[source] = true
+                }
+                EdgeId::DummySourceToSink { sink } => {
+                    self.dummy_source_to_sink_basic[sink - m] = true
+                }
                 EdgeId::DummySourceToDummySink => self.dummy_source_to_dummy_sink_basic = true,
             }
 
