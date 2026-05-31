@@ -262,11 +262,9 @@ fn parse_date(s: &str) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 fn log_value_difference(a: f64, b: f64) -> f64 {
-    let ua = a.abs() as u64;
-    let ub = b.abs() as u64;
-    let lz_a = ua.leading_zeros();
-    let lz_b = ub.leading_zeros();
-    (lz_a as i32 - lz_b as i32).abs() as f64
+    let exp_a = ((a.abs().max(0.01).to_bits() >> 52) & 0x7FF) as i32;
+    let exp_b = ((b.abs().max(0.01).to_bits() >> 52) & 0x7FF) as i32;
+    (exp_a - exp_b).abs() as f64
 }
 
 fn compute_cost(a: &IntercoTx, b: &IntercoTx) -> f64 {
