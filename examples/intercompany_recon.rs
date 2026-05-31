@@ -302,10 +302,17 @@ fn compute_cost(
     }
 
     let exact_val = (a.usd_amt + b.usd_amt).abs() < 0.01;
+    let close_val = (a.usd_amt + b.usd_amt) / (a.usd_amt.abs() + b.usd_amt.abs()) < 0.001;
 
     let exact_trx_val = !a.trx_currency.is_empty()
         && a.trx_currency == b.trx_currency
         && (a.trx_amt + b.trx_amt).abs() < 0.01;
+
+    let close_trx_val = !a.trx_currency.is_empty()
+        && a.trx_currency == b.trx_currency
+        && (a.trx_amt + b.trx_amt) / (a.trx_amt.abs() + b.trx_amt.abs()) < 0.001;
+
+    let good_val = close_trx_val || exact_trx_val || close_val || exact_val;
 
     let date_within_3_days = (a.gl_date_days - b.gl_date_days).abs() <= 3;
 
@@ -329,19 +336,7 @@ fn compute_cost(
     let exact_ref = matched_ref_str.is_some();
 
     // 3. Establish base cost using the Reference Quality
-    let mut base_cost = if exact_trx_val && exact_ref && date_within_3_days {
-        // Exact transaction currency and transaction amount, exact reference, within 3 days
-        1.0
-    } else if exact_val && exact_ref && date_within_3_days {
-        // Exact USD value and exact reference, within 3 days
-        1.0
-    } else if exact_val && date_within_3_days {
-        // Exact USD value and exact reference, within 3 days
-        5.0
-    } else if exact_trx_val && date_within_3_days {
-        // Exact USD value and exact reference, within 3 days
-        5.0
-    } else if exact_val && exact_ref {
+    let base_cost = if good_val && exact_ref && date_within_3_days {
         // Holy Grail: Exact value AND exact reference.
         // If ref is highly unique, cost is 1.0. If ref is generic "NA", cost scales up to 10.0.
         1.0 + ((1.0 - ref_quality) * 9.0)
@@ -350,25 +345,15 @@ fn compute_cost(
         // If ref is highly unique, cost is 5.0. If ref is generic, cost scales up to 50.0
         // (making it highly unlikely to group partials based on a garbage reference).
         5.0 + ((1.0 - ref_quality) * 45.0)
-    } else if exact_val {
+    } else if good_val && date_within_3_days {
+        10.0
+    } else if good_val {
         // Values match perfectly, but no text links them.
         50.0
     } else {
         // Desperation match: Nothing matches.
         200.0
     };
-
-    // 4. Metadata Discounts (if co/icp or objsub match, reduce the base cost)
-    if !a.co_cleaned.is_empty()
-        && !a.icp_cleaned.is_empty()
-        && a.co_cleaned == b.icp_cleaned
-        && a.icp_cleaned == b.co_cleaned
-    {
-        base_cost *= 0.5;
-    }
-    if !a.objsub_cleaned.is_empty() && a.objsub_cleaned == b.objsub_cleaned {
-        base_cost *= 0.7;
-    }
 
     // 5. Absolute Value Penalty
     // Adds $0.10 of cost for every $1.00 of residual mismatch.

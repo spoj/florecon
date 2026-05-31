@@ -4,7 +4,7 @@ use log::{debug, warn};
 // Constants
 // ---------------------------------------------------------------------------
 const FLOW_THRESHOLD: f64 = 1e-7;
-const PRICING_TOLERANCE: f64 = -1e-7;
+const PRICING_TOLERANCE: f64 = -1e-9;
 const BIG_M_PENALTY_DELTA: f64 = 1000.0;
 const PRICING_BLOCK_SIZE: usize = 65536;
 
