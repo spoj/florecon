@@ -268,7 +268,7 @@ fn log_value_difference(a: f64, b: f64) -> f64 {
     (exp_a - exp_b).abs() as f64
 }
 
-fn compute_cost(a: &IntercoTx, b: &IntercoTx) -> f64 {
+fn compute_cost(a: &IntercoTx, b: &IntercoTx, ref_counts: &HashMap<String, usize>, total_txs: usize) -> f64 {
     // Only connect opposite signs
     if a.usd_amt.signum() == b.usd_amt.signum() {
         return f64::MAX;
@@ -287,16 +287,31 @@ fn compute_cost(a: &IntercoTx, b: &IntercoTx) -> f64 {
         metadata_cost *= 0.5; 
     }
 
+    // Helper to calculate the IDF-scaled reference discount factor.
+    // If the matching term is rare (low cardinality), we apply a high prior discount (up to 70% off, i.e. 0.3 multiplier).
+    // If the matching term is extremely common (high cardinality), we apply little to no discount.
+    let get_ref_discount = |matching_ref: &str| -> f64 {
+        if let Some(&count) = ref_counts.get(matching_ref) {
+            let idf = (total_txs as f64 / (1.0 + count as f64)).ln().max(0.0);
+            let max_idf = (total_txs as f64 / 2.0).ln().max(1.0);
+            let idf_factor = (idf / max_idf).min(1.0).max(0.0);
+            // Interpolate multiplier: 0.3 (full 70% discount) when rare, up to 1.0 (no discount) when extremely common
+            1.0 - 0.7 * idf_factor
+        } else {
+            0.3
+        }
+    };
+
     // 3. if reference equal, high prior (but less so than the above)
-    let is_meaningful = |r: &str| !r.is_empty() && r != "nan" && r != "AGGREGATED OPENING BALANCE";
-    if is_meaningful(&a.ref_cleaned) && is_meaningful(&b.ref_cleaned) && a.ref_cleaned == b.ref_cleaned {
-        metadata_cost *= 0.3; 
+    if a.ref_cleaned == b.ref_cleaned {
+        metadata_cost *= get_ref_discount(&a.ref_cleaned); 
     }
 
     // 4. if (reference) = (description), high prior
-    if (is_meaningful(&a.ref_cleaned) && !b.desc_cleaned.is_empty() && a.ref_cleaned == b.desc_cleaned) ||
-       (is_meaningful(&b.ref_cleaned) && !a.desc_cleaned.is_empty() && b.ref_cleaned == a.desc_cleaned) {
-        metadata_cost *= 0.3;
+    if a.ref_cleaned == b.desc_cleaned {
+        metadata_cost *= get_ref_discount(&a.ref_cleaned);
+    } else if b.ref_cleaned == a.desc_cleaned {
+        metadata_cost *= get_ref_discount(&b.ref_cleaned);
     }
 
     // Value based costs: simple log based
@@ -315,6 +330,14 @@ fn compute_cost(a: &IntercoTx, b: &IntercoTx) -> f64 {
 // ---------------------------------------------------------------------------
 
 fn print_report(matches: &[florecon::SparseMatch], txs: &[IntercoTx], unmatched_indices: &[usize]) {
+    let mut ref_counts = HashMap::new();
+    for tx in txs {
+        if !tx.ref_cleaned.is_empty() {
+            *ref_counts.entry(tx.ref_cleaned.clone()).or_insert(0) += 1;
+        }
+    }
+    let total_txs = txs.len();
+
     println!("\n{}", "=".repeat(90));
     println!("  SPARSE RECONCILIATION REPORT");
     println!("{}", "=".repeat(90));
@@ -457,7 +480,7 @@ fn print_report(matches: &[florecon::SparseMatch], txs: &[IntercoTx], unmatched_
                         "        link cost [{:?}↔{:?}]: {:>8.2}  ({:>10.2} vs {:>10.2})",
                         a.policy,
                         b.policy,
-                        compute_cost(a, b),
+                        compute_cost(a, b, &ref_counts, total_txs),
                         a.usd_amt,
                         b.usd_amt
                     );
@@ -696,6 +719,14 @@ fn main() {
     let supplies: Vec<f64> = transactions.iter().map(|t| t.usd_amt).collect();
     let penalties = vec![1_000_000.0; n];
 
+    // Pre-calculate reference string frequency counts to scale priors by cardinality/IDF
+    let mut ref_counts = HashMap::new();
+    for tx in &transactions {
+        if !tx.ref_cleaned.is_empty() {
+            *ref_counts.entry(tx.ref_cleaned.clone()).or_insert(0) += 1;
+        }
+    }
+
     // 2. Generate sparse candidate edges within configurable row offset with pre-computed costs
     let mut candidate_edges = Vec::new();
     for i in 0..n {
@@ -708,7 +739,7 @@ fn main() {
                     let t = &transactions[j];
 
                     // Compute cost
-                    let mut cost = compute_cost(s, t);
+                    let mut cost = compute_cost(s, t, &ref_counts, n);
 
                     // Apply date-diff and value-ratio filters
                     if (s.gl_date_days - t.gl_date_days).abs() > max_date_diff {
