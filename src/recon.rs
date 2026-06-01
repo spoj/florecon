@@ -50,6 +50,28 @@ struct Entry<Tx> {
     arcs: Vec<(ExtId, crate::net::ArcId)>,
 }
 
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EntrySer<Tx> {
+    node: NodeId,
+    tx: Tx,
+    key: i64,
+    base: i64,
+    arcs: Vec<(ExtId, crate::net::ArcId)>,
+}
+
+/// Serializable, persistent state of a [`Reconciler`] (the engine basis plus
+/// the transaction index). Produce with [`Reconciler::snapshot`] and rebuild
+/// with [`Reconciler::restore`]. Requires the `serde` feature and
+/// `Model::Tx: Serialize + Deserialize`.
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ReconSnapshot<Tx> {
+    net: crate::net::Snapshot,
+    entries: Vec<(ExtId, EntrySer<Tx>)>,
+    by_key: BTreeMap<i64, Vec<ExtId>>,
+}
+
 /// A reconciled group: a connected component of matched transactions.
 #[derive(Debug, Clone)]
 pub struct Group {
@@ -283,6 +305,68 @@ impl<M: Model> Reconciler<M> {
     }
 }
 
+#[cfg(feature = "serde")]
+impl<M: Model> Reconciler<M>
+where
+    M::Tx: Clone + serde::Serialize,
+{
+    /// Capture the full reconciler state for caching between runs.
+    pub fn snapshot(&self) -> ReconSnapshot<M::Tx> {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(id, e)| {
+                (
+                    *id,
+                    EntrySer {
+                        node: e.node,
+                        tx: e.tx.clone(),
+                        key: e.key,
+                        base: e.base,
+                        arcs: e.arcs.clone(),
+                    },
+                )
+            })
+            .collect();
+        ReconSnapshot {
+            net: self.net.snapshot(),
+            entries,
+            by_key: self.by_key.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<M: Model> Reconciler<M> {
+    /// Rebuild a reconciler from a snapshot and a (re-supplied) model. Node and
+    /// arc handles, the basis, and the ExtId index are all preserved, so the
+    /// next `solve` is a warm start.
+    pub fn restore(model: M, snap: ReconSnapshot<M::Tx>) -> Self {
+        let entries = snap
+            .entries
+            .into_iter()
+            .map(|(id, e)| {
+                (
+                    id,
+                    Entry {
+                        node: e.node,
+                        tx: e.tx,
+                        key: e.key,
+                        base: e.base,
+                        arcs: e.arcs,
+                    },
+                )
+            })
+            .collect();
+        Reconciler {
+            model,
+            net: Network::restore(snap.net),
+            entries,
+            by_key: snap.by_key,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -384,5 +468,52 @@ mod tests {
         r.solve();
         assert_eq!(r.groups().len(), 0);
         assert_eq!(r.unmatched(), vec![1]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn facade_snapshot_roundtrip() {
+        #[derive(Clone, serde::Serialize, serde::Deserialize)]
+        struct STx {
+            amount: i64,
+            date: i64,
+        }
+        struct SModel;
+        impl Model for SModel {
+            type Tx = STx;
+            fn base_amount(&self, t: &STx) -> i64 {
+                t.amount
+            }
+            fn penalty(&self, _t: &STx) -> f64 {
+                1e6
+            }
+            fn block_key(&self, t: &STx) -> i64 {
+                t.date
+            }
+            fn window(&self) -> i64 {
+                3
+            }
+            fn cost(&self, a: &STx, b: &STx) -> Option<f64> {
+                Some(1.0 + (a.amount + b.amount).abs() as f64 * 0.1)
+            }
+        }
+
+        // "Month 1": match a pair, then cache.
+        let mut r = Reconciler::new(SModel);
+        r.upsert(1, STx { amount: 100, date: 0 });
+        r.upsert(2, STx { amount: -100, date: 0 });
+        r.solve();
+        let json = serde_json::to_string(&r.snapshot()).unwrap();
+
+        // "Month 2": restore the cached basis, stream a new pair, warm-solve.
+        let snap: ReconSnapshot<STx> = serde_json::from_str(&json).unwrap();
+        let mut r2 = Reconciler::restore(SModel, snap);
+        assert_eq!(r2.groups().len(), 1); // basis survived the round-trip
+        r2.upsert(3, STx { amount: 70, date: 1 });
+        r2.upsert(4, STx { amount: -70, date: 1 });
+        r2.solve();
+        let g = r2.groups();
+        assert_eq!(g.len(), 2);
+        assert!(g.iter().all(|g| g.clean));
     }
 }

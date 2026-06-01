@@ -35,6 +35,7 @@ const PRICING_TOLERANCE: f64 = -1e-9;
 
 /// Stable handle to a node. Cheap to copy; hold it to address the node later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NodeId {
     slot: u32,
     generation: u32,
@@ -42,6 +43,7 @@ pub struct NodeId {
 
 /// Stable handle to an arc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ArcId {
     slot: u32,
     generation: u32,
@@ -57,6 +59,7 @@ pub enum SolveStatus {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct Node {
     alive: bool,
     generation: u32,
@@ -66,6 +69,7 @@ struct Node {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct Arc {
     alive: bool,
     generation: u32,
@@ -80,7 +84,19 @@ struct Arc {
     is_penalty: bool,
 }
 
-/// The transportation engine. Persists its optimal basis across mutations.
+/// Serializable, persistent basis state of a [`Network`]. Produce one with
+/// [`Network::snapshot`] and rebuild with [`Network::restore`]. Implements
+/// `Serialize`/`Deserialize` when the `serde` feature is enabled.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Snapshot {
+    nodes: Vec<Node>,
+    free_nodes: Vec<u32>,
+    arcs: Vec<Arc>,
+    free_arcs: Vec<u32>,
+    dummy: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Network {
     nodes: Vec<Node>,
@@ -101,6 +117,9 @@ pub struct Network {
     queue: std::collections::VecDeque<u32>,
     path_u: Vec<u32>,
     path_v: Vec<u32>,
+    /// O(1)-reset visited marker for subtree traversals.
+    stamp: Vec<u32>,
+    cur_stamp: u32,
 
     needs_rebuild: bool,
     dirty: bool,
@@ -130,6 +149,8 @@ impl Network {
             queue: std::collections::VecDeque::new(),
             path_u: Vec::new(),
             path_v: Vec::new(),
+            stamp: Vec::new(),
+            cur_stamp: 0,
             needs_rebuild: false,
             dirty: true,
         };
@@ -162,6 +183,7 @@ impl Network {
             self.parent_forward.push(true);
             self.depth.push(0);
             self.adj.push(Vec::new());
+            self.stamp.push(0);
             slot
         }
     }
@@ -361,6 +383,48 @@ impl Network {
         self.nodes.iter().filter(|n| n.alive).count() - 1
     }
 
+    // --- persistence -----------------------------------------------------
+
+    /// Capture the persistent basis state for caching (e.g. to disk between
+    /// reconciliation runs). Transient solver buffers are not included; they
+    /// are rebuilt on `restore`.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            nodes: self.nodes.clone(),
+            free_nodes: self.free_nodes.clone(),
+            arcs: self.arcs.clone(),
+            free_arcs: self.free_arcs.clone(),
+            dummy: self.dummy,
+        }
+    }
+
+    /// Rebuild a network from a snapshot. Node/arc handles taken before the
+    /// snapshot remain valid (slots and generations are preserved). The next
+    /// `solve` refreshes potentials from the restored basis.
+    pub fn restore(s: Snapshot) -> Self {
+        let n = s.nodes.len();
+        Network {
+            nodes: s.nodes,
+            free_nodes: s.free_nodes,
+            arcs: s.arcs,
+            free_arcs: s.free_arcs,
+            dummy: s.dummy,
+            potential: vec![0.0; n],
+            parent: vec![NONE; n],
+            parent_arc: vec![NONE; n],
+            parent_forward: vec![true; n],
+            depth: vec![0; n],
+            adj: vec![Vec::new(); n],
+            queue: std::collections::VecDeque::new(),
+            path_u: Vec::new(),
+            path_v: Vec::new(),
+            stamp: vec![0; n],
+            cur_stamp: 0,
+            needs_rebuild: false,
+            dirty: true,
+        }
+    }
+
     // --- solve -----------------------------------------------------------
 
     /// Re-optimize from the cached basis. Returns when optimal or capped.
@@ -376,7 +440,12 @@ impl Network {
         let n_alive = self.nodes.iter().filter(|n| n.alive).count();
         let max_iterations = (n_alive * n_alive * 2).max(1000);
         let mut iterations = 0;
+        let mut since_refactor = 0u32;
         let mut status = SolveStatus::Optimal;
+
+        // One full refactorization to establish consistent adjacency and
+        // potentials; subsequent pivots update both incrementally.
+        self.rebuild_tree();
 
         loop {
             if iterations >= max_iterations {
@@ -386,18 +455,21 @@ impl Network {
             }
             iterations += 1;
 
-            // TODO(step 2): replace per-iteration rebuild with incremental
-            // potential updates; keep this only as periodic refactorization.
-            self.rebuild_tree();
-
-            let Some(entering) = self.find_entering_arc() else {
+            let Some((entering, rc)) = self.find_entering_arc() else {
                 debug!("optimal after {iterations} iterations");
                 break;
             };
 
-            if !self.pivot(entering) {
+            if !self.pivot(entering, rc) {
                 warn!("degenerate/unbounded: no leaving arc");
                 break;
+            }
+
+            // Periodic refactorization to flush accumulated float error.
+            since_refactor += 1;
+            if since_refactor >= 1024 {
+                self.rebuild_tree();
+                since_refactor = 0;
             }
         }
 
@@ -488,7 +560,7 @@ impl Network {
     }
 
     /// Find a non-basic arc with negative reduced cost (Dantzig rule).
-    fn find_entering_arc(&self) -> Option<u32> {
+    fn find_entering_arc(&self) -> Option<(u32, f64)> {
         let mut best = None;
         let mut best_rc = PRICING_TOLERANCE;
         for (idx, arc) in self.arcs.iter().enumerate() {
@@ -498,15 +570,71 @@ impl Network {
             let rc = arc.cost - self.potential[arc.to as usize] + self.potential[arc.from as usize];
             if rc < best_rc {
                 best_rc = rc;
-                best = Some(idx as u32);
+                best = Some((idx as u32, rc));
             }
         }
         best
     }
 
-    /// Perform one pivot around the cycle created by `entering`. Returns false
-    /// if no leaving arc exists (unbounded — should not happen with penalties).
-    fn pivot(&mut self, entering: u32) -> bool {
+    fn adj_add(&mut self, arc_idx: u32) {
+        let (f, t) = {
+            let a = &self.arcs[arc_idx as usize];
+            (a.from, a.to)
+        };
+        self.adj[f as usize].push((t, arc_idx, true));
+        self.adj[t as usize].push((f, arc_idx, false));
+    }
+
+    fn adj_remove(&mut self, arc_idx: u32) {
+        let (f, t) = {
+            let a = &self.arcs[arc_idx as usize];
+            (a.from, a.to)
+        };
+        self.adj[f as usize].retain(|e| e.1 != arc_idx);
+        self.adj[t as usize].retain(|e| e.1 != arc_idx);
+    }
+
+    /// Re-root subtree `S` (reachable from `x` without crossing to `y`) onto
+    /// `y` via the entering arc, recomputing parents/depths and shifting all of
+    /// `S`'s potentials by the constant `delta_pot`. O(|S|).
+    fn bfs_reroot(&mut self, x: usize, y: usize, entering: u32, delta_pot: f64) {
+        self.cur_stamp += 1;
+        let s = self.cur_stamp;
+        self.stamp[y] = s; // block the boundary node
+        self.stamp[x] = s;
+
+        let forward = self.arcs[entering as usize].from as usize == y;
+        self.parent[x] = y as u32;
+        self.parent_arc[x] = entering;
+        self.parent_forward[x] = forward;
+        self.depth[x] = self.depth[y] + 1;
+        self.potential[x] += delta_pot;
+
+        self.queue.clear();
+        self.queue.push_back(x as u32);
+        while let Some(cur) = self.queue.pop_front() {
+            let cur = cur as usize;
+            for i in 0..self.adj[cur].len() {
+                let (nbr, arc_idx, fwd) = self.adj[cur][i];
+                let nbr = nbr as usize;
+                if self.stamp[nbr] == s {
+                    continue;
+                }
+                self.stamp[nbr] = s;
+                self.parent[nbr] = cur as u32;
+                self.parent_arc[nbr] = arc_idx;
+                self.parent_forward[nbr] = fwd;
+                self.depth[nbr] = self.depth[cur] + 1;
+                self.potential[nbr] += delta_pot;
+                self.queue.push_back(nbr as u32);
+            }
+        }
+    }
+
+    /// Perform one pivot around the cycle created by `entering` (reduced cost
+    /// `rc`). Updates flows, adjacency, and potentials incrementally. Returns
+    /// false if no leaving arc exists (unbounded — should not happen).
+    fn pivot(&mut self, entering: u32, rc: f64) -> bool {
         let (u, v) = {
             let a = &self.arcs[entering as usize];
             (a.from as usize, a.to as usize)
@@ -533,9 +661,11 @@ impl Network {
 
         // Determine the maximum flow change theta and the leaving arc.
         // Entering arc u->v carries +theta. On the cycle, an arc "decreases"
-        // when flow runs against its direction.
+        // when flow runs against its direction. Track which side (the subtree
+        // that will detach) the leaving arc sits on.
         let mut min_theta = i64::MAX;
         let mut leaving = NONE;
+        let mut leaving_on_v = true;
 
         for &w in &self.path_v {
             let idx = self.parent_arc[w as usize];
@@ -544,6 +674,7 @@ impl Network {
                 if flow <= min_theta {
                     min_theta = flow;
                     leaving = idx;
+                    leaving_on_v = true;
                 }
             }
         }
@@ -554,6 +685,7 @@ impl Network {
                 if flow <= min_theta {
                     min_theta = flow;
                     leaving = idx;
+                    leaving_on_v = false;
                 }
             }
         }
@@ -584,6 +716,18 @@ impl Network {
         self.arcs[leaving as usize].flow = 0;
         self.arcs[entering as usize].basic = true;
         self.arcs[entering as usize].flow = theta;
+
+        // Incremental structure + potential update. The detached subtree is the
+        // one containing v (if leaving was on the v-side) or u (otherwise); it
+        // re-roots onto the opposite endpoint and shifts potentials by rc.
+        let (x, y, delta_pot) = if leaving_on_v {
+            (v, u, rc)
+        } else {
+            (u, v, -rc)
+        };
+        self.adj_remove(leaving);
+        self.adj_add(entering);
+        self.bfs_reroot(x, y, entering, delta_pot);
         true
     }
 }
@@ -759,6 +903,107 @@ mod tests {
             let opt = brute(&costs, k);
             assert!((obj - opt).abs() < 1e-6, "obj {obj} != opt {opt} (k={k})");
         }
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn warm_start_matches_cold() {
+        // Drive a network through many cost mutations with warm re-solves and
+        // verify the objective always equals a freshly cold-solved equivalent.
+        let mut seed: u64 = 0xdead_beef_0000_0001;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let k = 6;
+
+        let mut warm = Network::new();
+        let ws: Vec<NodeId> = (0..k).map(|_| warm.add_node(1, 1e6)).collect();
+        let wt: Vec<NodeId> = (0..k).map(|_| warm.add_node(-1, 1e6)).collect();
+        let mut warc = vec![vec![]; k];
+        for r in 0..k {
+            for c in 0..k {
+                warc[r].push(warm.add_arc(ws[r], wt[c], 0.0).unwrap());
+            }
+        }
+
+        for round in 0..30 {
+            let costs: Vec<Vec<f64>> =
+                (0..k).map(|_| (0..k).map(|_| 1.0 + (rng() % 90) as f64).collect()).collect();
+            for r in 0..k {
+                for c in 0..k {
+                    warm.set_cost(warc[r][c], costs[r][c]);
+                }
+            }
+            warm.solve();
+            let warm_obj: f64 = (0..k)
+                .flat_map(|r| (0..k).map(move |c| (r, c)))
+                .map(|(r, c)| if warm.flow(warc[r][c]) > 0 { costs[r][c] } else { 0.0 })
+                .sum();
+
+            // cold equivalent
+            let mut cold = Network::new();
+            let cs: Vec<NodeId> = (0..k).map(|_| cold.add_node(1, 1e6)).collect();
+            let ct: Vec<NodeId> = (0..k).map(|_| cold.add_node(-1, 1e6)).collect();
+            let mut carc = vec![vec![]; k];
+            for r in 0..k {
+                for c in 0..k {
+                    carc[r].push(cold.add_arc(cs[r], ct[c], costs[r][c]).unwrap());
+                }
+            }
+            cold.solve();
+            let cold_obj: f64 = (0..k)
+                .flat_map(|r| (0..k).map(move |c| (r, c)))
+                .map(|(r, c)| if cold.flow(carc[r][c]) > 0 { costs[r][c] } else { 0.0 })
+                .sum();
+
+            assert!(
+                (warm_obj - cold_obj).abs() < 1e-6,
+                "round {round}: warm {warm_obj} != cold {cold_obj}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_basis() {
+        let mut net = Network::new();
+        let s = net.add_node(100, 1e6);
+        let t = net.add_node(-100, 1e6);
+        let a = net.add_arc(s, t, 1.0).unwrap();
+        net.solve();
+        assert_eq!(net.flow(a), 100);
+
+        // Round-trip through a snapshot; handles stay valid, basis preserved.
+        let snap = net.snapshot();
+        let mut restored = Network::restore(snap);
+        assert_eq!(restored.flow(a), 100);
+        assert_eq!(restored.solve(), SolveStatus::Optimal);
+        assert_eq!(matched_pairs(&restored), vec![(s.slot, t.slot, 100)]);
+
+        // Warm-start the restored network with a new streamed pair.
+        let s2 = restored.add_node(40, 1e6);
+        let t2 = restored.add_node(-40, 1e6);
+        restored.add_arc(s2, t2, 1.0);
+        restored.solve();
+        assert_eq!(matched_pairs(&restored).len(), 2);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn snapshot_serde_roundtrip() {
+        let mut net = Network::new();
+        let s = net.add_node(100, 1e6);
+        let t = net.add_node(-100, 1e6);
+        net.add_arc(s, t, 1.0);
+        net.solve();
+
+        let json = serde_json::to_string(&net.snapshot()).unwrap();
+        let snap: Snapshot = serde_json::from_str(&json).unwrap();
+        let mut restored = Network::restore(snap);
+        restored.solve();
+        assert_eq!(matched_pairs(&restored), vec![(s.slot, t.slot, 100)]);
     }
 
     #[test]

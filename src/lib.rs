@@ -4,10 +4,14 @@
 //!
 //! - [`net`] — a domain-agnostic network-simplex engine with stable
 //!   [`net::NodeId`]/[`net::ArcId`] handles, single-dummy transportation model,
-//!   and warm-started re-solving across mutations.
+//!   warm-started re-solving with incremental potential updates, and
+//!   [`net::Snapshot`] persistence for caching the basis across runs.
 //! - [`recon`] — an ergonomic facade: describe your domain once via
 //!   [`recon::Model`], then drive it with `upsert` / `remove` / `solve` and read
 //!   back netted [`recon::Group`]s.
+//!
+//! Enable the `serde` feature to serialize [`net::Snapshot`] / `ReconSnapshot`
+//! to disk and warm-start next month off this month's tree.
 //!
 //! ```
 //! use florecon::recon::{Model, Reconciler};
