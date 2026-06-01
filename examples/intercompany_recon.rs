@@ -1,21 +1,16 @@
-//! Intercompany reconciliation example — LF Centennial (288) vs Mighty Hurricane (236)
+//! Intercompany reconciliation — ported to the `recon` facade.
 //!
-//! Sparse API version. This shows how a client uses the core `SparseReconciler`
-//! by:
-//! 1. Loading data from CSV.
-//! 2. Building supplies and unmatched penalty arrays.
-//! 3. Creating a **Reference and Proximity Blocker** to generate sparse candidate
-//!    edges, avoiding the O(N^2) fully dense scaling wall.
-//! 4. Running the solver in milliseconds.
-//! 5. Mapping indices back to print a detailed business report.
+//! Shows the ergonomic path: implement `Model` once (numeraire = USD cents,
+//! proximity key = GL date, cost = matching quality), then stream transactions
+//! in via `upsert`, `solve`, and read back netted groups.
 
-use florecon::SparseReconciler;
-use std::collections::{HashMap, HashSet};
+use florecon::recon::{Model, Reconciler};
+use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// Client-side Data Model
+// Data model
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
@@ -24,19 +19,14 @@ struct IntercoTx {
     row: usize,
     policy: Policy,
     co: String,
-    objsub: String,
     icp: String,
     reference: String,
-    description: String,
     business_unit: String,
     gl_date_days: i64,
     usd_amt: f64,
     co_cleaned: String,
     icp_cleaned: String,
-    objsub_cleaned: String,
     ref_cleaned: String,
-    desc_cleaned: String,
-    log_value: f64,
     trx_currency: String,
     trx_amt: f64,
 }
@@ -56,166 +46,46 @@ impl IntercoTx {
             "GA" => Policy::GA,
             _ => return None,
         };
-
         let co = record.get(3)?.trim().to_string();
         let objsub = record.get(6)?.trim().to_string();
+        let _ = objsub;
         let icp = record.get(13)?.trim().to_string();
         let reference = record.get(20)?.trim().to_string();
-        let description = record.get(22)?.trim().to_string();
         let business_unit = record.get(37)?.trim().to_string();
-
         let fc_amt: f64 = record.get(27)?.parse().ok()?;
         let usd_amt: f64 = record.get(43)?.parse().ok()?;
-
-        let signed_usd = match policy {
-            Policy::AR => usd_amt.abs(),
-            Policy::AP => -usd_amt.abs(),
-            Policy::GA => {
-                if fc_amt >= 0.0 {
-                    usd_amt.abs()
-                } else {
-                    -usd_amt.abs()
-                }
-            }
-        };
-
-        let gl_date_str = record.get(28)?;
-        let gl_date_days = parse_date(gl_date_str).unwrap_or(0);
-
-        let trx_currency = record
-            .get(25)
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        let gl_date_days = parse_date(record.get(28)?).unwrap_or(0);
+        let trx_currency = record.get(25).map(|s| s.trim().to_string()).unwrap_or_default();
         let trx_amt: f64 = record.get(26).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-
-        let co_cleaned = co.trim().trim_start_matches('0').to_string();
-        let icp_cleaned = icp.trim().trim_start_matches('0').to_string();
-        let objsub_cleaned = objsub.trim().to_string();
-        let ref_cleaned = reference.trim().to_string();
-        let desc_cleaned = description.trim().to_string();
-        let log_value = signed_usd.abs().ln_1p();
-
-        Some(IntercoTx {
+        Some(Self::build(
             row,
             policy,
             co,
-            objsub,
             icp,
             reference,
-            description,
             business_unit,
             gl_date_days,
-            usd_amt: signed_usd,
-            co_cleaned,
-            icp_cleaned,
-            objsub_cleaned,
-            ref_cleaned,
-            desc_cleaned,
-            log_value,
+            fc_amt,
+            usd_amt,
             trx_currency,
             trx_amt,
-        })
+        ))
     }
 
-    fn from_parquet_row(row_idx: usize, row: &parquet::record::Row) -> Option<Self> {
-        let mut policy = None;
-        let mut co = String::new();
-        let mut objsub = String::new();
-        let mut icp = String::new();
-        let mut reference = String::new();
-        let mut description = String::new();
-        let mut business_unit = String::new();
-        let mut fc_amt = 0.0;
-        let mut usd_amt = 0.0;
-        let mut gl_date_days = 0;
-        let mut trx_currency = String::new();
-        let mut trx_amt = 0.0;
-
-        for (name, field) in row.get_column_iter() {
-            match name.as_str() {
-                "source_policy" => {
-                    if let parquet::record::Field::Str(s) = field {
-                        policy = match s.as_str() {
-                            "AR" => Some(Policy::AR),
-                            "AP" => Some(Policy::AP),
-                            "GA" => Some(Policy::GA),
-                            _ => None,
-                        };
-                    }
-                }
-                "company" => {
-                    if let parquet::record::Field::Str(s) = field {
-                        co = s.trim().to_string();
-                    }
-                }
-                "objsub" => {
-                    if let parquet::record::Field::Str(s) = field {
-                        objsub = s.trim().to_string();
-                    }
-                }
-                "icp" => {
-                    if let parquet::record::Field::Str(s) = field {
-                        icp = s.trim().to_string();
-                    }
-                }
-                "reference" => {
-                    if let parquet::record::Field::Str(s) = field {
-                        reference = s.trim().to_string();
-                    }
-                }
-                "description" => {
-                    if let parquet::record::Field::Str(s) = field {
-                        description = s.trim().to_string();
-                    }
-                }
-                "business_unit" => {
-                    if let parquet::record::Field::Str(s) = field {
-                        business_unit = s.trim().to_string();
-                    }
-                }
-                "fc_amt" => {
-                    fc_amt = match field {
-                        parquet::record::Field::Double(d) => *d,
-                        parquet::record::Field::Float(f) => *f as f64,
-                        parquet::record::Field::Int(i) => *i as f64,
-                        parquet::record::Field::Long(l) => *l as f64,
-                        _ => 0.0,
-                    };
-                }
-                "indicative_usd_amt" => {
-                    usd_amt = match field {
-                        parquet::record::Field::Double(d) => *d,
-                        parquet::record::Field::Float(f) => *f as f64,
-                        parquet::record::Field::Int(i) => *i as f64,
-                        parquet::record::Field::Long(l) => *l as f64,
-                        _ => 0.0,
-                    };
-                }
-                "trx_currency" => {
-                    if let parquet::record::Field::Str(s) = field {
-                        trx_currency = s.trim().to_string();
-                    }
-                }
-                "trx_amt" => {
-                    trx_amt = match field {
-                        parquet::record::Field::Double(d) => *d,
-                        parquet::record::Field::Float(f) => *f as f64,
-                        parquet::record::Field::Int(i) => *i as f64,
-                        parquet::record::Field::Long(l) => *l as f64,
-                        _ => 0.0,
-                    };
-                }
-                "gl_date" => {
-                    if let parquet::record::Field::Date(days) = field {
-                        gl_date_days = *days as i64;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let policy = policy?;
-
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        row: usize,
+        policy: Policy,
+        co: String,
+        icp: String,
+        reference: String,
+        business_unit: String,
+        gl_date_days: i64,
+        fc_amt: f64,
+        usd_amt: f64,
+        trx_currency: String,
+        trx_amt: f64,
+    ) -> Self {
         let signed_usd = match policy {
             Policy::AR => usd_amt.abs(),
             Policy::AP => -usd_amt.abs(),
@@ -227,33 +97,24 @@ impl IntercoTx {
                 }
             }
         };
-
         let co_cleaned = co.trim().trim_start_matches('0').to_string();
         let icp_cleaned = icp.trim().trim_start_matches('0').to_string();
-        let objsub_cleaned = objsub.trim().to_string();
         let ref_cleaned = reference.trim().to_string();
-        let desc_cleaned = description.trim().to_string();
-
-        Some(IntercoTx {
-            row: row_idx + 2,
+        IntercoTx {
+            row,
             policy,
             co,
-            objsub,
             icp,
             reference,
-            description,
             business_unit,
             gl_date_days,
             usd_amt: signed_usd,
             co_cleaned,
             icp_cleaned,
-            objsub_cleaned,
             ref_cleaned,
-            desc_cleaned,
-            log_value: signed_usd.abs().ln_1p(),
             trx_currency,
             trx_amt,
-        })
+        }
     }
 }
 
@@ -279,343 +140,82 @@ fn parse_date(s: &str) -> Option<i64> {
             };
             let year: i64 = parts[2].parse().ok()?;
             let year = if year < 50 { 2000 + year } else { 1900 + year };
-            let days_since_2020 = (year - 2020) * 365 + (month - 1) * 30 + day;
-            return Some(days_since_2020);
+            return Some((year - 2020) * 365 + (month - 1) * 30 + day);
         }
     }
     None
 }
 
 // ---------------------------------------------------------------------------
-// Client-side Cost Function
+// The Model
 // ---------------------------------------------------------------------------
 
-fn compute_cost(
-    a: &IntercoTx,
-    b: &IntercoTx,
-    ref_counts: &HashMap<String, usize>,
+struct IntercoModel {
+    ref_counts: HashMap<String, usize>,
     total_txs: usize,
-) -> f64 {
-    // Only connect opposite signs
-    if a.usd_amt.signum() == b.usd_amt.signum() {
-        return f64::MAX;
-    }
-
-    let exact_val = (a.usd_amt + b.usd_amt).abs() < 0.01;
-    let close_val = (a.usd_amt + b.usd_amt) / (a.usd_amt.abs() + b.usd_amt.abs()) < 0.001;
-
-    let exact_trx_val = !a.trx_currency.is_empty()
-        && a.trx_currency == b.trx_currency
-        && (a.trx_amt + b.trx_amt).abs() < 0.01;
-
-    let close_trx_val = !a.trx_currency.is_empty()
-        && a.trx_currency == b.trx_currency
-        && (a.trx_amt + b.trx_amt) / (a.trx_amt.abs() + b.trx_amt.abs()) < 0.001;
-
-    let good_val = close_trx_val || exact_trx_val || close_val || exact_val;
-
-    let date_within_3_days = (a.gl_date_days - b.gl_date_days).abs() <= 3;
-
-    // 1. Identify if we have a text link (ref-ref, or ref-desc cross match)
-    let matched_ref_str = Some(&a.ref_cleaned);
-
-    // 2. Calculate the IDF "Quality" of the reference (0.0 = garbage/common, 1.0 = highly unique)
-    let mut ref_quality = 0.0;
-    if let Some(ref_str) = matched_ref_str {
-        // Fallback to 1 if not found (meaning it's extremely rare)
-        let count = *ref_counts.get(ref_str).unwrap_or(&1);
-
-        // IDF = ln(N / frequency)
-        let idf = (total_txs as f64 / count as f64).ln().max(0.0);
-        // Max theoretical IDF happens when a reference appears exactly twice (a perfect pair)
-        let max_idf = (total_txs as f64 / 2.0).max(2.0).ln();
-
-        ref_quality = (idf / max_idf).clamp(0.0, 1.0);
-    }
-
-    let exact_ref = matched_ref_str.is_some();
-
-    // 3. Establish base cost using the Reference Quality
-    let base_cost = if good_val && exact_ref && date_within_3_days {
-        // Holy Grail: Exact value AND exact reference.
-        // If ref is highly unique, cost is 1.0. If ref is generic "NA", cost scales up to 10.0.
-        1.0 + ((1.0 - ref_quality) * 9.0)
-    } else if exact_ref {
-        // Partial/Split value, but references match.
-        // If ref is highly unique, cost is 5.0. If ref is generic, cost scales up to 50.0
-        // (making it highly unlikely to group partials based on a garbage reference).
-        5.0 + ((1.0 - ref_quality) * 45.0)
-    } else if good_val && date_within_3_days {
-        10.0
-    } else if good_val {
-        // Values match perfectly, but no text links them.
-        50.0
-    } else {
-        // Desperation match: Nothing matches.
-        200.0
-    };
-
-    // 5. Absolute Value Penalty
-    // Adds $0.10 of cost for every $1.00 of residual mismatch.
-    // This strictly punishes leaving messy unmatched residuals!
-    let val_diff = (a.usd_amt.abs() - b.usd_amt.abs()).abs();
-    let value_penalty = val_diff * 0.10;
-
-    // 6. Date Proximity Penalty (5.0 cost units per day apart)
-    let date_diff = (a.gl_date_days - b.gl_date_days).abs() as f64;
-    let date_penalty = date_diff * 0.5;
-
-    base_cost + value_penalty + date_penalty
+    window_days: i64,
+    max_value_ratio: f64,
 }
 
-// ---------------------------------------------------------------------------
-// Reporting
-// ---------------------------------------------------------------------------
+impl Model for IntercoModel {
+    type Tx = IntercoTx;
 
-fn print_report(matches: &[florecon::SparseMatch], txs: &[IntercoTx], unmatched_indices: &[usize]) {
-    let mut ref_counts = HashMap::new();
-    for tx in txs {
-        if !tx.ref_cleaned.is_empty() {
-            *ref_counts.entry(tx.ref_cleaned.clone()).or_insert(0) += 1;
+    fn base_amount(&self, tx: &IntercoTx) -> i64 {
+        (tx.usd_amt * 100.0).round() as i64
+    }
+
+    fn penalty(&self, _tx: &IntercoTx) -> f64 {
+        1_000_000.0
+    }
+
+    fn block_key(&self, tx: &IntercoTx) -> i64 {
+        tx.gl_date_days
+    }
+
+    fn window(&self) -> i64 {
+        self.window_days
+    }
+
+    fn cost(&self, a: &IntercoTx, b: &IntercoTx) -> Option<f64> {
+        // Value-ratio gate.
+        let ratio =
+            a.usd_amt.abs().max(b.usd_amt.abs()) / a.usd_amt.abs().min(b.usd_amt.abs()).max(0.01);
+        if ratio > self.max_value_ratio {
+            return None;
         }
+
+        let exact_val = (a.usd_amt + b.usd_amt).abs() < 0.01;
+        let close_val = (a.usd_amt + b.usd_amt) / (a.usd_amt.abs() + b.usd_amt.abs()) < 0.001;
+        let same_ccy = !a.trx_currency.is_empty() && a.trx_currency == b.trx_currency;
+        let exact_trx = same_ccy && (a.trx_amt + b.trx_amt).abs() < 0.01;
+        let close_trx = same_ccy && (a.trx_amt + b.trx_amt) / (a.trx_amt.abs() + b.trx_amt.abs()) < 0.001;
+        let good_val = exact_val || close_val || exact_trx || close_trx;
+        let date_within_3 = (a.gl_date_days - b.gl_date_days).abs() <= 3;
+
+        // IDF quality of the reference.
+        let ref_str = &a.ref_cleaned;
+        let count = *self.ref_counts.get(ref_str).unwrap_or(&1);
+        let idf = (self.total_txs as f64 / count as f64).ln().max(0.0);
+        let max_idf = (self.total_txs as f64 / 2.0).max(2.0).ln();
+        let ref_quality = (idf / max_idf).clamp(0.0, 1.0);
+        let exact_ref = !ref_str.is_empty();
+
+        let base_cost = if good_val && exact_ref && date_within_3 {
+            1.0 + (1.0 - ref_quality) * 9.0
+        } else if exact_ref {
+            5.0 + (1.0 - ref_quality) * 45.0
+        } else if good_val && date_within_3 {
+            10.0
+        } else if good_val {
+            50.0
+        } else {
+            200.0
+        };
+
+        let val_diff = (a.usd_amt.abs() - b.usd_amt.abs()).abs();
+        let date_diff = (a.gl_date_days - b.gl_date_days).abs() as f64;
+        Some(base_cost + val_diff * 0.10 + date_diff * 0.5)
     }
-    let total_txs = txs.len();
-
-    println!("\n{}", "=".repeat(90));
-    println!("  SPARSE RECONCILIATION REPORT");
-    println!("{}", "=".repeat(90));
-
-    let total_matched_abs: f64 = matches.iter().map(|m| m.flow).sum::<f64>() * 2.0; // flow counts on both sides
-    let total_unmatched_abs: f64 = unmatched_indices
-        .iter()
-        .map(|&i| txs[i].usd_amt.abs())
-        .sum();
-    let total_input_abs: f64 = txs.iter().map(|t| t.usd_amt.abs()).sum();
-
-    let mut matched_set = HashSet::new();
-    for m in matches {
-        matched_set.insert(m.source_idx);
-        matched_set.insert(m.sink_idx);
-    }
-    let matched_rows_count = matched_set.len();
-    let unmatched_rows_count = txs.len() - matched_rows_count;
-
-    println!("\n  📊 SUMMARY");
-    println!("  ──────────────────────────────────────────────────────────────────────────");
-    println!("  Total input rows:        {:>5}", txs.len());
-    println!(
-        "  Matched rows:            {:>5}  ({:.1}%)",
-        matched_rows_count,
-        100.0 * matched_rows_count as f64 / txs.len() as f64
-    );
-    println!(
-        "  Unmatched rows:          {:>5}  ({:.1}%)",
-        unmatched_rows_count,
-        100.0 * unmatched_rows_count as f64 / txs.len() as f64
-    );
-    println!("  Total matches found:     {:>5}", matches.len());
-    println!(
-        "  Total value matched:     {:>15.2}  ({:.1}% of {:>15.2})",
-        total_matched_abs / 2.0,
-        100.0 * (total_matched_abs / 2.0) / total_input_abs,
-        total_input_abs
-    );
-    println!("  Total value unmatched:   {:>15.2}", total_unmatched_abs);
-
-    // Grouping matches into components for display
-    let mut adj = vec![Vec::new(); txs.len()];
-    for m in matches {
-        adj[m.source_idx].push(m.sink_idx);
-        adj[m.sink_idx].push(m.source_idx);
-    }
-
-    let mut visited = vec![false; txs.len()];
-    let mut groups = Vec::new();
-
-    for start in 0..txs.len() {
-        if visited[start] || adj[start].is_empty() {
-            continue;
-        }
-        let mut group = Vec::new();
-        let mut stack = vec![start];
-        visited[start] = true;
-        while let Some(node) = stack.pop() {
-            group.push(node);
-            for &nb in &adj[node] {
-                if !visited[nb] {
-                    visited[nb] = true;
-                    stack.push(nb);
-                }
-            }
-        }
-        groups.push(group);
-    }
-
-    // Group size distribution
-    let mut size_counts = HashMap::new();
-    for g in &groups {
-        *size_counts.entry(g.len()).or_insert(0) += 1;
-    }
-    let mut sizes: Vec<_> = size_counts.iter().collect();
-    sizes.sort_by_key(|(k, _)| *k);
-
-    println!("\n  📐 GROUP SIZE DISTRIBUTION");
-    println!("  ──────────────────────────────────────────────────────────────────────────");
-    for (size, count) in sizes {
-        println!(
-            "    Size {:>2}: {:>4} groups  {}",
-            size,
-            count,
-            "█".repeat((*count).min(50))
-        );
-    }
-
-    // Clean matches
-    println!("\n  🟢 CLEAN MATCHES (net ≈ 0, same reference) — first 10");
-    println!("  ──────────────────────────────────────────────────────────────────────────");
-    let clean_groups: Vec<_> = groups
-        .iter()
-        .filter(|g| {
-            let net: f64 = g.iter().map(|&idx| txs[idx].usd_amt).sum();
-            net.abs() < 1.0
-        })
-        .filter(|g| {
-            let refs: Vec<&str> = g
-                .iter()
-                .map(|&idx| txs[idx].reference.as_str())
-                .filter(|r| !r.is_empty())
-                .collect();
-            refs.len() >= 2 && refs.iter().all(|r| *r == refs[0])
-        })
-        .collect();
-
-    for (i, g) in clean_groups.iter().take(10).enumerate() {
-        let ar: f64 = g
-            .iter()
-            .filter(|&&idx| txs[idx].policy == Policy::AR)
-            .map(|&idx| txs[idx].usd_amt)
-            .sum();
-        let ap: f64 = g
-            .iter()
-            .filter(|&&idx| txs[idx].policy == Policy::AP)
-            .map(|&idx| txs[idx].usd_amt)
-            .sum();
-        let ga: f64 = g
-            .iter()
-            .filter(|&&idx| txs[idx].policy == Policy::GA)
-            .map(|&idx| txs[idx].usd_amt)
-            .sum();
-        let ref_name = txs[g[0]].reference.clone();
-        let net: f64 = g.iter().map(|&idx| txs[idx].usd_amt).sum();
-        println!("\n    Group {}: {} txns | ref={}", i + 1, g.len(), ref_name);
-        println!(
-            "      AR={:>12.2}  AP={:>12.2}  GA={:>12.2}  NET={:>10.2}",
-            ar, ap, ga, net
-        );
-
-        // Show link costs
-        for ii in 0..g.len() {
-            for jj in ii + 1..g.len() {
-                let a = &txs[g[ii]];
-                let b = &txs[g[jj]];
-                if a.usd_amt * b.usd_amt < 0.0 {
-                    println!(
-                        "        link cost [{:?}↔{:?}]: {:>8.2}  ({:>10.2} vs {:>10.2})",
-                        a.policy,
-                        b.policy,
-                        compute_cost(a, b, &ref_counts, total_txs),
-                        a.usd_amt,
-                        b.usd_amt
-                    );
-                }
-            }
-        }
-        for &idx in *g {
-            let t = &txs[idx];
-            println!(
-                "        [{:>3}] {:?}  {:>12.2}  bu={}",
-                t.row, t.policy, t.usd_amt, t.business_unit
-            );
-        }
-    }
-
-    // Residual groups
-    let residual_groups: Vec<_> = groups
-        .iter()
-        .filter(|g| {
-            let net: f64 = g.iter().map(|&idx| txs[idx].usd_amt).sum();
-            net.abs() >= 1.0
-        })
-        .collect();
-
-    if !residual_groups.is_empty() {
-        println!(
-            "\n  🟡 RESIDUAL GROUPS (net ≠ 0) — all {} shown",
-            residual_groups.len()
-        );
-        println!("  ──────────────────────────────────────────────────────────────────────────");
-        for (i, g) in residual_groups.iter().enumerate() {
-            let ar: f64 = g
-                .iter()
-                .filter(|&&idx| txs[idx].policy == Policy::AR)
-                .map(|&idx| txs[idx].usd_amt)
-                .sum();
-            let ap: f64 = g
-                .iter()
-                .filter(|&&idx| txs[idx].policy == Policy::AP)
-                .map(|&idx| txs[idx].usd_amt)
-                .sum();
-            let ga: f64 = g
-                .iter()
-                .filter(|&&idx| txs[idx].policy == Policy::GA)
-                .map(|&idx| txs[idx].usd_amt)
-                .sum();
-            let net: f64 = g.iter().map(|&idx| txs[idx].usd_amt).sum();
-
-            let refs: HashSet<&str> = g
-                .iter()
-                .map(|&idx| txs[idx].reference.as_str())
-                .filter(|r| !r.is_empty() && *r != "nan")
-                .collect();
-
-            println!(
-                "\n    Group {}: {} txns | refs={:?} | NET={:>12.2}",
-                i + 1,
-                g.len(),
-                refs,
-                net
-            );
-            println!("      AR={:>12.2}  AP={:>12.2}  GA={:>12.2}", ar, ap, ga);
-            for &idx in *g {
-                let t = &txs[idx];
-                println!(
-                    "        [{:>3}] {:?}  {:>12.2}  ref={:<20}  bu={}",
-                    t.row, t.policy, t.usd_amt, t.reference, t.business_unit
-                );
-            }
-        }
-    }
-
-    // Unmatched
-    if !unmatched_indices.is_empty() {
-        println!("\n  🔴 UNMATCHED TRANSACTIONS — first 10");
-        println!("  ──────────────────────────────────────────────────────────────────────────");
-        for &idx in unmatched_indices.iter().take(10) {
-            let t = &txs[idx];
-            println!(
-                "    [{:>3}] {:?}  {:>12.2}  ref={:<20}  bu={}",
-                t.row, t.policy, t.usd_amt, t.reference, t.business_unit
-            );
-        }
-        if unmatched_indices.len() > 10 {
-            println!(
-                "    ... and {} more unmatched",
-                unmatched_indices.len() - 10
-            );
-        }
-    }
-
-    println!("\n{}", "=".repeat(90));
 }
 
 // ---------------------------------------------------------------------------
@@ -624,213 +224,97 @@ fn print_report(matches: &[florecon::SparseMatch], txs: &[IntercoTx], unmatched_
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let path = args
-        .get(1)
-        .map(|s| s.as_str())
-        .unwrap_or("data/ledger.csv");
+    let path = args.get(1).map(|s| s.as_str()).unwrap_or("data/ledger.csv");
     let filter_co = args.get(2).cloned();
-    let row_offset: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2);
+    let window_days: i64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(90);
 
     let filter_cos: Option<Vec<String>> = filter_co
         .as_ref()
-        .map(|s| s.split(',').map(|part| part.trim().to_string()).collect());
+        .map(|s| s.split(',').map(|p| p.trim().to_string()).collect());
 
-    if let Some(ref filter) = filter_co {
-        println!(
-            "Loading intercompany data from: {} (filtered by company list: {}, row offset: {})",
-            path, filter, row_offset
-        );
-    } else {
-        println!(
-            "Loading intercompany data from: {} (row offset: {})",
-            path, row_offset
-        );
-    }
+    println!("Loading {path} (window = {window_days} days)");
 
-    let mut transactions: Vec<IntercoTx> = Vec::new();
-
-    if path.to_lowercase().ends_with(".parquet") {
-        use parquet::file::reader::FileReader;
-        let file = std::fs::File::open(path).expect("Failed to open Parquet file");
-        let reader = parquet::file::reader::SerializedFileReader::new(file)
-            .expect("Failed to create Parquet reader");
-        let row_iter = reader
-            .get_row_iter(None)
-            .expect("Failed to get row iterator");
-
-        for (row_idx, row_res) in row_iter.enumerate() {
-            let row = row_res.expect("Failed to read Parquet row");
-            if let Some(tx) = IntercoTx::from_parquet_row(row_idx, &row)
-                && tx.usd_amt.abs() > 0.01
-            {
-                if let Some(ref filters) = filter_cos {
-                    let co_matched = filters.iter().any(|filter| {
-                        let filter_clean = filter.trim_start_matches('0');
-                        tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
-                    });
-                    let icp_matched = filters.iter().any(|filter| {
-                        let filter_clean = filter.trim_start_matches('0');
-                        tx.icp_cleaned == filter_clean || tx.icp.trim() == filter.as_str()
-                    });
-                    let matched = if filters.len() > 1 {
-                        co_matched && icp_matched
-                    } else {
-                        co_matched
-                    };
-                    if matched {
-                        transactions.push(tx);
-                    }
-                } else {
-                    transactions.push(tx);
-                }
+    let mut rdr = csv::Reader::from_path(path).expect("Failed to open CSV");
+    let mut txs: Vec<IntercoTx> = Vec::new();
+    for (i, result) in rdr.records().enumerate() {
+        let record = result.expect("bad record");
+        let Some(tx) = IntercoTx::from_csv_record(i + 2, &record) else {
+            continue;
+        };
+        if tx.usd_amt.abs() <= 0.01 {
+            continue;
+        }
+        if let Some(filters) = &filter_cos {
+            let matches = |a: &str, b: &str| {
+                filters
+                    .iter()
+                    .any(|f| a == f.trim_start_matches('0') || b == f.as_str())
+            };
+            let co_ok = matches(&tx.co_cleaned, tx.co.trim());
+            let icp_ok = matches(&tx.icp_cleaned, tx.icp.trim());
+            let keep = if filters.len() > 1 { co_ok && icp_ok } else { co_ok };
+            if !keep {
+                continue;
             }
         }
-    } else {
-        let mut rdr = csv::Reader::from_path(path).expect("Failed to open CSV");
-        for (row_idx, result) in rdr.records().enumerate() {
-            let record = result.expect("Failed to read CSV record");
-            if let Some(tx) = IntercoTx::from_csv_record(row_idx + 2, &record)
-                && tx.usd_amt.abs() > 0.01
-            {
-                if let Some(ref filters) = filter_cos {
-                    let co_matched = filters.iter().any(|filter| {
-                        let filter_clean = filter.trim_start_matches('0');
-                        tx.co_cleaned == filter_clean || tx.co.trim() == filter.as_str()
-                    });
-                    let icp_matched = filters.iter().any(|filter| {
-                        let filter_clean = filter.trim_start_matches('0');
-                        tx.icp_cleaned == filter_clean || tx.icp.trim() == filter.as_str()
-                    });
-                    let matched = if filters.len() > 1 {
-                        co_matched && icp_matched
-                    } else {
-                        co_matched
-                    };
-                    if matched {
-                        transactions.push(tx);
-                    }
-                } else {
-                    transactions.push(tx);
-                }
-            }
-        }
+        txs.push(tx);
     }
 
-    let n = transactions.len();
-    println!("Loaded {} transactions", n);
+    let n = txs.len();
+    println!("Loaded {n} transactions");
 
-    // 1. Sort the transactions by gl_date_days, and secondarily by signed usd_amt.
-    transactions.sort_by(|a, b| {
-        a.gl_date_days.cmp(&b.gl_date_days).then_with(|| {
-            a.usd_amt
-                .abs()
-                .partial_cmp(&b.usd_amt.abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    });
-
-    let ar_count = transactions
-        .iter()
-        .filter(|t| t.policy == Policy::AR)
-        .count();
-    let ap_count = transactions
-        .iter()
-        .filter(|t| t.policy == Policy::AP)
-        .count();
-    let ga_count = transactions
-        .iter()
-        .filter(|t| t.policy == Policy::GA)
-        .count();
-    let ar_sum: f64 = transactions
-        .iter()
-        .filter(|t| t.policy == Policy::AR)
-        .map(|t| t.usd_amt)
-        .sum();
-    let ap_sum: f64 = transactions
-        .iter()
-        .filter(|t| t.policy == Policy::AP)
-        .map(|t| t.usd_amt)
-        .sum();
-    let ga_sum: f64 = transactions
-        .iter()
-        .filter(|t| t.policy == Policy::GA)
-        .map(|t| t.usd_amt)
-        .sum();
-
-    println!("  AR: {:>3} rows, total = {:>15.2}", ar_count, ar_sum);
-    println!("  AP: {:>3} rows, total = {:>15.2}", ap_count, ap_sum);
-    println!("  GA: {:>3} rows, total = {:>15.2}", ga_count, ga_sum);
-    println!("  Net imbalance: {:>15.2}", ar_sum + ap_sum + ga_sum);
-
-    let max_date_diff = 90;
-    let max_value_ratio = 10.0;
-
-    // Supplies and Unmatched Penalties
-    let supplies: Vec<f64> = transactions.iter().map(|t| t.usd_amt).collect();
-    let penalties = vec![1_000_000.0; n];
-
-    // Pre-calculate reference string frequency counts to scale priors by cardinality/IDF
     let mut ref_counts = HashMap::new();
-    for tx in &transactions {
+    for tx in &txs {
         if !tx.ref_cleaned.is_empty() {
             *ref_counts.entry(tx.ref_cleaned.clone()).or_insert(0) += 1;
         }
     }
 
-    // 2. Generate sparse candidate edges within configurable row offset with pre-computed costs
-    let mut candidate_edges = Vec::new();
-    for i in 0..n {
-        if transactions[i].usd_amt > 0.0 {
-            let start = i.saturating_sub(row_offset);
-            let end = (i + row_offset).min(n - 1);
-            for j in start..=end {
-                if transactions[j].usd_amt < 0.0 {
-                    let s = &transactions[i];
-                    let t = &transactions[j];
+    let model = IntercoModel {
+        ref_counts,
+        total_txs: n,
+        window_days,
+        max_value_ratio: 10.0,
+    };
 
-                    // Compute cost
-                    let mut cost = compute_cost(s, t, &ref_counts, n);
+    let t0 = Instant::now();
+    let mut recon = Reconciler::new(model);
+    for (i, tx) in txs.iter().enumerate() {
+        recon.upsert(i as u64, tx.clone());
+    }
+    let status = recon.solve();
+    let elapsed = t0.elapsed();
+    println!("Solve {status:?} in {elapsed:?}");
 
-                    // Apply date-diff and value-ratio filters
-                    if (s.gl_date_days - t.gl_date_days).abs() > max_date_diff {
-                        cost = 1_000_000_000.0;
-                    }
-                    let ratio = s.usd_amt.abs().max(t.usd_amt.abs())
-                        / s.usd_amt.abs().min(t.usd_amt.abs()).max(0.01);
-                    if ratio > max_value_ratio {
-                        cost = 1_000_000_000.0;
-                    }
+    let groups = recon.groups();
+    let unmatched = recon.unmatched();
 
-                    candidate_edges.push((i, j, cost));
-                }
-            }
+    let matched_rows: usize = groups.iter().map(|g| g.members.len()).sum();
+    let clean = groups.iter().filter(|g| g.clean).count();
+    println!("\n  SUMMARY");
+    println!("  total rows:    {n}");
+    println!("  matched rows:  {matched_rows}");
+    println!("  unmatched:     {}", unmatched.len());
+    println!("  groups:        {} ({clean} clean, {} residual)", groups.len(), groups.len() - clean);
+
+    // group size distribution
+    let mut sizes: HashMap<usize, usize> = HashMap::new();
+    for g in &groups {
+        *sizes.entry(g.members.len()).or_insert(0) += 1;
+    }
+    let mut sizes: Vec<_> = sizes.into_iter().collect();
+    sizes.sort();
+    println!("\n  GROUP SIZE DISTRIBUTION");
+    for (size, count) in sizes {
+        println!("    size {size:>2}: {count:>4} {}", "#".repeat(count.min(50)));
+    }
+
+    println!("\n  RESIDUAL GROUPS (net != 0) — first 10");
+    for g in groups.iter().filter(|g| !g.clean).take(10) {
+        println!("    net={:>12.2}  members={:?}", g.net_base as f64 / 100.0, g.members);
+        for &id in &g.members {
+            let t = &txs[id as usize];
+            println!("      [{:>3}] {:?} {:>12.2} ref={}", t.row, t.policy, t.usd_amt, t.reference);
         }
     }
-
-    // --- Solve ---
-    println!(
-        "  Solving transportation sparse graph with Network Simplex (edges limit = {}, row offset = {})...",
-        candidate_edges.len(),
-        row_offset
-    );
-    let t_solve_start = Instant::now();
-    let mut reconciler = SparseReconciler::new(supplies);
-    reconciler
-        .update_costs(&penalties, &candidate_edges)
-        .unwrap();
-    let matches = reconciler.solve();
-    let t_solve = t_solve_start.elapsed();
-    println!("  Solve complete! Took: {:?}", t_solve);
-
-    // Identify unmatched indices
-    let mut matched_indices = HashSet::new();
-    for m in &matches {
-        matched_indices.insert(m.source_idx);
-        matched_indices.insert(m.sink_idx);
-    }
-    let unmatched_indices: Vec<usize> = (0..n)
-        .filter(|idx| !matched_indices.contains(idx))
-        .collect();
-
-    print_report(&matches, &transactions, &unmatched_indices);
 }
