@@ -31,6 +31,8 @@
 use log::{debug, warn};
 
 const NONE: u32 = u32::MAX;
+/// Sentinel for an uncapacitated upper bound.
+const INF: i64 = i64::MAX;
 const PRICING_TOLERANCE: f64 = -1e-9;
 
 /// Stable handle to a node. Cheap to copy; hold it to address the node later.
@@ -68,6 +70,17 @@ struct Node {
     penalty_arc: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+enum ArcState {
+    /// In the spanning-tree basis; `flow` is free between the bounds.
+    Basic,
+    /// Non-basic, resting at the lower bound (`flow == lower`).
+    AtLower,
+    /// Non-basic, resting at the upper bound (`flow == upper`).
+    AtUpper,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 struct Arc {
@@ -76,12 +89,22 @@ struct Arc {
     from: u32,
     to: u32,
     cost: f64,
-    /// Whether this arc is part of the current basis (spanning tree).
-    basic: bool,
-    /// Flow carried; only meaningful while `basic`.
+    /// Inclusive flow bounds.
+    lower: i64,
+    upper: i64,
+    /// Basis / bound state.
+    state: ArcState,
+    /// Flow carried (always within `[lower, upper]`).
     flow: i64,
     /// True for engine-managed penalty arcs (node <-> dummy).
     is_penalty: bool,
+}
+
+impl Arc {
+    #[inline]
+    fn is_basic(&self) -> bool {
+        matches!(self.state, ArcState::Basic)
+    }
 }
 
 /// Serializable, persistent basis state of a [`Network`]. Produce one with
@@ -240,7 +263,9 @@ impl Network {
             from,
             to,
             cost: penalty,
-            basic: true,
+            lower: 0,
+            upper: INF,
+            state: ArcState::Basic,
             flow,
             is_penalty: true,
         });
@@ -253,10 +278,22 @@ impl Network {
         }
     }
 
-    /// Add a directed real arc `from -> to` with the given cost.
+    /// Add a directed real arc `from -> to` with the given cost, uncapacitated.
     ///
     /// Incremental: the arc enters non-basic, so the basis is unchanged.
     pub fn add_arc(&mut self, from: NodeId, to: NodeId, cost: f64) -> Option<ArcId> {
+        self.add_arc_bounded(from, to, cost, 0, INF)
+    }
+
+    /// Add a directed real arc with explicit `[lower, upper]` flow bounds.
+    pub fn add_arc_bounded(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        cost: f64,
+        lower: i64,
+        upper: i64,
+    ) -> Option<ArcId> {
         let f = self.node_slot(from)? as u32;
         let t = self.node_slot(to)? as u32;
         let slot = self.raw_alloc_arc(Arc {
@@ -265,8 +302,10 @@ impl Network {
             from: f,
             to: t,
             cost,
-            basic: false,
-            flow: 0,
+            lower,
+            upper,
+            state: ArcState::AtLower,
+            flow: lower,
             is_penalty: false,
         });
         self.dirty = true;
@@ -281,6 +320,17 @@ impl Network {
     pub fn set_cost(&mut self, arc: ArcId, cost: f64) -> Option<()> {
         let s = self.arc_slot(arc)?;
         self.arcs[s].cost = cost;
+        self.dirty = true;
+        Some(())
+    }
+
+    /// Update an arc's flow bounds. Falls back to a feasible rebuild (changing
+    /// capacities can break the current basis).
+    pub fn set_bounds(&mut self, arc: ArcId, lower: i64, upper: i64) -> Option<()> {
+        let s = self.arc_slot(arc)?;
+        self.arcs[s].lower = lower;
+        self.arcs[s].upper = upper;
+        self.needs_rebuild = true;
         self.dirty = true;
         Some(())
     }
@@ -314,7 +364,7 @@ impl Network {
         if self.arcs[s].is_penalty {
             return None; // penalty arcs are engine-managed
         }
-        if self.arcs[s].basic {
+        if self.arcs[s].is_basic() {
             self.needs_rebuild = true;
         }
         self.arcs[s].alive = false;
@@ -331,7 +381,7 @@ impl Network {
         for a in 0..self.arcs.len() {
             let arc = &self.arcs[a];
             if arc.alive && (arc.from as usize == s || arc.to as usize == s) {
-                if arc.basic && !arc.is_penalty {
+                if arc.is_basic() && !arc.is_penalty {
                     self.needs_rebuild = true;
                 }
                 self.arcs[a].alive = false;
@@ -348,19 +398,20 @@ impl Network {
 
     // --- queries ---------------------------------------------------------
 
-    /// Flow currently routed on an arc (0 if non-basic or unknown).
+    /// Flow currently routed on an arc (includes arcs saturated at their upper
+    /// bound; 0 for unknown/stale handles).
     pub fn flow(&self, arc: ArcId) -> i64 {
         match self.arc_slot(arc) {
-            Some(s) if self.arcs[s].basic => self.arcs[s].flow,
-            _ => 0,
+            Some(s) => self.arcs[s].flow,
+            None => 0,
         }
     }
 
-    /// Iterate matched real arcs (basic, non-penalty, positive flow) as
-    /// `(from, to, flow)` triples.
+    /// Iterate matched real arcs (non-penalty arcs carrying positive flow,
+    /// whether basic or saturated) as `(from, to, flow)` triples.
     pub fn matches(&self) -> impl Iterator<Item = (NodeId, NodeId, i64)> + '_ {
         self.arcs.iter().filter_map(move |a| {
-            if a.alive && a.basic && !a.is_penalty && a.flow > 0 {
+            if a.alive && !a.is_penalty && a.flow > 0 {
                 Some((
                     NodeId {
                         slot: a.from,
@@ -381,6 +432,16 @@ impl Network {
     /// Number of alive real nodes (excluding the dummy).
     pub fn node_count(&self) -> usize {
         self.nodes.iter().filter(|n| n.alive).count() - 1
+    }
+
+    /// Total objective: sum of `cost * flow` over all alive arcs (matched flow
+    /// plus unmatched penalties).
+    pub fn total_cost(&self) -> f64 {
+        self.arcs
+            .iter()
+            .filter(|a| a.alive)
+            .map(|a| a.cost * a.flow as f64)
+            .sum()
     }
 
     // --- persistence -----------------------------------------------------
@@ -455,12 +516,12 @@ impl Network {
             }
             iterations += 1;
 
-            let Some((entering, rc)) = self.find_entering_arc() else {
+            let Some((entering, rc, dir)) = self.find_entering_arc() else {
                 debug!("optimal after {iterations} iterations");
                 break;
             };
 
-            if !self.pivot(entering, rc) {
+            if !self.pivot(entering, rc, dir) {
                 warn!("degenerate/unbounded: no leaving arc");
                 break;
             }
@@ -483,8 +544,8 @@ impl Network {
     fn rebuild_star_basis(&mut self) {
         for a in &mut self.arcs {
             if a.alive {
-                a.basic = false;
-                a.flow = 0;
+                a.state = ArcState::AtLower;
+                a.flow = a.lower;
             }
         }
         for s in 0..self.nodes.len() {
@@ -506,7 +567,7 @@ impl Network {
                 a.to = s as u32;
                 a.flow = -supply;
             }
-            a.basic = true;
+            a.state = ArcState::Basic;
         }
         self.dirty = true;
     }
@@ -517,7 +578,7 @@ impl Network {
             a.clear();
         }
         for (idx, arc) in self.arcs.iter().enumerate() {
-            if !arc.alive || !arc.basic {
+            if !arc.alive || !arc.is_basic() {
                 continue;
             }
             self.adj[arc.from as usize].push((arc.to, idx as u32, true));
@@ -559,18 +620,25 @@ impl Network {
         }
     }
 
-    /// Find a non-basic arc with negative reduced cost (Dantzig rule).
-    fn find_entering_arc(&self) -> Option<(u32, f64)> {
+    /// Find a non-basic arc that violates its optimality bound. Returns the
+    /// arc, its reduced cost, and the direction its flow should move
+    /// (`+1` from the lower bound, `-1` from the upper bound).
+    fn find_entering_arc(&self) -> Option<(u32, f64, i64)> {
         let mut best = None;
-        let mut best_rc = PRICING_TOLERANCE;
+        let mut best_viol = -PRICING_TOLERANCE; // positive threshold (~1e-9)
         for (idx, arc) in self.arcs.iter().enumerate() {
-            if !arc.alive || arc.basic {
+            if !arc.alive {
                 continue;
             }
             let rc = arc.cost - self.potential[arc.to as usize] + self.potential[arc.from as usize];
-            if rc < best_rc {
-                best_rc = rc;
-                best = Some((idx as u32, rc));
+            let (viol, dir) = match arc.state {
+                ArcState::AtLower => (-rc, 1i64), // improves by increasing if rc < 0
+                ArcState::AtUpper => (rc, -1i64), // improves by decreasing if rc > 0
+                ArcState::Basic => continue,
+            };
+            if viol > best_viol {
+                best_viol = viol;
+                best = Some((idx as u32, rc, dir));
             }
         }
         best
@@ -631,10 +699,11 @@ impl Network {
         }
     }
 
-    /// Perform one pivot around the cycle created by `entering` (reduced cost
-    /// `rc`). Updates flows, adjacency, and potentials incrementally. Returns
-    /// false if no leaving arc exists (unbounded — should not happen).
-    fn pivot(&mut self, entering: u32, rc: f64) -> bool {
+    /// Perform one bounded pivot around the cycle created by `entering`
+    /// (reduced cost `rc`, moving in `dir`). Handles capacity limits and
+    /// bound-flips (no basis change). Updates flows, adjacency, and potentials
+    /// incrementally. Returns false only if the problem is unbounded.
+    fn pivot(&mut self, entering: u32, rc: f64, dir: i64) -> bool {
         let (u, v) = {
             let a = &self.arcs[entering as usize];
             (a.from as usize, a.to as usize)
@@ -659,67 +728,91 @@ impl Network {
             }
         }
 
-        // Determine the maximum flow change theta and the leaving arc.
-        // Entering arc u->v carries +theta. On the cycle, an arc "decreases"
-        // when flow runs against its direction. Track which side (the subtree
-        // that will detach) the leaving arc sits on.
-        let mut min_theta = i64::MAX;
-        let mut leaving = NONE;
-        let mut leaving_on_v = true;
+        // Ratio test. The entering arc moves its flow by `dir * theta`; each
+        // cycle arc then increases or decreases. theta is bounded by the first
+        // arc to hit a bound (or the entering arc's own width => bound flip).
+        let limit = |inc: bool, a: &Arc| -> i64 {
+            if inc {
+                if a.upper == INF { INF } else { a.upper - a.flow }
+            } else {
+                a.flow - a.lower
+            }
+        };
+        let eff_inc = |nominal_inc: bool| if dir > 0 { nominal_inc } else { !nominal_inc };
+
+        // Start with the entering arc's own bound-flip width.
+        let mut best_theta = {
+            let a = &self.arcs[entering as usize];
+            if a.upper == INF { INF } else { a.upper - a.lower }
+        };
+        let mut leaving = NONE; // NONE => bound flip on the entering arc
+        let mut leaving_inc = false;
+        let mut leaving_on_v = false;
 
         for &w in &self.path_v {
             let idx = self.parent_arc[w as usize];
-            if self.parent_forward[w as usize] {
-                let flow = self.arcs[idx as usize].flow;
-                if flow <= min_theta {
-                    min_theta = flow;
-                    leaving = idx;
-                    leaving_on_v = true;
-                }
+            let inc = eff_inc(!self.parent_forward[w as usize]);
+            let lim = limit(inc, &self.arcs[idx as usize]);
+            if lim <= best_theta {
+                best_theta = lim;
+                leaving = idx;
+                leaving_inc = inc;
+                leaving_on_v = true;
             }
         }
         for &w in &self.path_u {
             let idx = self.parent_arc[w as usize];
-            if !self.parent_forward[w as usize] {
-                let flow = self.arcs[idx as usize].flow;
-                if flow <= min_theta {
-                    min_theta = flow;
-                    leaving = idx;
-                    leaving_on_v = false;
-                }
+            let inc = eff_inc(self.parent_forward[w as usize]);
+            let lim = limit(inc, &self.arcs[idx as usize]);
+            if lim <= best_theta {
+                best_theta = lim;
+                leaving = idx;
+                leaving_inc = inc;
+                leaving_on_v = false;
             }
         }
+
+        if best_theta == INF {
+            return false; // unbounded
+        }
+        let theta = best_theta;
+
+        // Apply flow changes around the cycle.
+        for &w in &self.path_v {
+            let idx = self.parent_arc[w as usize] as usize;
+            if eff_inc(!self.parent_forward[w as usize]) {
+                self.arcs[idx].flow += theta;
+            } else {
+                self.arcs[idx].flow -= theta;
+            }
+        }
+        for &w in &self.path_u {
+            let idx = self.parent_arc[w as usize] as usize;
+            if eff_inc(self.parent_forward[w as usize]) {
+                self.arcs[idx].flow += theta;
+            } else {
+                self.arcs[idx].flow -= theta;
+            }
+        }
+        self.arcs[entering as usize].flow += dir * theta;
 
         if leaving == NONE {
-            return false;
-        }
-        let theta = min_theta;
-
-        for &w in &self.path_v {
-            let idx = self.parent_arc[w as usize] as usize;
-            if self.parent_forward[w as usize] {
-                self.arcs[idx].flow -= theta;
-            } else {
-                self.arcs[idx].flow += theta;
-            }
-        }
-        for &w in &self.path_u {
-            let idx = self.parent_arc[w as usize] as usize;
-            if self.parent_forward[w as usize] {
-                self.arcs[idx].flow += theta;
-            } else {
-                self.arcs[idx].flow -= theta;
-            }
+            // Bound flip: the entering arc moves to its opposite bound; the
+            // basis (tree/potentials) is unchanged.
+            self.arcs[entering as usize].state =
+                if dir > 0 { ArcState::AtUpper } else { ArcState::AtLower };
+            return true;
         }
 
-        self.arcs[leaving as usize].basic = false;
-        self.arcs[leaving as usize].flow = 0;
-        self.arcs[entering as usize].basic = true;
-        self.arcs[entering as usize].flow = theta;
+        // Real pivot: leaving arc rests at the bound it hit; entering joins the
+        // basis.
+        self.arcs[leaving as usize].state =
+            if leaving_inc { ArcState::AtUpper } else { ArcState::AtLower };
+        self.arcs[entering as usize].state = ArcState::Basic;
 
         // Incremental structure + potential update. The detached subtree is the
         // one containing v (if leaving was on the v-side) or u (otherwise); it
-        // re-roots onto the opposite endpoint and shifts potentials by rc.
+        // re-roots onto the opposite endpoint and shifts potentials by ±rc.
         let (x, y, delta_pot) = if leaving_on_v {
             (v, u, rc)
         } else {
@@ -845,6 +938,104 @@ mod tests {
         net.solve();
         // 2000 unmatched penalty < no match? matching gone -> unmatched
         assert_eq!(matched_pairs(&net).len(), 0);
+    }
+
+    #[test]
+    fn capacity_caps_flow() {
+        // A single arc capped below the full amount: it should saturate at its
+        // upper bound, leaving the remainder unmatched.
+        let mut net = Network::new();
+        let s = net.add_node(100, 1000.0);
+        let t = net.add_node(-100, 1000.0);
+        let a = net.add_arc_bounded(s, t, 1.0, 0, 70).unwrap();
+        net.solve();
+        assert_eq!(net.flow(a), 70);
+    }
+
+    #[test]
+    fn capacity_splits_across_sinks() {
+        // Source must split: cheap sink is capacity-limited, rest spills to the
+        // pricier sink.
+        let mut net = Network::new();
+        let s = net.add_node(100, 1e6);
+        let t0 = net.add_node(-50, 1e6);
+        let t1 = net.add_node(-50, 1e6);
+        let a0 = net.add_arc_bounded(s, t0, 1.0, 0, 30).unwrap(); // cheap but capped
+        let a1 = net.add_arc(s, t1, 5.0).unwrap(); // pricier, uncapped
+        net.solve();
+        assert_eq!(net.flow(a0), 30);
+        // 70 remain; 50 fill t1, 20 of source unmatched (t0 short by 20).
+        assert_eq!(net.flow(a1), 50);
+    }
+
+    #[test]
+    fn set_bounds_then_resolve() {
+        let mut net = Network::new();
+        let s = net.add_node(100, 1000.0);
+        let t = net.add_node(-100, 1000.0);
+        let a = net.add_arc(s, t, 1.0).unwrap();
+        net.solve();
+        assert_eq!(net.flow(a), 100);
+        net.set_bounds(a, 0, 40);
+        net.solve();
+        assert_eq!(net.flow(a), 40);
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn capacitated_warm_matches_cold() {
+        // Random capacitated transportation driven through cost+bound mutations
+        // with warm re-solves; objective must match a cold build each round.
+        let mut seed: u64 = 0x0bad_f00d_1234_5678;
+        let mut rng = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let k = 4;
+        let supply = 20i64;
+
+        let mut warm = Network::new();
+        let ws: Vec<NodeId> = (0..k).map(|_| warm.add_node(supply, 100.0)).collect();
+        let wt: Vec<NodeId> = (0..k).map(|_| warm.add_node(-supply, 100.0)).collect();
+        let mut warc = vec![vec![]; k];
+        for r in 0..k {
+            for c in 0..k {
+                warc[r].push(warm.add_arc_bounded(ws[r], wt[c], 1.0, 0, supply).unwrap());
+            }
+        }
+
+        for round in 0..25 {
+            let costs: Vec<Vec<f64>> =
+                (0..k).map(|_| (0..k).map(|_| 1.0 + (rng() % 40) as f64).collect()).collect();
+            let caps: Vec<Vec<i64>> =
+                (0..k).map(|_| (0..k).map(|_| (rng() % (supply as u64 + 1)) as i64).collect()).collect();
+            for r in 0..k {
+                for c in 0..k {
+                    warm.set_cost(warc[r][c], costs[r][c]);
+                    warm.set_bounds(warc[r][c], 0, caps[r][c]);
+                }
+            }
+            warm.solve();
+            let warm_cost = warm.total_cost();
+
+            let mut cold = Network::new();
+            let cs: Vec<NodeId> = (0..k).map(|_| cold.add_node(supply, 100.0)).collect();
+            let ct: Vec<NodeId> = (0..k).map(|_| cold.add_node(-supply, 100.0)).collect();
+            for r in 0..k {
+                for c in 0..k {
+                    cold.add_arc_bounded(cs[r], ct[c], costs[r][c], 0, caps[r][c]);
+                }
+            }
+            cold.solve();
+            let cold_cost = cold.total_cost();
+
+            assert!(
+                (warm_cost - cold_cost).abs() < 1e-6,
+                "round {round}: warm {warm_cost} != cold {cold_cost}"
+            );
+        }
     }
 
     #[test]
