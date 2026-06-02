@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "florecon"
+version = "0.1.0"
+description = "Incremental financial reconciliation by min-cost flow — the engine as a single WASM core, driven from Python via wasmtime. Nothing created, nothing lost."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["reconciliation", "finance", "matching", "wasm", "min-cost-flow"]
+dependencies = ["wasmtime>=20"]
+
+[project.urls]
+Repository = "https://github.com/florecon/florecon"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+florecon = ["_engine.wasm"]
