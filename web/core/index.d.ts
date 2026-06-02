@@ -19,18 +19,32 @@ export interface Envelope {
   report?: Report | null;
 }
 
-/** A column value: an integer or a list of pre-hashed reference tokens. */
-export type Value = { Int: number } | { Tokens: number[] };
-export interface Row {
-  values: Value[];
-}
+/** A bare input cell: a number or a string. How it lowers is decided by its
+ * column's `kind` in the schema, not by the cell. A `number` column takes the
+ * integer as-is; a `key` column lowers a string to one id (a numeric cell is an
+ * already-numeric key); a `tokens` column lowers free text to a signal set. */
+export type Cell = number | string;
+/** A bare positional row: one Cell per schema column. */
+export type Row = Cell[];
 export type IdRow = [number, Row];
+
+/** How a column's cells lower. */
+export type Kind = "number" | "key" | "tokens";
+export interface Column {
+  name: string;
+  kind: Kind;
+}
+export interface Schema {
+  cols: Column[];
+  /** Stopwords for `tokens` lowering, matched upper-cased; optional. */
+  token_drop?: string[];
+}
 
 /** A serializable Plan node (tagged union on `op`). See the JSON Schema. */
 export type Plan = Record<string, unknown>;
 
 export interface SolveRequest {
-  schema: { cols: string[] };
+  schema: Schema;
   rows: IdRow[];
   plan: Plan;
 }

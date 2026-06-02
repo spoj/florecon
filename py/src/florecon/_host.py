@@ -7,7 +7,7 @@ import json
 import wasmtime
 
 # Must equal the engine's abi_version() export (plan::CONTRACT_VERSION).
-CONTRACT_VERSION = 3
+CONTRACT_VERSION = 4
 
 
 class ContractMismatch(RuntimeError):
@@ -74,7 +74,9 @@ class Workspace:
 
     def __init__(self, schema, pln, wasm_path=None, _engine: Florecon = None):
         self.fe = _engine or Florecon(wasm_path)
-        self.schema = {"cols": list(schema)}
+        # schema is a full dict ({"cols": [{name, kind}, ...], "token_drop": ...});
+        # a bare list of columns is tolerated.
+        self.schema = schema if isinstance(schema, dict) else {"cols": list(schema)}
         self.plan = pln
         self.last = self.fe.dispatch(
             {"op": "init", "schema": self.schema, "plan": pln, "rows": []}
@@ -82,7 +84,9 @@ class Workspace:
         _ok(self.last)
 
     def upsert(self, id: int, values) -> "Workspace":
-        self.last = self.fe.dispatch({"op": "upsert", "rows": [[id, {"values": list(values)}]]})
+        # values is a bare row: one scalar per column (int for number columns,
+        # str for key/tokens columns).
+        self.last = self.fe.dispatch({"op": "upsert", "rows": [[id, list(values)]]})
         _ok(self.last)
         return self
 

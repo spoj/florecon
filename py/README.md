@@ -5,9 +5,12 @@ WASM core embedded in this wheel and driven via `wasmtime` — there is no nativ
 extension to compile, so one `py3-none-any` wheel runs on every OS.
 
 ```python
-from florecon import Workspace, plan as P, Int, Tokens
+from florecon import Workspace, plan as P, schema, col, key, KEY, NUMBER, TOKENS
 
-schema = ["unit", "ccy", "day", "objsub", "native", "tokens"]
+sch = schema([
+    col("unit", KEY), col("ccy", KEY), col("day", NUMBER),
+    col("objsub", KEY), col("native", NUMBER), col("tokens", TOKENS),
+])
 pln = P.partition("unit", P.partition("ccy", P.seq(
     P.agg_net("objsub", "native", tol=100),
     P.exact("native"),
@@ -15,9 +18,10 @@ pln = P.partition("unit", P.partition("ccy", P.seq(
     P.flow("native", day="day", native="native", tokens="tokens"),
 )))
 
-ws = Workspace(schema, pln)
-ws.upsert(1, [Int(1), Int(1), Int(1), Int(0), Int(100), Tokens([])])
-ws.upsert(2, [Int(1), Int(1), Int(2), Int(0), Int(-100), Tokens([])])
+ws = Workspace(sch, pln)
+# bare cells: a string for key/tokens columns, an int for number columns
+ws.upsert(1, [key("00492", "00288"), "USD", 1, "61500", 100, "INV1"])
+ws.upsert(2, [key("00492", "00288"), "USD", 2, "61500", -100, "INV1"])
 ws.solve()
 print(ws.report())          # one clean group
 ```

@@ -19,17 +19,18 @@
 //! never silently lose or double-count mass.
 
 use crate::flow::{ExtId, Model};
-use crate::lower::{RawRow, TokenCfg};
+use crate::lower::{Kind, RawRow, TokenCfg};
 
 /// The wire-contract version: the shape of [`Plan`], [`Report`], and the WASM
 /// command set. Hosts (the Python wheel, the browser module) read it back from
 /// the engine and refuse to run against a mismatched binary. Bump it on any
 /// breaking change to those shapes.
 ///
-/// v3 grew the input value set: rows may carry business strings
-/// ([`crate::lower::RawValue::Str`]/`Pair`/`Text`) that the engine lowers,
-/// alongside the original pre-lowered `Int`/`Tokens`.
-pub const CONTRACT_VERSION: u32 = 3;
+/// v4 makes the business representation canonical: input values are
+/// [`crate::lower::RawValue`] (`Int` for genuine numbers, `Str`/`Pair`/`Text`
+/// for strings). The engine's lowered `Int`/`Tokens` form is an internal
+/// implementation detail — it is no longer accepted on the wire.
+pub const CONTRACT_VERSION: u32 = 4;
 use crate::strategy::{
     Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
 };
@@ -39,9 +40,11 @@ use std::collections::{BTreeMap, BTreeSet};
 // Typed records
 // ---------------------------------------------------------------------------
 
-/// A typed column value. Integers carry money (minor units), dates (days), and
-/// partition/bucket keys; token lists carry pre-hashed out-of-band signals
-/// (reference tokens) computed host-side.
+/// A typed column value the engine works on — the *lowered*, internal form,
+/// produced from a business [`RawCell`](crate::lower::RawCell) by
+/// [`crate::lower`]. `Int` carries money (minor units), dates (days), and
+/// partition/bucket keys; `Tokens` carries hashed reference signals. Callers do
+/// not construct this; they describe rows with bare cells and a [`Schema`].
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
@@ -49,28 +52,62 @@ pub enum Value {
     Tokens(Vec<u64>),
 }
 
-/// Column layout shared by every row in a [`Session`].
+/// One schema column: a name (referenced by the plan) and a [`Kind`] (how its
+/// cells lower).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Column {
+    pub name: String,
+    pub kind: Kind,
+}
+
+/// Column layout shared by every row in a [`Session`]: the ordered, typed
+/// columns plus the text-token policy. Lowering ([`crate::lower`]) reads the
+/// per-column [`Kind`]s; the plan references columns by name.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Schema {
-    cols: Vec<String>,
-    /// Stopwords for `Text` token lowering (see [`crate::lower::tokens`]),
-    /// matched upper-cased. Empty by default; carried here so the lowering
-    /// policy travels with the schema it applies to.
+    cols: Vec<Column>,
+    /// Stopwords for `Tokens` lowering (see [`crate::lower::tokens`]), matched
+    /// upper-cased. Empty by default; carried here so the lowering policy
+    /// travels with the schema it applies to.
     #[cfg_attr(feature = "serde", serde(default))]
     token_drop: Vec<String>,
 }
 
 impl Schema {
+    /// Schema from `(name, kind)` pairs.
+    pub fn typed<I, S>(cols: I) -> Self
+    where
+        I: IntoIterator<Item = (S, Kind)>,
+        S: Into<String>,
+    {
+        Schema {
+            cols: cols
+                .into_iter()
+                .map(|(name, kind)| Column {
+                    name: name.into(),
+                    kind,
+                })
+                .collect(),
+            token_drop: Vec::new(),
+        }
+    }
+
+    /// Schema from names alone, every column [`Kind::Number`]. A convenience for
+    /// engine-level callers that build lowered [`Row`]s directly (the kind only
+    /// matters when lowering bare cells).
     pub fn new<I, S>(cols: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Schema {
-            cols: cols.into_iter().map(Into::into).collect(),
-            token_drop: Vec::new(),
-        }
+        Schema::typed(cols.into_iter().map(|c| (c, Kind::Number)))
+    }
+
+    /// The per-column lowering kinds, positional against rows.
+    pub fn kinds(&self) -> Vec<Kind> {
+        self.cols.iter().map(|c| c.kind).collect()
     }
 
     /// The token-extraction policy for this schema (drop list from the schema,
@@ -93,7 +130,7 @@ impl Schema {
     fn index(&self, name: &str) -> Result<usize, ApiError> {
         self.cols
             .iter()
-            .position(|c| c == name)
+            .position(|c| c.name == name)
             .ok_or_else(|| ApiError::UnknownColumn(name.to_string()))
     }
 }
@@ -263,6 +300,9 @@ pub enum ApiError {
     FrozenMember(ExtId),
     /// A manual group needs at least two distinct members.
     DegenerateGroup,
+    /// A bare cell did not match its column [`Kind`] (e.g. a string in a
+    /// `Number` column). `col` is the column index; `want` the expected scalar.
+    BadCell { col: usize, want: &'static str },
 }
 
 impl std::fmt::Display for ApiError {
@@ -281,6 +321,9 @@ impl std::fmt::Display for ApiError {
                 write!(f, "row {id} is in a frozen group; unfreeze it first")
             }
             ApiError::DegenerateGroup => write!(f, "a manual group needs at least two rows"),
+            ApiError::BadCell { col, want } => {
+                write!(f, "column {col}: expected a {want}")
+            }
         }
     }
 }
@@ -628,10 +671,12 @@ impl SolveRequest {
     /// (partition check included).
     pub fn run(self) -> Result<Report, ApiError> {
         let cfg = self.schema.token_cfg();
+        let kinds = self.schema.kinds();
         let rows = self
             .rows
             .into_iter()
-            .map(|(id, raw)| (id, raw.lower(&cfg)));
+            .map(|(id, raw)| Ok((id, raw.lower(&kinds, &cfg)?)))
+            .collect::<Result<Vec<_>, ApiError>>()?;
         let session = Session::from_rows(self.schema, rows)?;
         session.solve(&self.plan)
     }
@@ -1068,10 +1113,10 @@ impl Workspace {
         Ok(())
     }
 
-    /// Insert or replace a row given business values, lowering strings to engine
-    /// ids via the workspace's schema before [`Self::upsert`].
+    /// Insert or replace a row given bare cells, lowering them to engine ids via
+    /// the workspace's schema (per-column [`Kind`]) before [`Self::upsert`].
     pub fn upsert_raw(&mut self, id: ExtId, raw: RawRow) -> Result<(), ApiError> {
-        let row = raw.lower(&self.schema.token_cfg());
+        let row = raw.lower(&self.schema.kinds(), &self.schema.token_cfg())?;
         self.upsert(id, row)
     }
 

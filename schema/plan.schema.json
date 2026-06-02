@@ -2,36 +2,44 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the Report. Contract version 3 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
-  "x-contract-version": 3,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the Report. Contract version 4 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
+  "x-contract-version": 4,
 
   "$defs": {
-    "Value": {
-      "description": "A business-level input value lowered to an engine integer host-side-or-in-rust. Int/Tokens pass through (already lowered, or genuinely numeric columns like money/dates); Str/Pair/Text carry strings the engine never sees, lowered via FNV-1a (see plan::CONTRACT_VERSION v3 and src/lower.rs).",
-      "oneOf": [
-        { "type": "object", "properties": { "Int": { "type": "integer" } }, "required": ["Int"], "additionalProperties": false },
-        { "type": "object", "properties": { "Tokens": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }, "required": ["Tokens"], "additionalProperties": false },
-        { "type": "object", "properties": { "Str": { "type": "string" } }, "required": ["Str"], "additionalProperties": false },
-        { "type": "object", "properties": { "Pair": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 } }, "required": ["Pair"], "additionalProperties": false },
-        { "type": "object", "properties": { "Text": { "type": "array", "items": { "type": "string" } } }, "required": ["Text"], "additionalProperties": false }
-      ]
+    "Cell": {
+      "description": "A bare input cell: a number or a string. How it lowers is decided by its column's Kind in the Schema, not by the cell, so there is no per-cell tag. A Number column takes the integer as-is; a Key column lowers a string via FNV-1a (a numeric cell is an already-lowered key); a Tokens column lowers a free-text string to a reference-token set. The lowered engine form is internal and never on the wire. See src/lower.rs.",
+      "type": ["integer", "string"]
+    },
+
+    "Kind": {
+      "description": "How a column's cells lower.",
+      "enum": ["number", "key", "tokens"]
+    },
+
+    "Column": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "kind": { "$ref": "#/$defs/Kind" }
+      },
+      "required": ["name", "kind"],
+      "additionalProperties": false
     },
 
     "Schema": {
       "type": "object",
       "properties": {
-        "cols": { "type": "array", "items": { "type": "string" } },
-        "token_drop": { "type": "array", "items": { "type": "string" }, "description": "stopwords for Text token lowering, matched upper-cased; optional" }
+        "cols": { "type": "array", "items": { "$ref": "#/$defs/Column" } },
+        "token_drop": { "type": "array", "items": { "type": "string" }, "description": "stopwords for Tokens lowering, matched upper-cased; optional" }
       },
       "required": ["cols"],
       "additionalProperties": false
     },
 
     "Row": {
-      "type": "object",
-      "properties": { "values": { "type": "array", "items": { "$ref": "#/$defs/Value" } } },
-      "required": ["values"],
-      "additionalProperties": false
+      "description": "A bare positional row: one Cell per schema column.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Cell" }
     },
 
     "IdRow": {

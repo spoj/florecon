@@ -15,7 +15,7 @@ import pyarrow.parquet as pq
 # Use the one canonical host — the wheel package under py/src — rather than a
 # second copy. Pinned ahead of any installed build so dev edits are live.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "py" / "src"))
-from florecon import Interner
+from florecon import KEY, NUMBER, TOKENS, col, key
 
 OUT = "web/data.json"
 FIELDS = ["reference", "reference2", "description", "name_remark_explanation", "invoice_no"]
@@ -86,8 +86,10 @@ def main():
             if co and icp and co != icp:
                 cnt[frozenset((co, icp))] += 1
         pair = cnt.most_common(1)[0][0]
-    schema = ["unit", "ccy", "day", "objsub", "native", "tokens"]
-    it = Interner()  # interning lives at the boundary, not in this script
+    schema = [
+        col("unit", KEY), col("ccy", KEY), col("day", NUMBER),
+        col("objsub", KEY), col("native", NUMBER), col("tokens", TOKENS),
+    ]
     rows, display = [], []
     for k in range(t.num_rows):
         if cols["is_offset"][k]:
@@ -107,14 +109,17 @@ def main():
         gl = cols["gl_date"][k]
         gl_day = gl.toordinal() - 719163 if gl else 0
         rid = len(rows)
-        rows.append([rid, {"values": [
-            it.pair(co, icp),
-            it.cat(ccy_s),
-            {"Int": gl_day},
-            it.cat(cols["objsub"][k] or ""),
-            {"Int": native_cents},
-            it.tokens([cols[f][k] for f in FIELDS], drop=("OFFSETENTRY",)),
-        ]}])
+        # Bare cells, positional against `schema`. The engine lowers strings
+        # (FNV-1a) by column kind; we ship business values, not hashes.
+        text = " ".join(s for s in (cols[f][k] for f in FIELDS) if s)
+        rows.append([rid, [
+            key(co, icp),                # unit: composite bilateral key
+            ccy_s,                       # ccy: categorical key
+            gl_day,                      # day: genuine integer
+            cols["objsub"][k] or "",     # objsub: categorical key
+            native_cents,                # native: money, minor units
+            text,                        # tokens: free text
+        ]])
         ref = " ".join(s for s in (cols["reference"][k], cols["reference2"][k],
                                    cols["description"][k]) if s).strip()
         base_ccy = cols["base_currency"][k] or ""
@@ -145,7 +150,7 @@ def main():
         if maxrows and len(rows) >= maxrows:
             break
 
-    out = {"pair": " / ".join(sorted(pair)), "schema": {"cols": schema},
+    out = {"pair": " / ".join(sorted(pair)), "schema": {"cols": schema, "token_drop": ["OFFSETENTRY"]},
            "plan": plan(), "fields": fields_spec(), "rows": rows, "display": display}
     import os
     os.makedirs("web", exist_ok=True)

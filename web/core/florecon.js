@@ -1,10 +1,11 @@
-// Browser host for the florecon WASM module — mirror of python/florecon.py.
-// The module has no imports; i64 returns arrive as BigInt.
+// Browser host for the florecon WASM module — a thin alloc/write/call/read
+// wrapper over linear memory. The module has no imports; i64 returns arrive as
+// BigInt.
 
 export class Florecon {
   // The wire-contract version this host speaks; must equal the engine's
   // abi_version() export. Bump in lockstep with plan::CONTRACT_VERSION.
-  static CONTRACT_VERSION = 3;
+  static CONTRACT_VERSION = 4;
 
   static async load(url) {
     const bytes = await (await fetch(url)).arrayBuffer();

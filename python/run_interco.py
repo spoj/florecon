@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 # Use the one canonical host — the wheel package under py/src — rather than a
 # second copy. Pinned ahead of any installed build so dev edits are live.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "py" / "src"))
-from florecon import Florecon, Interner
+from florecon import Florecon, KEY, NUMBER, TOKENS, col, key
 
 WASM = "target/wasm32-unknown-unknown/release/florecon.wasm"
 FIELDS = ["reference", "reference2", "description", "name_remark_explanation", "invoice_no"]
@@ -28,8 +28,10 @@ def ingest(path, pair=None, maxrows=None):
     t = pq.read_table(path, columns=COLS)
     cols = {n: t.column(n).to_pylist() for n in COLS}
     n = t.num_rows
-    schema = ["unit", "ccy", "day", "objsub", "native", "tokens"]
-    it = Interner()  # interning lives at the boundary, not in this script
+    schema = [
+        col("unit", KEY), col("ccy", KEY), col("day", NUMBER),
+        col("objsub", KEY), col("native", NUMBER), col("tokens", TOKENS),
+    ]
     rows, usd_by_id = [], []
     for i in range(n):
         if cols["is_offset"][i]:
@@ -52,14 +54,11 @@ def ingest(path, pair=None, maxrows=None):
         gl_day = gl.toordinal() - 719163 if gl else 0  # days since 1970-01-01
         rid = len(rows)
         usd_by_id.append(usd_cents)
-        rows.append([rid, {"values": [
-            it.pair(co, icp),
-            it.cat(ccy_s),
-            {"Int": gl_day},
-            it.cat(cols["objsub"][i] or ""),
-            {"Int": snative},
-            it.tokens([cols[f][i] for f in FIELDS], drop=("OFFSETENTRY",)),
-        ]}])
+        # Bare cells; the engine lowers strings by column kind.
+        text = " ".join(s for s in (cols[f][i] for f in FIELDS) if s)
+        rows.append([rid, [
+            key(co, icp), ccy_s, gl_day, cols["objsub"][i] or "", snative, text,
+        ]])
         if maxrows and len(rows) >= maxrows:
             break
     return schema, rows, usd_by_id
@@ -100,7 +99,7 @@ def main():
     print(f"ingested {len(rows)} rows in {time.time()-t0:.2f}s")
 
     fe = Florecon(WASM)
-    req = {"schema": {"cols": schema}, "rows": rows, "plan": plan()}
+    req = {"schema": {"cols": schema, "token_drop": ["OFFSETENTRY"]}, "rows": rows, "plan": plan()}
     t1 = time.time()
     env = fe.solve(req)
     dt = time.time() - t1

@@ -1,35 +1,44 @@
-//! String lowering — the one place business values become engine integers.
+//! Lowering — the one place business values become engine integers.
 //!
 //! The engine is integer-only ([`Value::Int`]/[`Value::Tokens`]). Callers — the
 //! Python batch host, the browser, native Rust — describe rows with *business*
-//! values instead: currency codes, account strings, bilateral company pairs,
-//! free-text reference fields. This module lowers those to stable i64s with a
-//! pure FNV-1a hash.
+//! values instead: currency codes, account strings, free-text reference fields.
+//! This module lowers those to stable i64s with a pure FNV-1a hash.
+//!
+//! How a cell lowers is a property of its *column*, not the cell, so the policy
+//! lives in the [`Schema`](crate::plan::Schema) as a per-column [`Kind`]:
+//!
+//! | [`Kind`] | cell  | lowers to        | matching semantics      |
+//! |----------|-------|------------------|-------------------------|
+//! | `Number` | i64   | [`Value::Int`]   | compare / net / bucket  |
+//! | `Key`    | str   | `Int(cat(s))`    | whole-string equality   |
+//! | `Tokens` | str   | `Tokens(..)`     | reference-token overlap |
+//!
+//! A cell is therefore a bare scalar ([`RawCell`]) — a number or a string — and
+//! the schema says how to read it. There is no separate "pair" or "text" value:
+//! a composite/bilateral key is just a `Key` column whose string the caller
+//! composed (sorted-join is domain logic, not an engine concept).
 //!
 //! "Pure" is the load-bearing word: the same string lowers to the same id in
 //! every process and shard with no shared dictionary, so ids agree across
 //! languages and partitions without coordination. The Python host mirrors this
-//! hash byte-for-byte (see `py/src/florecon/intern.py`), and the
-//! `matches_python_host` test pins the two together.
-//!
-//! It is a first-class Rust API, not just a wire detail: build engine rows from
-//! strings directly with [`RawValue`]/[`RawRow`], or call [`cat`]/[`pair`]/
-//! [`tokens`] piecemeal.
+//! hash byte-for-byte, and the `matches_python_host` test pins the two together.
 //!
 //! ```
-//! use florecon::lower::{RawRow, RawValue, TokenCfg};
-//! let cfg = TokenCfg::default();
+//! use florecon::lower::{Kind, RawRow, TokenCfg};
+//! let kinds = [Kind::Key, Kind::Key, Kind::Number, Kind::Tokens];
 //! let row = RawRow::new(vec![
-//!     RawValue::pair("00492", "00288"), // bilateral key, order-independent
-//!     RawValue::str("USD"),             // categorical
-//!     RawValue::Int(20517),             // genuine integer (epoch day)
-//!     RawValue::text(["INV0001234567 memo text"]), // free-text -> tokens
+//!     "00288|00492".into(),        // composite key, caller-composed
+//!     "USD".into(),                // categorical key
+//!     20517i64.into(),             // genuine integer (epoch day)
+//!     "INV0001234567 memo".into(), // free text -> tokens
 //! ])
-//! .lower(&cfg);
+//! .lower(&kinds, &TokenCfg::default())
+//! .unwrap();
 //! assert_eq!(row.values.len(), 4);
 //! ```
 
-use crate::plan::{Row, Value};
+use crate::plan::{ApiError, Row, Value};
 
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
@@ -51,13 +60,6 @@ pub fn fnv1a(s: &str) -> u64 {
 /// Lower a categorical string to a non-negative engine id.
 pub fn cat(s: &str) -> i64 {
     (fnv1a(s) & I63) as i64
-}
-
-/// Lower an unordered pair (e.g. a bilateral `company|counterparty` key) to one
-/// id. Order-independent: `pair(a, b) == pair(b, a)`.
-pub fn pair(a: &str, b: &str) -> i64 {
-    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-    (fnv1a(&format!("{lo}|{hi}")) & I63) as i64
 }
 
 /// Token-extraction policy for [`tokens`]. Defaults mirror the host: keep
@@ -115,71 +117,93 @@ pub fn tokens(fields: &[String], cfg: &TokenCfg) -> Vec<u64> {
     out
 }
 
-/// A business-level input value. `Int`/`Tokens` pass through unchanged (already
-/// lowered, or genuinely numeric columns like money and epoch dates); `Str`/
-/// `Pair`/`Text` carry strings the engine never sees, lowered by [`Self::lower`].
-#[derive(Debug, Clone, PartialEq)]
+/// How a column's cells lower to engine values. A column-level property (the
+/// whole column is one kind), declared once in the [`Schema`](crate::plan::Schema).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum RawValue {
-    Int(i64),
-    Tokens(Vec<u64>),
-    Str(String),
-    Pair(String, String),
-    Text(Vec<String>),
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Kind {
+    /// A genuine number (money in minor units, an epoch day): the i64 as-is.
+    Number,
+    /// A categorical string, lowered to one stable id by [`cat`]. A numeric cell
+    /// is taken as an already-lowered key and passes through.
+    Key,
+    /// A free-text field, lowered to a set of reference-signal ids by [`tokens`].
+    Tokens,
 }
 
-impl RawValue {
-    /// Lower to the engine [`Value`]. `cfg` governs `Text` token extraction; the
-    /// other variants ignore it.
-    pub fn lower(self, cfg: &TokenCfg) -> Value {
-        match self {
-            RawValue::Int(i) => Value::Int(i),
-            RawValue::Tokens(t) => Value::Tokens(t),
-            RawValue::Str(s) => Value::Int(cat(&s)),
-            RawValue::Pair(a, b) => Value::Int(pair(&a, &b)),
-            RawValue::Text(fields) => Value::Tokens(tokens(&fields, cfg)),
+/// A bare input cell: a number or a string. How it lowers is decided by the
+/// column's [`Kind`], not by the cell itself, so there is no per-cell tag.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(untagged))]
+pub enum RawCell {
+    Num(i64),
+    Str(String),
+}
+
+impl From<i64> for RawCell {
+    fn from(i: i64) -> Self {
+        RawCell::Num(i)
+    }
+}
+impl From<&str> for RawCell {
+    fn from(s: &str) -> Self {
+        RawCell::Str(s.to_string())
+    }
+}
+impl From<String> for RawCell {
+    fn from(s: String) -> Self {
+        RawCell::Str(s)
+    }
+}
+
+impl RawCell {
+    /// Lower against the column's [`Kind`]. `col` is the column index, reported
+    /// on a kind/scalar mismatch.
+    pub fn lower(self, kind: Kind, col: usize, cfg: &TokenCfg) -> Result<Value, ApiError> {
+        match (kind, self) {
+            (Kind::Number, RawCell::Num(i)) => Ok(Value::Int(i)),
+            // A numeric cell in a key column is an already-numeric key.
+            (Kind::Key, RawCell::Num(i)) => Ok(Value::Int(i)),
+            (Kind::Key, RawCell::Str(s)) => Ok(Value::Int(cat(&s))),
+            (Kind::Tokens, RawCell::Str(s)) => Ok(Value::Tokens(tokens(&[s], cfg))),
+            (Kind::Tokens, RawCell::Num(_)) => Ok(Value::Tokens(Vec::new())),
+            (Kind::Number, RawCell::Str(_)) => Err(ApiError::BadCell {
+                col,
+                want: "number",
+            }),
         }
     }
-
-    /// `Str` constructor taking anything string-like.
-    pub fn str(s: impl Into<String>) -> Self {
-        RawValue::Str(s.into())
-    }
-
-    /// `Pair` constructor taking anything string-like.
-    pub fn pair(a: impl Into<String>, b: impl Into<String>) -> Self {
-        RawValue::Pair(a.into(), b.into())
-    }
-
-    /// `Text` constructor from an iterator of free-text fields.
-    pub fn text<I, S>(fields: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        RawValue::Text(fields.into_iter().map(Into::into).collect())
-    }
 }
 
-/// A row of business values, positional against the schema. Lower with
-/// [`Self::lower`] to get an engine [`Row`].
+/// A row of bare cells, positional against the schema. Lower with
+/// [`Self::lower`] (driven by the schema's per-column [`Kind`]s) to get an
+/// engine [`Row`]. Serializes as a bare array, e.g. `["USD", 20517, "INV1"]`.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct RawRow {
-    pub values: Vec<RawValue>,
-}
+#[cfg_attr(feature = "serde", serde(transparent))]
+pub struct RawRow(pub Vec<RawCell>);
 
 impl RawRow {
-    pub fn new(values: Vec<RawValue>) -> Self {
-        RawRow { values }
+    pub fn new(cells: Vec<RawCell>) -> Self {
+        RawRow(cells)
     }
 
-    /// Lower every value to its engine [`Value`], producing the row the engine
-    /// consumes.
-    pub fn lower(self, cfg: &TokenCfg) -> Row {
-        Row {
-            values: self.values.into_iter().map(|v| v.lower(cfg)).collect(),
+    /// Lower every cell against the matching column [`Kind`], producing the row
+    /// the engine consumes. Errors on arity or kind/scalar mismatch.
+    pub fn lower(self, kinds: &[Kind], cfg: &TokenCfg) -> Result<Row, ApiError> {
+        if self.0.len() != kinds.len() {
+            return Err(ApiError::SchemaArity {
+                expected: kinds.len(),
+                got: self.0.len(),
+            });
         }
+        let mut values = Vec::with_capacity(self.0.len());
+        for (col, (cell, &kind)) in self.0.into_iter().zip(kinds).enumerate() {
+            values.push(cell.lower(kind, col, cfg)?);
+        }
+        Ok(Row { values })
     }
 }
 
@@ -187,15 +211,15 @@ impl RawRow {
 mod tests {
     use super::*;
 
-    // Pinned against the Python host (py/src/florecon/intern.py) and confirmed
-    // against web/data.json row 0. If these drift, ids stop agreeing across the
-    // batch path, the browser, and native Rust.
+    // Pinned against the Python host and confirmed against web/data.json row 0.
+    // If these drift, ids stop agreeing across the batch path, the browser, and
+    // native Rust.
     #[test]
     fn matches_python_host() {
         assert_eq!(cat("USD"), 7056772390745336839);
         assert_eq!(cat("00492"), 7792345195920810492);
-        assert_eq!(pair("00492", "00288"), 7686300666667729858);
-        assert_eq!(pair("00288", "00492"), 7686300666667729858); // order-independent
+        // a composite key is just cat() of a caller-composed (sorted) string
+        assert_eq!(cat("00288|00492"), 7686300666667729858);
         assert_eq!(
             tokens(&["INV0001234567 hello THE 12".into()], &TokenCfg::default()),
             vec![6280867139549122728]
@@ -220,14 +244,33 @@ mod tests {
     }
 
     #[test]
-    fn lower_passthrough_and_strings() {
+    fn lowers_by_kind() {
         let cfg = TokenCfg::default();
-        assert_eq!(RawValue::Int(5).lower(&cfg), Value::Int(5));
-        assert_eq!(RawValue::Tokens(vec![9]).lower(&cfg), Value::Tokens(vec![9]));
-        assert_eq!(RawValue::str("USD").lower(&cfg), Value::Int(cat("USD")));
+        let kinds = [Kind::Number, Kind::Key, Kind::Key, Kind::Tokens];
+        let row = RawRow::new(vec![
+            5i64.into(),
+            "USD".into(),
+            492i64.into(), // numeric key passes through
+            "INV0001234567 x".into(),
+        ])
+        .lower(&kinds, &cfg)
+        .unwrap();
         assert_eq!(
-            RawValue::pair("00492", "00288").lower(&cfg),
-            Value::Int(7686300666667729858)
+            row.values,
+            vec![
+                Value::Int(5),
+                Value::Int(cat("USD")),
+                Value::Int(492),
+                Value::Tokens(vec![6280867139549122728]),
+            ]
         );
+        // a string in a number column fails loud
+        assert!(RawRow::new(vec!["oops".into()])
+            .lower(&[Kind::Number], &cfg)
+            .is_err());
+        // arity mismatch fails loud
+        assert!(RawRow::new(vec![5i64.into()])
+            .lower(&[Kind::Number, Kind::Key], &cfg)
+            .is_err());
     }
 }
