@@ -138,6 +138,82 @@ where
     })
 }
 
+struct Windowed<E, FO> {
+    order: FO,
+    width: i64,
+    inner: Box<dyn Strategy<E>>,
+    _e: PhantomData<E>,
+}
+
+impl<E, FO> Strategy<E> for Windowed<E, FO>
+where
+    FO: Fn(&E) -> i64,
+{
+    fn run(&self, mut bag: Vec<Item<E>>) -> Resolution<E> {
+        // Soft locality, not hard segmentation: sort by `order`, sweep in bands
+        // of `width`, and run `inner` on each band together with a carry of
+        // still-matchable items from earlier bands. An item gets a full window
+        // of look-back and look-ahead before it is flushed to residual, so a
+        // match whose endpoints' order keys differ (a card payment vs its
+        // transactions) is still found -- without letting a coincidental far
+        // match form. `width` is the tolerance for imperfect ordering.
+        let w = self.width.max(1);
+        bag.sort_by_key(|i| (self.order)(&i.data));
+        let mut groups = Vec::new();
+        let mut residual = Vec::new();
+        let mut carry: Vec<Item<E>> = Vec::new();
+        let mut it = bag.into_iter().peekable();
+        while let Some(first) = it.peek() {
+            let band_bottom = (self.order)(&first.data);
+            let mut band = Vec::new();
+            while let Some(item) = it.peek() {
+                if (self.order)(&item.data) < band_bottom + w {
+                    band.push(it.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+            // flush carry items too old to match anything from here on
+            let mut keep = Vec::new();
+            for item in carry.drain(..) {
+                if (self.order)(&item.data) + w >= band_bottom {
+                    keep.push(item);
+                } else {
+                    residual.push(item);
+                }
+            }
+            keep.extend(band);
+            let r = self.inner.run(keep);
+            groups.extend(r.groups);
+            carry = r.residual; // unmatched -> look ahead into later bands
+        }
+        residual.extend(carry);
+        Resolution { groups, residual }
+    }
+}
+
+/// Order-then-windowed-search: bound where a committing `inner` strategy looks
+/// by proximity over an `order` key, with `width` as the tolerance for
+/// imperfect ordering. This gives the deterministic primitives the same
+/// locality the [`flow`] arbiter gets from its block/window, cutting both false
+/// positives (a coincidental equal amount a year away) and work. `running_zero`
+/// is the strict special case (window = since the last balance clear).
+pub fn windowed<E: 'static, FO>(
+    order: FO,
+    width: i64,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>>
+where
+    FO: Fn(&E) -> i64 + 'static,
+{
+    Box::new(Windowed {
+        order,
+        width,
+        inner,
+        _e: PhantomData,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Primitives
 // ---------------------------------------------------------------------------
@@ -519,6 +595,40 @@ mod tests {
         assert_eq!(r.groups.len(), 1);
         assert_eq!(ids(&r.groups[0]), vec![1, 2]);
         assert_eq!(r.residual.len(), 1);
+    }
+
+    #[test]
+    fn windowed_blocks_far_matches() {
+        // +5@1 and -5@100: global exact_1to1 would pair them; windowed (w=3)
+        // must not -- they are too far apart in the ordering.
+        let b = vec![
+            Item { id: 1, data: (1i64, 5i64) },
+            Item { id: 2, data: (100, -5) },
+        ];
+        let inner = exact_1to1(
+            |d: &(i64, i64)| Some(d.1.unsigned_abs()),
+            |d: &(i64, i64)| d.1,
+        );
+        let r = windowed(|d: &(i64, i64)| d.0, 3, inner).run(b);
+        assert_eq!(r.groups.len(), 0);
+        assert_eq!(r.residual.len(), 2);
+    }
+
+    #[test]
+    fn windowed_finds_near_match_across_band_boundary() {
+        // +5@4 and -5@7 fall in different bands (w=3) but within one window of
+        // each other; the carry/look-ahead must still pair them.
+        let b = vec![
+            Item { id: 1, data: (4i64, 5i64) },
+            Item { id: 2, data: (7, -5) },
+        ];
+        let inner = exact_1to1(
+            |d: &(i64, i64)| Some(d.1.unsigned_abs()),
+            |d: &(i64, i64)| d.1,
+        );
+        let r = windowed(|d: &(i64, i64)| d.0, 3, inner).run(b);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.residual.len(), 0);
     }
 
     #[test]

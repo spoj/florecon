@@ -206,6 +206,9 @@ fn main() {
             |t: &Tx| t.ccy,
             seq(vec![
                 agg_net(|t: &Tx| t.objsub, |t: &Tx| t.snative, TOL),
+                // Exact amount is high-precision regardless of date gap, so it
+                // runs unwindowed; `windowed` is reserved for weak signals
+                // (amount-only fallbacks) where a far match is likely spurious.
                 exact_1to1(
                     |t: &Tx| if t.snative != 0 { Some(t.snative.unsigned_abs()) } else { None },
                     |t: &Tx| t.snative,
