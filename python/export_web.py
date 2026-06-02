@@ -7,9 +7,14 @@ Carries two views, joined by id:
   python python/export_web.py [parquet] [--pair COMPANY ICP] [--max N]
 """
 
+import pathlib
 import sys
 import json
 import pyarrow.parquet as pq
+
+# Use the one canonical host — the wheel package under py/src — rather than a
+# second copy. Pinned ahead of any installed build so dev edits are live.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "py" / "src"))
 from florecon import Interner
 
 OUT = "web/data.json"
