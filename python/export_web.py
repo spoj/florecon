@@ -64,11 +64,18 @@ def main():
         else:
             positional.append(args[i]); i += 1
     path = positional[0] if positional else "data/ledger.parquet"
-    if pair is None:
-        pair = frozenset(("A", "B"))
 
     t = pq.read_table(path, columns=COLS)
     cols = {n: t.column(n).to_pylist() for n in COLS}
+    if pair is None:
+        # Default to the busiest bilateral pair in the data (no hardcoded ids).
+        from collections import Counter
+
+        cnt: Counter = Counter()
+        for co, icp in zip(cols["company"], cols["icp"]):
+            if co and icp and co != icp:
+                cnt[frozenset((co, icp))] += 1
+        pair = cnt.most_common(1)[0][0]
     schema = ["unit", "ccy", "day", "objsub", "native", "tokens"]
     rows, display = [], []
     for k in range(t.num_rows):
