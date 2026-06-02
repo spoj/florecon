@@ -19,12 +19,17 @@
 //! never silently lose or double-count mass.
 
 use crate::flow::{ExtId, Model};
+use crate::lower::{RawRow, TokenCfg};
 
 /// The wire-contract version: the shape of [`Plan`], [`Report`], and the WASM
 /// command set. Hosts (the Python wheel, the browser module) read it back from
 /// the engine and refuse to run against a mismatched binary. Bump it on any
 /// breaking change to those shapes.
-pub const CONTRACT_VERSION: u32 = 2;
+///
+/// v3 grew the input value set: rows may carry business strings
+/// ([`crate::lower::RawValue::Str`]/`Pair`/`Text`) that the engine lowers,
+/// alongside the original pre-lowered `Int`/`Tokens`.
+pub const CONTRACT_VERSION: u32 = 3;
 use crate::strategy::{
     Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
 };
@@ -49,6 +54,11 @@ pub enum Value {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Schema {
     cols: Vec<String>,
+    /// Stopwords for `Text` token lowering (see [`crate::lower::tokens`]),
+    /// matched upper-cased. Empty by default; carried here so the lowering
+    /// policy travels with the schema it applies to.
+    #[cfg_attr(feature = "serde", serde(default))]
+    token_drop: Vec<String>,
 }
 
 impl Schema {
@@ -59,6 +69,16 @@ impl Schema {
     {
         Schema {
             cols: cols.into_iter().map(Into::into).collect(),
+            token_drop: Vec::new(),
+        }
+    }
+
+    /// The token-extraction policy for this schema (drop list from the schema,
+    /// length band at the [`TokenCfg`] defaults).
+    pub fn token_cfg(&self) -> TokenCfg {
+        TokenCfg {
+            drop: self.token_drop.clone(),
+            ..TokenCfg::default()
         }
     }
 
@@ -598,15 +618,21 @@ impl Session {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SolveRequest {
     pub schema: Schema,
-    pub rows: Vec<(ExtId, Row)>,
+    pub rows: Vec<(ExtId, RawRow)>,
     pub plan: Plan,
 }
 
 #[cfg(feature = "serde")]
 impl SolveRequest {
-    /// Build the session and run the plan, partition check included.
+    /// Lower the rows against the schema, build the session, and run the plan
+    /// (partition check included).
     pub fn run(self) -> Result<Report, ApiError> {
-        let session = Session::from_rows(self.schema, self.rows)?;
+        let cfg = self.schema.token_cfg();
+        let rows = self
+            .rows
+            .into_iter()
+            .map(|(id, raw)| (id, raw.lower(&cfg)));
+        let session = Session::from_rows(self.schema, rows)?;
         session.solve(&self.plan)
     }
 }
@@ -1040,6 +1066,13 @@ impl Workspace {
         }
         self.inner.upsert(id, row);
         Ok(())
+    }
+
+    /// Insert or replace a row given business values, lowering strings to engine
+    /// ids via the workspace's schema before [`Self::upsert`].
+    pub fn upsert_raw(&mut self, id: ExtId, raw: RawRow) -> Result<(), ApiError> {
+        let row = raw.lower(&self.schema.token_cfg());
+        self.upsert(id, row)
     }
 
     /// Remove a row from the workspace and from wherever it currently sits.

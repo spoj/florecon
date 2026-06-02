@@ -2,21 +2,27 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the Report. Contract version 2 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
-  "x-contract-version": 2,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the Report. Contract version 3 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
+  "x-contract-version": 3,
 
   "$defs": {
     "Value": {
-      "description": "A typed column value: an integer (money in minor units, dates in days, or a partition/bucket key) or a list of pre-hashed reference tokens.",
+      "description": "A business-level input value lowered to an engine integer host-side-or-in-rust. Int/Tokens pass through (already lowered, or genuinely numeric columns like money/dates); Str/Pair/Text carry strings the engine never sees, lowered via FNV-1a (see plan::CONTRACT_VERSION v3 and src/lower.rs).",
       "oneOf": [
         { "type": "object", "properties": { "Int": { "type": "integer" } }, "required": ["Int"], "additionalProperties": false },
-        { "type": "object", "properties": { "Tokens": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }, "required": ["Tokens"], "additionalProperties": false }
+        { "type": "object", "properties": { "Tokens": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }, "required": ["Tokens"], "additionalProperties": false },
+        { "type": "object", "properties": { "Str": { "type": "string" } }, "required": ["Str"], "additionalProperties": false },
+        { "type": "object", "properties": { "Pair": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2 } }, "required": ["Pair"], "additionalProperties": false },
+        { "type": "object", "properties": { "Text": { "type": "array", "items": { "type": "string" } } }, "required": ["Text"], "additionalProperties": false }
       ]
     },
 
     "Schema": {
       "type": "object",
-      "properties": { "cols": { "type": "array", "items": { "type": "string" } } },
+      "properties": {
+        "cols": { "type": "array", "items": { "type": "string" } },
+        "token_drop": { "type": "array", "items": { "type": "string" }, "description": "stopwords for Text token lowering, matched upper-cased; optional" }
+      },
       "required": ["cols"],
       "additionalProperties": false
     },

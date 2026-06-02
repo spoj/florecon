@@ -4,7 +4,7 @@
 export class Florecon {
   // The wire-contract version this host speaks; must equal the engine's
   // abi_version() export. Bump in lockstep with plan::CONTRACT_VERSION.
-  static CONTRACT_VERSION = 2;
+  static CONTRACT_VERSION = 3;
 
   static async load(url) {
     const bytes = await (await fetch(url)).arrayBuffer();

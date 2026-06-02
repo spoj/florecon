@@ -52,6 +52,7 @@
 
 pub mod engine;
 pub mod flow;
+pub mod lower;
 pub mod plan;
 pub mod strategy;
 
@@ -60,3 +61,4 @@ pub mod wasm;
 
 pub use engine::{ArcId, Network, NodeId, SolveStatus};
 pub use flow::{ExtId, Group, Matcher, Model};
+pub use lower::{RawRow, RawValue, TokenCfg};

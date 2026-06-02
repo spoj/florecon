@@ -94,8 +94,9 @@ fn run(bytes: &[u8]) -> Vec<u8> {
 // Stateful interactive surface: one workspace, driven by JSON commands.
 // ---------------------------------------------------------------------------
 
-use crate::plan::{Plan, Row, Schema, Workspace, WorkspaceReport};
+use crate::plan::{Plan, Schema, Workspace, WorkspaceReport};
 use crate::flow::ExtId;
+use crate::lower::RawRow;
 
 thread_local! {
     static WS: RefCell<Option<Workspace>> = const { RefCell::new(None) };
@@ -110,10 +111,10 @@ enum Cmd {
         schema: Schema,
         plan: Plan,
         #[serde(default)]
-        rows: Vec<(ExtId, Row)>,
+        rows: Vec<(ExtId, RawRow)>,
     },
     /// Insert or replace rows.
-    Upsert { rows: Vec<(ExtId, Row)> },
+    Upsert { rows: Vec<(ExtId, RawRow)> },
     /// Remove rows by id.
     Remove { ids: Vec<ExtId> },
     /// Recompute the unfrozen pool.
@@ -206,7 +207,7 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
             Err(e) => return WsEnvelope::err(e.to_string()),
         };
         for (id, row) in rows {
-            if let Err(e) = ws.upsert(id, row) {
+            if let Err(e) = ws.upsert_raw(id, row) {
                 return WsEnvelope::err(e.to_string());
             }
         }
@@ -222,7 +223,7 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
         Cmd::Init { .. } => unreachable!(),
         Cmd::Upsert { rows } => rows
             .into_iter()
-            .try_for_each(|(id, row)| ws.upsert(id, row)),
+            .try_for_each(|(id, row)| ws.upsert_raw(id, row)),
         Cmd::Remove { ids } => {
             ids.into_iter().for_each(|id| ws.remove(id));
             Ok(())
