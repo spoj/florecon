@@ -268,6 +268,66 @@ where
     })
 }
 
+struct RunningZero<E, FO, FA> {
+    order: FO,
+    amount: FA,
+    tol: i64,
+    _e: PhantomData<E>,
+}
+
+impl<E, FO, FA> Strategy<E> for RunningZero<E, FO, FA>
+where
+    FO: Fn(&E) -> i64,
+    FA: Fn(&E) -> i64,
+{
+    fn run(&self, mut bag: Vec<Item<E>>) -> Resolution<E> {
+        // Order the bag (finance bags are a timeline), then walk the running
+        // balance. Each time it returns to zero, everything since the last zero
+        // is a closed clearing segment -- e.g. a payment that settles all
+        // outstanding items up to its date.
+        bag.sort_by_key(|i| (self.order)(&i.data));
+        let mut groups = Vec::new();
+        let mut seg: Vec<Item<E>> = Vec::new();
+        let mut acc: i64 = 0;
+        for item in bag {
+            acc += (self.amount)(&item.data);
+            seg.push(item);
+            if acc.abs() <= self.tol && seg.len() >= 2 {
+                groups.push(Group {
+                    members: seg.iter().map(|i| i.id).collect(),
+                    origin: "running_zero",
+                    net: acc,
+                });
+                seg.clear();
+                acc = 0;
+            }
+        }
+        Resolution {
+            groups,
+            residual: seg, // trailing, never-cleared tail
+        }
+    }
+}
+
+/// Order-aware clearing: sort the bag by `order` and close a group every time
+/// the running balance returns to zero (within `tol`). Expresses
+/// "balance-forward" semantics -- an entry that clears all outstanding balance
+/// up to its date is exactly the one that brings the running balance back to
+/// zero. Intermediate zero-crossings give the finest segmentation consistent
+/// with the timeline; the never-cleared tail is left as residual.
+pub fn running_zero<E: 'static, FO, FA>(order: FO, amount: FA, tol: i64) -> Box<dyn Strategy<E>>
+where
+    FO: Fn(&E) -> i64 + 'static,
+    FA: Fn(&E) -> i64 + 'static,
+{
+    Box::new(RunningZero {
+        order,
+        amount,
+        tol,
+        _e: PhantomData,
+    })
+}
+
 struct SignalGroup<E, FS, FA> {
     signals: FS,
     amount: FA,
@@ -459,6 +519,39 @@ mod tests {
         assert_eq!(r.groups.len(), 1);
         assert_eq!(ids(&r.groups[0]), vec![1, 2]);
         assert_eq!(r.residual.len(), 1);
+    }
+
+    #[test]
+    fn running_zero_segments_at_balance_clears() {
+        // timeline: +100, -100 | +50, -30, -20  -> two clearing segments
+        let b = vec![
+            Item { id: 1, data: (1i64, 100i64) },
+            Item { id: 2, data: (2, -100) },
+            Item { id: 3, data: (3, 50) },
+            Item { id: 4, data: (4, -30) },
+            Item { id: 5, data: (5, -20) },
+        ];
+        let s = running_zero(|d: &(i64, i64)| d.0, |d: &(i64, i64)| d.1, 0);
+        let r = s.run(b);
+        let g: usize = r.groups.iter().map(|g| g.members.len()).sum();
+        assert_eq!(g + r.residual.len(), 5);
+        assert_eq!(r.groups.len(), 2);
+        assert_eq!(r.groups[0].members, vec![1, 2]);
+        assert_eq!(r.groups[1].members, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn running_zero_leaves_uncleared_tail() {
+        let b = vec![
+            Item { id: 1, data: (1i64, 100i64) },
+            Item { id: 2, data: (2, -100) },
+            Item { id: 3, data: (3, 7) }, // never clears
+        ];
+        let s = running_zero(|d: &(i64, i64)| d.0, |d: &(i64, i64)| d.1, 0);
+        let r = s.run(b);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.residual.len(), 1);
+        assert_eq!(r.residual[0].id, 3);
     }
 
     #[test]
