@@ -61,4 +61,4 @@ pub mod wasm;
 
 pub use engine::{ArcId, Network, NodeId, SolveStatus};
 pub use flow::{ExtId, Group, Matcher, Model};
-pub use lower::{Kind, RawCell, RawRow, TokenCfg};
+pub use lower::{Cell, Kind, Row, TokenCfg};

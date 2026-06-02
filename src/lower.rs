@@ -1,6 +1,7 @@
 //! Lowering — the one place business values become engine integers.
 //!
-//! The engine is integer-only ([`Value::Int`]/[`Value::Tokens`]). Callers — the
+//! The engine is integer-only ([`LoweredCell::Int`]/[`LoweredCell::Tokens`]).
+//! Callers — the
 //! Python batch host, the browser, native Rust — describe rows with *business*
 //! values instead: currency codes, account strings, free-text reference fields.
 //! This module lowers those to stable i64s with a pure FNV-1a hash.
@@ -10,11 +11,11 @@
 //!
 //! | [`Kind`] | cell  | lowers to        | matching semantics      |
 //! |----------|-------|------------------|-------------------------|
-//! | `Number` | i64   | [`Value::Int`]   | compare / net / bucket  |
+//! | `Number` | i64   | [`LoweredCell::Int`] | compare / net / bucket |
 //! | `Key`    | str   | `Int(cat(s))`    | whole-string equality   |
 //! | `Tokens` | str   | `Tokens(..)`     | reference-token overlap |
 //!
-//! A cell is therefore a bare scalar ([`RawCell`]) — a number or a string — and
+//! A cell is therefore a bare scalar ([`Cell`]) — a number or a string — and
 //! the schema says how to read it. There is no separate "pair" or "text" value:
 //! a composite/bilateral key is just a `Key` column whose string the caller
 //! composed (sorted-join is domain logic, not an engine concept).
@@ -25,9 +26,9 @@
 //! hash byte-for-byte, and the `matches_python_host` test pins the two together.
 //!
 //! ```
-//! use florecon::lower::{Kind, RawRow, TokenCfg};
+//! use florecon::lower::{Kind, Row, TokenCfg};
 //! let kinds = [Kind::Key, Kind::Key, Kind::Number, Kind::Tokens];
-//! let row = RawRow::new(vec![
+//! let row = Row::new(vec![
 //!     "00288|00492".into(),        // composite key, caller-composed
 //!     "USD".into(),                // categorical key
 //!     20517i64.into(),             // genuine integer (epoch day)
@@ -38,7 +39,7 @@
 //! assert_eq!(row.values.len(), 4);
 //! ```
 
-use crate::plan::{ApiError, Row, Value};
+use crate::plan::{ApiError, LoweredCell, LoweredRow};
 
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
@@ -137,39 +138,39 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(untagged))]
-pub enum RawCell {
+pub enum Cell {
     Num(i64),
     Str(String),
 }
 
-impl From<i64> for RawCell {
+impl From<i64> for Cell {
     fn from(i: i64) -> Self {
-        RawCell::Num(i)
+        Cell::Num(i)
     }
 }
-impl From<&str> for RawCell {
+impl From<&str> for Cell {
     fn from(s: &str) -> Self {
-        RawCell::Str(s.to_string())
+        Cell::Str(s.to_string())
     }
 }
-impl From<String> for RawCell {
+impl From<String> for Cell {
     fn from(s: String) -> Self {
-        RawCell::Str(s)
+        Cell::Str(s)
     }
 }
 
-impl RawCell {
+impl Cell {
     /// Lower against the column's [`Kind`]. `col` is the column index, reported
     /// on a kind/scalar mismatch.
-    pub fn lower(self, kind: Kind, col: usize, cfg: &TokenCfg) -> Result<Value, ApiError> {
+    pub fn lower(self, kind: Kind, col: usize, cfg: &TokenCfg) -> Result<LoweredCell, ApiError> {
         match (kind, self) {
-            (Kind::Number, RawCell::Num(i)) => Ok(Value::Int(i)),
+            (Kind::Number, Cell::Num(i)) => Ok(LoweredCell::Int(i)),
             // A numeric cell in a key column is an already-numeric key.
-            (Kind::Key, RawCell::Num(i)) => Ok(Value::Int(i)),
-            (Kind::Key, RawCell::Str(s)) => Ok(Value::Int(cat(&s))),
-            (Kind::Tokens, RawCell::Str(s)) => Ok(Value::Tokens(tokens(&[s], cfg))),
-            (Kind::Tokens, RawCell::Num(_)) => Ok(Value::Tokens(Vec::new())),
-            (Kind::Number, RawCell::Str(_)) => Err(ApiError::BadCell {
+            (Kind::Key, Cell::Num(i)) => Ok(LoweredCell::Int(i)),
+            (Kind::Key, Cell::Str(s)) => Ok(LoweredCell::Int(cat(&s))),
+            (Kind::Tokens, Cell::Str(s)) => Ok(LoweredCell::Tokens(tokens(&[s], cfg))),
+            (Kind::Tokens, Cell::Num(_)) => Ok(LoweredCell::Tokens(Vec::new())),
+            (Kind::Number, Cell::Str(_)) => Err(ApiError::BadCell {
                 col,
                 want: "number",
             }),
@@ -179,20 +180,20 @@ impl RawCell {
 
 /// A row of bare cells, positional against the schema. Lower with
 /// [`Self::lower`] (driven by the schema's per-column [`Kind`]s) to get an
-/// engine [`Row`]. Serializes as a bare array, e.g. `["USD", 20517, "INV1"]`.
+/// engine [`LoweredRow`]. Serializes as a bare array, e.g. `["USD", 20517, "INV1"]`.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
-pub struct RawRow(pub Vec<RawCell>);
+pub struct Row(pub Vec<Cell>);
 
-impl RawRow {
-    pub fn new(cells: Vec<RawCell>) -> Self {
-        RawRow(cells)
+impl Row {
+    pub fn new(cells: Vec<Cell>) -> Self {
+        Row(cells)
     }
 
     /// Lower every cell against the matching column [`Kind`], producing the row
     /// the engine consumes. Errors on arity or kind/scalar mismatch.
-    pub fn lower(self, kinds: &[Kind], cfg: &TokenCfg) -> Result<Row, ApiError> {
+    pub fn lower(self, kinds: &[Kind], cfg: &TokenCfg) -> Result<LoweredRow, ApiError> {
         if self.0.len() != kinds.len() {
             return Err(ApiError::SchemaArity {
                 expected: kinds.len(),
@@ -203,7 +204,7 @@ impl RawRow {
         for (col, (cell, &kind)) in self.0.into_iter().zip(kinds).enumerate() {
             values.push(cell.lower(kind, col, cfg)?);
         }
-        Ok(Row { values })
+        Ok(LoweredRow { values })
     }
 }
 
@@ -247,7 +248,7 @@ mod tests {
     fn lowers_by_kind() {
         let cfg = TokenCfg::default();
         let kinds = [Kind::Number, Kind::Key, Kind::Key, Kind::Tokens];
-        let row = RawRow::new(vec![
+        let row = Row::new(vec![
             5i64.into(),
             "USD".into(),
             492i64.into(), // numeric key passes through
@@ -258,19 +259,23 @@ mod tests {
         assert_eq!(
             row.values,
             vec![
-                Value::Int(5),
-                Value::Int(cat("USD")),
-                Value::Int(492),
-                Value::Tokens(vec![6280867139549122728]),
+                LoweredCell::Int(5),
+                LoweredCell::Int(cat("USD")),
+                LoweredCell::Int(492),
+                LoweredCell::Tokens(vec![6280867139549122728]),
             ]
         );
         // a string in a number column fails loud
-        assert!(RawRow::new(vec!["oops".into()])
-            .lower(&[Kind::Number], &cfg)
-            .is_err());
+        assert!(
+            Row::new(vec!["oops".into()])
+                .lower(&[Kind::Number], &cfg)
+                .is_err()
+        );
         // arity mismatch fails loud
-        assert!(RawRow::new(vec![5i64.into()])
-            .lower(&[Kind::Number, Kind::Key], &cfg)
-            .is_err());
+        assert!(
+            Row::new(vec![5i64.into()])
+                .lower(&[Kind::Number, Kind::Key], &cfg)
+                .is_err()
+        );
     }
 }

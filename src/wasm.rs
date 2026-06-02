@@ -96,7 +96,7 @@ fn run(bytes: &[u8]) -> Vec<u8> {
 
 use crate::plan::{Plan, Schema, Workspace, WorkspaceReport};
 use crate::flow::ExtId;
-use crate::lower::RawRow;
+use crate::lower::Row;
 
 thread_local! {
     static WS: RefCell<Option<Workspace>> = const { RefCell::new(None) };
@@ -111,10 +111,10 @@ enum Cmd {
         schema: Schema,
         plan: Plan,
         #[serde(default)]
-        rows: Vec<(ExtId, RawRow)>,
+        rows: Vec<(ExtId, Row)>,
     },
     /// Insert or replace rows.
-    Upsert { rows: Vec<(ExtId, RawRow)> },
+    Upsert { rows: Vec<(ExtId, Row)> },
     /// Remove rows by id.
     Remove { ids: Vec<ExtId> },
     /// Recompute the unfrozen pool.

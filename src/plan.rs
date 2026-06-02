@@ -10,7 +10,7 @@
 //!   (no host callbacks). Serializable, so an agent can author it and a native
 //!   interpreter runs it.
 //! - [`Recon`] — the one generic stateful facade (`upsert` / `remove` / `solve`
-//!   / `freeze` / `breakup` / …); [`Workspace`] is its [`Row`] + [`Plan`]
+//!   / `freeze` / `breakup` / …); [`Workspace`] is its [`LoweredRow`] + [`Plan`]
 //!   specialization and [`Session`] is the stateless one-shot form.
 //! - [`Report`] — the relational result (`assignments` + `groups` + `residual`).
 //!
@@ -19,17 +19,18 @@
 //! never silently lose or double-count mass.
 
 use crate::flow::{ExtId, Model};
-use crate::lower::{Kind, RawRow, TokenCfg};
+use crate::lower::{Kind, Row, TokenCfg};
 
 /// The wire-contract version: the shape of [`Plan`], [`Report`], and the WASM
 /// command set. Hosts (the Python wheel, the browser module) read it back from
 /// the engine and refuse to run against a mismatched binary. Bump it on any
 /// breaking change to those shapes.
 ///
-/// v4 makes the business representation canonical: input values are
-/// [`crate::lower::RawValue`] (`Int` for genuine numbers, `Str`/`Pair`/`Text`
-/// for strings). The engine's lowered `Int`/`Tokens` form is an internal
-/// implementation detail — it is no longer accepted on the wire.
+/// v4 makes the business representation canonical: a row is bare
+/// [`Cell`](crate::lower::Cell)s (a number or a string) and the schema's
+/// per-column [`Kind`] decides how each lowers. The engine's lowered
+/// [`LoweredCell`] (`Int`/`Tokens`) form is an internal implementation detail —
+/// it is never on the wire.
 pub const CONTRACT_VERSION: u32 = 4;
 use crate::strategy::{
     Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
@@ -41,13 +42,13 @@ use std::collections::{BTreeMap, BTreeSet};
 // ---------------------------------------------------------------------------
 
 /// A typed column value the engine works on — the *lowered*, internal form,
-/// produced from a business [`RawCell`](crate::lower::RawCell) by
+/// produced from a business [`Cell`](crate::lower::Cell) by
 /// [`crate::lower`]. `Int` carries money (minor units), dates (days), and
 /// partition/bucket keys; `Tokens` carries hashed reference signals. Callers do
 /// not construct this; they describe rows with bare cells and a [`Schema`].
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Value {
+pub enum LoweredCell {
     Int(i64),
     Tokens(Vec<u64>),
 }
@@ -95,7 +96,7 @@ impl Schema {
     }
 
     /// Schema from names alone, every column [`Kind::Number`]. A convenience for
-    /// engine-level callers that build lowered [`Row`]s directly (the kind only
+    /// engine-level callers that build lowered [`LoweredRow`]s directly (the kind only
     /// matters when lowering bare cells).
     pub fn new<I, S>(cols: I) -> Self
     where
@@ -138,25 +139,25 @@ impl Schema {
 /// One row's column values, positional against the session [`Schema`].
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Row {
-    pub values: Vec<Value>,
+pub struct LoweredRow {
+    pub values: Vec<LoweredCell>,
 }
 
-impl Row {
-    pub fn new(values: Vec<Value>) -> Self {
-        Row { values }
+impl LoweredRow {
+    pub fn new(values: Vec<LoweredCell>) -> Self {
+        LoweredRow { values }
     }
 
     fn int(&self, idx: usize) -> i64 {
         match self.values.get(idx) {
-            Some(Value::Int(i)) => *i,
+            Some(LoweredCell::Int(i)) => *i,
             _ => 0,
         }
     }
 
     fn tokens(&self, idx: usize) -> Vec<u64> {
         match self.values.get(idx) {
-            Some(Value::Tokens(t)) => t.clone(),
+            Some(LoweredCell::Tokens(t)) => t.clone(),
             _ => Vec::new(),
         }
     }
@@ -288,10 +289,16 @@ impl Default for CostSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiError {
     UnknownColumn(String),
-    SchemaArity { expected: usize, got: usize },
+    SchemaArity {
+        expected: usize,
+        got: usize,
+    },
     /// The pipeline did not partition the input: some id was lost or assigned
     /// to more than one group. Should be impossible — a bug guard.
-    ConservationViolated { input: usize, accounted: usize },
+    ConservationViolated {
+        input: usize,
+        accounted: usize,
+    },
     /// A group id referenced by an interactive op does not exist.
     UnknownGroup(u64),
     /// A manual op referenced an id that is not in the workspace.
@@ -302,7 +309,10 @@ pub enum ApiError {
     DegenerateGroup,
     /// A bare cell did not match its column [`Kind`] (e.g. a string in a
     /// `Number` column). `col` is the column index; `want` the expected scalar.
-    BadCell { col: usize, want: &'static str },
+    BadCell {
+        col: usize,
+        want: &'static str,
+    },
 }
 
 impl std::fmt::Display for ApiError {
@@ -346,21 +356,21 @@ struct PlanModel {
 }
 
 impl Model for PlanModel {
-    type Tx = Row;
+    type Tx = LoweredRow;
 
-    fn base_amount(&self, tx: &Row) -> i64 {
+    fn base_amount(&self, tx: &LoweredRow) -> i64 {
         tx.int(self.amount)
     }
-    fn penalty(&self, _tx: &Row) -> f64 {
+    fn penalty(&self, _tx: &LoweredRow) -> f64 {
         self.penalty
     }
-    fn block_key(&self, tx: &Row) -> i64 {
+    fn block_key(&self, tx: &LoweredRow) -> i64 {
         tx.int(self.day)
     }
     fn window(&self) -> i64 {
         self.window
     }
-    fn match_keys(&self, tx: &Row) -> Vec<u64> {
+    fn match_keys(&self, tx: &LoweredRow) -> Vec<u64> {
         // Reference tokens bridge the two books; the native amount lets exact
         // equal-magnitude rows become candidates even without a shared token.
         let mut keys = tx.tokens(self.tokens);
@@ -370,7 +380,7 @@ impl Model for PlanModel {
         }
         keys
     }
-    fn cost(&self, a: &Row, b: &Row) -> Option<f64> {
+    fn cost(&self, a: &LoweredRow, b: &LoweredRow) -> Option<f64> {
         let token_shared = {
             let bt = b.tokens(self.tokens);
             a.tokens(self.tokens).iter().any(|t| bt.contains(t))
@@ -420,7 +430,7 @@ fn conservation_airlock(input: usize, accounted: usize) -> Result<(), ApiError> 
     Ok(())
 }
 
-fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiError> {
+fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<LoweredRow>>, ApiError> {
     Ok(match plan {
         Plan::Seq { steps } => {
             let mut compiled = Vec::with_capacity(steps.len());
@@ -441,7 +451,7 @@ fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiEr
             let inner = (**inner).clone();
             let schema = schema.clone();
             let factory = move || compile(&inner, &schema).expect("inner plan already validated");
-            partition_by(move |r: &Row| r.int(k), factory)
+            partition_by(move |r: &LoweredRow| r.int(k), factory)
         }
         Plan::Windowed {
             order,
@@ -449,20 +459,28 @@ fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiEr
             inner,
         } => {
             let o = schema.index(order)?;
-            windowed(move |r: &Row| r.int(o), *width, compile(inner, schema)?)
+            windowed(
+                move |r: &LoweredRow| r.int(o),
+                *width,
+                compile(inner, schema)?,
+            )
         }
         Plan::AggNet { key, amount, tol } => {
             let (k, a) = (schema.index(key)?, schema.index(amount)?);
-            agg_net(move |r: &Row| r.int(k) as u64, move |r: &Row| r.int(a), *tol)
+            agg_net(
+                move |r: &LoweredRow| r.int(k) as u64,
+                move |r: &LoweredRow| r.int(a),
+                *tol,
+            )
         }
         Plan::Exact { amount } => {
             let a = schema.index(amount)?;
             exact_1to1(
-                move |r: &Row| {
+                move |r: &LoweredRow| {
                     let v = r.int(a);
                     if v != 0 { Some(v.unsigned_abs()) } else { None }
                 },
-                move |r: &Row| r.int(a),
+                move |r: &LoweredRow| r.int(a),
             )
         }
         Plan::Signal {
@@ -473,8 +491,8 @@ fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiEr
         } => {
             let (s, a) = (schema.index(signals)?, schema.index(amount)?);
             signal_group(
-                move |r: &Row| r.tokens(s),
-                move |r: &Row| r.int(a),
+                move |r: &LoweredRow| r.tokens(s),
+                move |r: &LoweredRow| r.int(a),
                 *tol,
                 *cap,
             )
@@ -545,7 +563,7 @@ pub struct Report {
 #[derive(Default)]
 pub struct Session {
     schema: Schema,
-    rows: BTreeMap<ExtId, Row>,
+    rows: BTreeMap<ExtId, LoweredRow>,
 }
 
 impl Session {
@@ -560,7 +578,7 @@ impl Session {
     /// mode: the whole shard crosses once, e.g. from a WASM host).
     pub fn from_rows<I>(schema: Schema, rows: I) -> Result<Self, ApiError>
     where
-        I: IntoIterator<Item = (ExtId, Row)>,
+        I: IntoIterator<Item = (ExtId, LoweredRow)>,
     {
         let mut s = Session::new(schema);
         for (id, row) in rows {
@@ -582,7 +600,7 @@ impl Session {
     }
 
     /// Insert or replace a row. One coarse boundary crossing per edit.
-    pub fn upsert(&mut self, id: ExtId, row: Row) -> Result<(), ApiError> {
+    pub fn upsert(&mut self, id: ExtId, row: LoweredRow) -> Result<(), ApiError> {
         if row.values.len() != self.schema.len() {
             return Err(ApiError::SchemaArity {
                 expected: self.schema.len(),
@@ -604,7 +622,7 @@ impl Session {
         // Session is a stateless one-shot: compile the cold flow leaf.
         let mut strategy = compile(plan, &self.schema)?;
         // Materialize in id order for deterministic candidate generation.
-        let bag: Vec<Item<Row>> = self
+        let bag: Vec<Item<LoweredRow>> = self
             .rows
             .iter()
             .map(|(id, row)| Item {
@@ -657,11 +675,10 @@ impl Session {
 /// A self-contained batch solve: schema + rows + plan. This is the JSON a WASM
 /// or other batch host ships across the boundary in one coarse crossing.
 #[cfg(feature = "serde")]
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SolveRequest {
     pub schema: Schema,
-    pub rows: Vec<(ExtId, RawRow)>,
+    pub rows: Vec<(ExtId, Row)>,
     pub plan: Plan,
 }
 
@@ -1072,12 +1089,12 @@ impl<E: Clone> Recon<E> {
     }
 }
 
-/// The interactive [`Plan`]-driven workspace over [`Row`]s: a [`Recon<Row>`]
+/// The interactive [`Plan`]-driven workspace over [`LoweredRow`]s: a [`Recon<LoweredRow>`]
 /// plus its [`Schema`] (for arity validation). This is what the WASM `dispatch`
 /// surface drives.
 pub struct Workspace {
     schema: Schema,
-    inner: Recon<Row>,
+    inner: Recon<LoweredRow>,
 }
 
 impl Workspace {
@@ -1102,7 +1119,7 @@ impl Workspace {
     }
 
     /// Insert or replace a row (arity-checked against the schema).
-    pub fn upsert(&mut self, id: ExtId, row: Row) -> Result<(), ApiError> {
+    pub fn upsert(&mut self, id: ExtId, row: LoweredRow) -> Result<(), ApiError> {
         if row.values.len() != self.schema.len() {
             return Err(ApiError::SchemaArity {
                 expected: self.schema.len(),
@@ -1115,7 +1132,7 @@ impl Workspace {
 
     /// Insert or replace a row given bare cells, lowering them to engine ids via
     /// the workspace's schema (per-column [`Kind`]) before [`Self::upsert`].
-    pub fn upsert_raw(&mut self, id: ExtId, raw: RawRow) -> Result<(), ApiError> {
+    pub fn upsert_raw(&mut self, id: ExtId, raw: Row) -> Result<(), ApiError> {
         let row = raw.lower(&self.schema.kinds(), &self.schema.token_cfg())?;
         self.upsert(id, row)
     }
@@ -1180,13 +1197,13 @@ mod tests {
         Schema::new(["usd", "day", "objsub", "native", "tokens"])
     }
 
-    fn row(usd: i64, day: i64, objsub: i64, native: i64, tokens: &[u64]) -> Row {
-        Row::new(vec![
-            Value::Int(usd),
-            Value::Int(day),
-            Value::Int(objsub),
-            Value::Int(native),
-            Value::Tokens(tokens.to_vec()),
+    fn row(usd: i64, day: i64, objsub: i64, native: i64, tokens: &[u64]) -> LoweredRow {
+        LoweredRow::new(vec![
+            LoweredCell::Int(usd),
+            LoweredCell::Int(day),
+            LoweredCell::Int(objsub),
+            LoweredCell::Int(native),
+            LoweredCell::Tokens(tokens.to_vec()),
         ])
     }
 
@@ -1282,16 +1299,13 @@ mod tests {
         let plan = Plan::Exact {
             amount: "nope".into(),
         };
-        assert_eq!(
-            s.solve(&plan),
-            Err(ApiError::UnknownColumn("nope".into()))
-        );
+        assert_eq!(s.solve(&plan), Err(ApiError::UnknownColumn("nope".into())));
     }
 
     #[test]
     fn arity_mismatch_rejected() {
         let mut s = Session::new(schema());
-        let bad = Row::new(vec![Value::Int(1)]);
+        let bad = LoweredRow::new(vec![LoweredCell::Int(1)]);
         assert!(matches!(
             s.upsert(1, bad),
             Err(ApiError::SchemaArity { .. })
@@ -1393,7 +1407,12 @@ mod tests {
         r.freeze(g).unwrap();
         r.upsert(4, 9);
         r.solve().unwrap();
-        assert!(r.report().groups.iter().any(|x| x.group_id == g && x.status == Status::Frozen));
+        assert!(
+            r.report()
+                .groups
+                .iter()
+                .any(|x| x.group_id == g && x.status == Status::Frozen)
+        );
     }
 
     fn ws_conserves(ws: &Workspace) {
@@ -1412,7 +1431,12 @@ mod tests {
         ws.upsert(4, row(-50, 4, 20, -50, &[])).unwrap();
         // Before solving, every fresh id stands as a live singleton group.
         assert_eq!(ws.report().groups.len(), 4);
-        assert!(ws.report().groups.iter().all(|g| g.size == 1 && g.status == Status::Live));
+        assert!(
+            ws.report()
+                .groups
+                .iter()
+                .all(|g| g.size == 1 && g.status == Status::Live)
+        );
         ws_conserves(&ws);
 
         ws.solve().unwrap();
@@ -1428,14 +1452,24 @@ mod tests {
         // g1's members are now live singletons; g0 still grouped + frozen.
         let rep = ws.report();
         assert_eq!(rep.groups.len(), 3);
-        assert_eq!(rep.groups.iter().filter(|g| g.status == Status::Frozen).count(), 1);
+        assert_eq!(
+            rep.groups
+                .iter()
+                .filter(|g| g.status == Status::Frozen)
+                .count(),
+            1
+        );
         assert_eq!(rep.groups.iter().filter(|g| g.size == 1).count(), 2);
         ws_conserves(&ws);
 
         // Re-solve: frozen group survives with its id; the pool reforms.
         ws.solve().unwrap();
         let rep = ws.report();
-        assert!(rep.groups.iter().any(|g| g.group_id == g0 && g.status == Status::Frozen));
+        assert!(
+            rep.groups
+                .iter()
+                .any(|g| g.group_id == g0 && g.status == Status::Frozen)
+        );
         assert_eq!(rep.groups.len(), 2);
         ws_conserves(&ws);
     }
@@ -1476,8 +1510,14 @@ mod tests {
         ws.solve().unwrap();
 
         // A degenerate (single-row) manual group is refused.
-        assert_eq!(ws.group(&[1], 100, "manual"), Err(ApiError::DegenerateGroup));
-        assert_eq!(ws.group(&[1, 999], 0, "manual"), Err(ApiError::UnknownId(999)));
+        assert_eq!(
+            ws.group(&[1], 100, "manual"),
+            Err(ApiError::DegenerateGroup)
+        );
+        assert_eq!(
+            ws.group(&[1, 999], 0, "manual"),
+            Err(ApiError::UnknownId(999))
+        );
 
         // Manually match two residual rows; the group is frozen and net is
         // exactly what the caller supplied.
@@ -1492,7 +1532,10 @@ mod tests {
         assert!(ws.report().groups.iter().any(|g| g.group_id == gid));
 
         // Stealing a row out of a frozen group is refused.
-        assert_eq!(ws.group(&[1, 3], 0, "manual"), Err(ApiError::FrozenMember(1)));
+        assert_eq!(
+            ws.group(&[1, 3], 0, "manual"),
+            Err(ApiError::FrozenMember(1))
+        );
         assert_eq!(ws.ungroup(&[1]), Err(ApiError::FrozenMember(1)));
 
         // Ungroup sends live-group rows back to live singletons.
@@ -1502,7 +1545,12 @@ mod tests {
             .groups
             .iter()
             .filter(|g| g.size == 1 && g.status == Status::Live)
-            .flat_map(|g| rep.assignments.iter().filter(move |(_, gid)| *gid == g.group_id).map(|(id, _)| *id))
+            .flat_map(|g| {
+                rep.assignments
+                    .iter()
+                    .filter(move |(_, gid)| *gid == g.group_id)
+                    .map(|(id, _)| *id)
+            })
             .collect();
         assert!(singletons.contains(&3) && singletons.contains(&4));
         ws_conserves(&ws);
@@ -1522,7 +1570,12 @@ mod tests {
         assert_eq!(g.origin, "unmatched");
 
         ws.freeze_singletons(&[1]);
-        let g = ws.report().groups.into_iter().find(|g| g.group_id == gid).unwrap();
+        let g = ws
+            .report()
+            .groups
+            .into_iter()
+            .find(|g| g.group_id == gid)
+            .unwrap();
         assert!(g.size == 1 && g.status == Status::Frozen);
 
         // A re-solve leaves the frozen singleton untouched, id stable.
@@ -1600,7 +1653,7 @@ mod tests {
     // other leg. With every pair isolated, the min-cost-flow optimum is
     // *unique* (no equal-cost alternative arcs), so a warm re-solve and a fresh
     // cold solve must agree group-for-group, not merely on objective.
-    fn pair_rows(p: u64, shard: i64) -> ((ExtId, Row), (ExtId, Row)) {
+    fn pair_rows(p: u64, shard: i64) -> ((ExtId, LoweredRow), (ExtId, LoweredRow)) {
         let mag = (p as i64 + 1) * 101; // distinct magnitude per pair
         let token = 1_000 + p; // distinct token per pair
         let day = (p % 20) as i64;
@@ -1640,7 +1693,11 @@ mod tests {
         report_partition(&rep.assignments, &multi)
     }
 
-    fn cold_partition(schema: &Schema, plan: &Plan, rows: &BTreeMap<ExtId, Row>) -> BTreeSet<Vec<ExtId>> {
+    fn cold_partition(
+        schema: &Schema,
+        plan: &Plan,
+        rows: &BTreeMap<ExtId, LoweredRow>,
+    ) -> BTreeSet<Vec<ExtId>> {
         let mut s = Session::new(schema.clone());
         for (&id, r) in rows {
             s.upsert(id, r.clone()).unwrap();
@@ -1674,7 +1731,7 @@ mod tests {
         let schema = schema();
         let mut rng = Lcg(seed);
         let mut ws = Workspace::new(schema.clone(), plan.clone()).unwrap();
-        let mut rows: BTreeMap<ExtId, Row> = BTreeMap::new();
+        let mut rows: BTreeMap<ExtId, LoweredRow> = BTreeMap::new();
         let pairs: u64 = 24;
 
         for _ in 0..300 {
@@ -1697,7 +1754,10 @@ mod tests {
             assert_eq!(rep.assignments.len(), ws.len(), "conservation");
             let warm = warm_partition(&rep);
             let cold = cold_partition(&schema, &plan, &rows);
-            assert_eq!(warm, cold, "warm flow grouping diverged from a fresh cold solve");
+            assert_eq!(
+                warm, cold,
+                "warm flow grouping diverged from a fresh cold solve"
+            );
         }
     }
 

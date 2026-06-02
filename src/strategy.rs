@@ -61,11 +61,12 @@ pub struct Resolution<E> {
 /// A reconciliation strategy: pull groups from a bag, return the residual.
 ///
 /// `run` takes `&mut self`, so a node *may* carry state across calls (e.g. the
-/// warm [`flow_cached`] leaf keeps a live [`Matcher`] per shard). Statefulness
+/// stateful [`flow`] leaf keeps a live [`Matcher`], and [`partition_by`] holds
+/// one warm child per shard). Statefulness
 /// is an opt-in capability, not a mandate: the cheap leaves (`agg_net`,
 /// `exact_1to1`, `signal_group`, …) ignore `&mut` and recompute, staying
 /// stateless by convention. A node that *does* hold state owes a warm-vs-cold
-/// determinism guarantee (see `flow_cached`'s cross-check).
+/// determinism guarantee (see [`flow`]'s cross-check).
 pub trait Strategy<E> {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E>;
 }
