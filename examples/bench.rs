@@ -8,7 +8,7 @@
 //! e.g. `cargo run --release --example bench -- 50000 100`  (~5M edges)
 //!      `cargo run --release --example bench -- 50000 200`  (~10M edges)
 
-use florecon::net::Network;
+use florecon::engine::Network;
 use std::time::Instant;
 
 fn main() {

@@ -30,8 +30,8 @@
 //! rows they are certain about; [`flow`] is the global *arbiter* for the
 //! ambiguous residual where strategies would otherwise compete.
 
-use crate::net::SolveStatus;
-use crate::recon::{ExtId, Model, Reconciler};
+use crate::engine::SolveStatus;
+use crate::flow::{ExtId, Model, Matcher};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -497,7 +497,7 @@ where
     M::Tx: Clone,
 {
     fn run(&self, bag: Vec<Item<M::Tx>>) -> Resolution<M::Tx> {
-        let mut rec = Reconciler::new(self.model.clone());
+        let mut rec = Matcher::new(self.model.clone());
         for item in &bag {
             rec.upsert(item.id, item.data.clone());
         }

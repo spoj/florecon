@@ -2,30 +2,33 @@
 //!
 //! Four layers, each a thin lowering of the one above:
 //!
-//! - [`net`] — a domain-agnostic network-simplex engine with stable
-//!   [`net::NodeId`]/[`net::ArcId`] handles, single-dummy transportation model,
-//!   warm-started re-solving with incremental potential updates, and
-//!   [`net::Snapshot`] persistence for caching the basis across runs.
-//! - [`recon`] — an ergonomic facade: describe your domain once via
-//!   [`recon::Model`], then drive it with `upsert` / `remove` / `solve` and read
-//!   back netted [`recon::Group`]s.
+//! - [`engine`] — a domain-agnostic network-simplex engine with stable
+//!   [`engine::NodeId`]/[`engine::ArcId`] handles, single-dummy transportation
+//!   model, warm-started re-solving with incremental potential updates, and
+//!   [`engine::Snapshot`] persistence for caching the basis across runs.
+//! - [`flow`] — the incremental min-cost-flow matcher: describe your domain
+//!   once via [`flow::Model`], then drive a [`flow::Matcher`] with `upsert` /
+//!   `remove` / `solve` and read back netted [`flow::Group`]s. This is the
+//!   engine behind the `flow` strategy leaf.
 //! - [`strategy`] — a combinator algebra over an unordered bag of items:
 //!   `Strategy: Bag -> (Groups, residual)`, conserving by construction. Cheap
 //!   deterministic primitives (`exact_1to1`, `agg_net`, `signal_group`,
 //!   `running_zero`) cascade ahead of the `flow` arbiter via `seq`,
 //!   `partition_by`, and `windowed`.
-//! - [`api`] — the consumption surface: a serializable [`api::Plan`] (the
-//!   strategy tree as data), a stateful [`api::Session`] that owns rows
-//!   natively, and a relational [`api::Report`]. Conservation is enforced at
-//!   the boundary, so a malformed plan degrades to a bad proposal, never a
-//!   broken ledger. With the `wasm` feature, [`wasm`] exports this as a
+//! - [`plan`] — the consumption surface: a serializable [`plan::Plan`] (the
+//!   strategy tree as data, pricing included via [`plan::CostSpec`]), one
+//!   generic stateful facade [`plan::Recon`] (with [`plan::Workspace`] its
+//!   `Row` specialization), and a relational [`plan::Report`]. Conservation is
+//!   enforced at the boundary, so a malformed plan degrades to a bad proposal,
+//!   never a broken ledger. With the `wasm` feature, [`wasm`] exports this as a
 //!   single C-ABI module any runtime (wasmtime, browser) can drive.
 //!
-//! Enable the `serde` feature to serialize [`net::Snapshot`] / `ReconSnapshot`
-//! to disk and warm-start next month off this month's tree.
+//! Enable the `serde` feature to serialize [`engine::Snapshot`] /
+//! [`flow::MatcherSnapshot`] to disk and warm-start next month off this
+//! month's tree.
 //!
 //! ```
-//! use florecon::recon::{Model, Reconciler};
+//! use florecon::flow::{Model, Matcher};
 //!
 //! struct Tx { amount: i64, date: i64 }
 //! struct M;
@@ -40,20 +43,20 @@
 //!     }
 //! }
 //!
-//! let mut r = Reconciler::new(M);
+//! let mut r = Matcher::new(M);
 //! r.upsert(1, Tx { amount: 100, date: 0 });
 //! r.upsert(2, Tx { amount: -100, date: 0 });
 //! r.solve();
 //! assert!(r.groups()[0].clean);
 //! ```
 
-pub mod api;
-pub mod net;
-pub mod recon;
+pub mod engine;
+pub mod flow;
+pub mod plan;
 pub mod strategy;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-pub use net::{ArcId, Network, NodeId, SolveStatus};
-pub use recon::{ExtId, Group, Model, Reconciler};
+pub use engine::{ArcId, Network, NodeId, SolveStatus};
+pub use flow::{ExtId, Group, Matcher, Model};

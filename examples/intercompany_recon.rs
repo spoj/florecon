@@ -4,7 +4,7 @@
 //! proximity key = GL date, cost = matching quality), then stream transactions
 //! in via `upsert`, `solve`, and read back netted groups.
 
-use florecon::recon::{Model, Reconciler};
+use florecon::flow::{Model, Matcher};
 use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
@@ -278,7 +278,7 @@ fn main() {
     };
 
     let t0 = Instant::now();
-    let mut recon = Reconciler::new(model);
+    let mut recon = Matcher::new(model);
     for (i, tx) in txs.iter().enumerate() {
         recon.upsert(i as u64, tx.clone());
     }

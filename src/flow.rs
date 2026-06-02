@@ -1,17 +1,19 @@
-//! Layer 2 — the reconciliation facade.
+//! Layer 2 — the incremental min-cost-flow matcher.
 //!
 //! You describe your domain once via the [`Model`] trait, then drive the
-//! engine with three verbs: [`Reconciler::upsert`], [`Reconciler::remove`],
-//! and [`Reconciler::solve`]. The facade owns candidate-arc generation (using
-//! a 1-D proximity window over `block_key`) and maps results back to netted
-//! groups.
+//! engine with three verbs: [`Matcher::upsert`], [`Matcher::remove`], and
+//! [`Matcher::solve`]. The matcher owns candidate-arc generation (using a 1-D
+//! proximity window over `block_key` plus exact-join `match_keys`) and maps the
+//! solved flow back to netted groups. It is the engine behind the `flow`
+//! strategy leaf, and — with the `serde` feature — its
+//! [`MatcherSnapshot`] warm-starts next month off this month's basis.
 //!
 //! Currency lives entirely inside your opaque `Tx` type; the engine reads only
 //! `base_amount` (the single shared numeraire it conserves) plus whatever your
 //! `cost` closure inspects. An "FX reprice" is therefore just an `upsert` with
 //! updated lanes — no special verb, no FX table in the engine.
 
-use crate::net::{NodeId, Network, SolveStatus};
+use crate::engine::{NodeId, Network, SolveStatus};
 use std::collections::{BTreeMap, HashMap};
 
 /// External, caller-owned identity for a transaction (hash your reference/UUID
@@ -63,7 +65,7 @@ struct Entry<Tx> {
     /// Exact-join keys this transaction is indexed under.
     keys: Vec<u64>,
     /// Real arcs incident to this transaction, by the *other* endpoint's ExtId.
-    arcs: Vec<(ExtId, crate::net::ArcId)>,
+    arcs: Vec<(ExtId, crate::engine::ArcId)>,
 }
 
 #[cfg(feature = "serde")]
@@ -74,17 +76,17 @@ struct EntrySer<Tx> {
     key: i64,
     base: i64,
     keys: Vec<u64>,
-    arcs: Vec<(ExtId, crate::net::ArcId)>,
+    arcs: Vec<(ExtId, crate::engine::ArcId)>,
 }
 
-/// Serializable, persistent state of a [`Reconciler`] (the engine basis plus
-/// the transaction index). Produce with [`Reconciler::snapshot`] and rebuild
-/// with [`Reconciler::restore`]. Requires the `serde` feature and
+/// Serializable, persistent state of a [`Matcher`] (the engine basis plus
+/// the transaction index). Produce with [`Matcher::snapshot`] and rebuild
+/// with [`Matcher::restore`]. Requires the `serde` feature and
 /// `Model::Tx: Serialize + Deserialize`.
 #[cfg(feature = "serde")]
 #[derive(serde::Serialize, serde::Deserialize)]
-pub struct ReconSnapshot<Tx> {
-    net: crate::net::Snapshot,
+pub struct MatcherSnapshot<Tx> {
+    net: crate::engine::Snapshot,
     entries: Vec<(ExtId, EntrySer<Tx>)>,
     by_key: BTreeMap<i64, Vec<ExtId>>,
     by_match_key: HashMap<u64, Vec<ExtId>>,
@@ -101,7 +103,7 @@ pub struct Group {
 }
 
 /// A persistent, incremental reconciler over your `Model`.
-pub struct Reconciler<M: Model> {
+pub struct Matcher<M: Model> {
     model: M,
     net: Network,
     entries: HashMap<ExtId, Entry<M::Tx>>,
@@ -111,10 +113,10 @@ pub struct Reconciler<M: Model> {
     by_match_key: HashMap<u64, Vec<ExtId>>,
 }
 
-impl<M: Model> Reconciler<M> {
+impl<M: Model> Matcher<M> {
     /// Create a fresh reconciler for the given model.
     pub fn new(model: M) -> Self {
-        Reconciler {
+        Matcher {
             model,
             net: Network::new(),
             entries: HashMap::new(),
@@ -310,6 +312,11 @@ impl<M: Model> Reconciler<M> {
             }
         }
 
+        // Add arcs in a deterministic order so the matching is reproducible
+        // across builds (HashSet iteration order is not stable, and ties in the
+        // ambiguous tail would otherwise resolve differently run to run).
+        let mut partners: Vec<ExtId> = partners.into_iter().collect();
+        partners.sort_unstable();
         for other in partners {
             // Orient source -> sink and cost(source_tx, sink_tx).
             let (src_id, snk_id) = if base > 0 { (id, other) } else { (other, id) };
@@ -370,12 +377,12 @@ impl<M: Model> Reconciler<M> {
 }
 
 #[cfg(feature = "serde")]
-impl<M: Model> Reconciler<M>
+impl<M: Model> Matcher<M>
 where
     M::Tx: Clone + serde::Serialize,
 {
     /// Capture the full reconciler state for caching between runs.
-    pub fn snapshot(&self) -> ReconSnapshot<M::Tx> {
+    pub fn snapshot(&self) -> MatcherSnapshot<M::Tx> {
         let entries = self
             .entries
             .iter()
@@ -393,7 +400,7 @@ where
                 )
             })
             .collect();
-        ReconSnapshot {
+        MatcherSnapshot {
             net: self.net.snapshot(),
             entries,
             by_key: self.by_key.clone(),
@@ -403,11 +410,11 @@ where
 }
 
 #[cfg(feature = "serde")]
-impl<M: Model> Reconciler<M> {
+impl<M: Model> Matcher<M> {
     /// Rebuild a reconciler from a snapshot and a (re-supplied) model. Node and
     /// arc handles, the basis, and the ExtId index are all preserved, so the
     /// next `solve` is a warm start.
-    pub fn restore(model: M, snap: ReconSnapshot<M::Tx>) -> Self {
+    pub fn restore(model: M, snap: MatcherSnapshot<M::Tx>) -> Self {
         let entries = snap
             .entries
             .into_iter()
@@ -425,7 +432,7 @@ impl<M: Model> Reconciler<M> {
                 )
             })
             .collect();
-        Reconciler {
+        Matcher {
             model,
             net: Network::restore(snap.net),
             entries,
@@ -471,7 +478,7 @@ mod tests {
 
     #[test]
     fn basic_recon() {
-        let mut r = Reconciler::new(Demo);
+        let mut r = Matcher::new(Demo);
         r.upsert(1, Tx { amount: 100, date: 0 });
         r.upsert(2, Tx { amount: -100, date: 1 });
         r.solve();
@@ -483,7 +490,7 @@ mod tests {
 
     #[test]
     fn streaming_add() {
-        let mut r = Reconciler::new(Demo);
+        let mut r = Matcher::new(Demo);
         r.upsert(1, Tx { amount: 100, date: 0 });
         r.upsert(2, Tx { amount: -100, date: 0 });
         r.solve();
@@ -500,7 +507,7 @@ mod tests {
 
     #[test]
     fn out_of_window_unmatched() {
-        let mut r = Reconciler::new(Demo);
+        let mut r = Matcher::new(Demo);
         r.upsert(1, Tx { amount: 100, date: 0 });
         r.upsert(2, Tx { amount: -100, date: 100 }); // far outside window
         r.solve();
@@ -510,7 +517,7 @@ mod tests {
 
     #[test]
     fn correction_reprice() {
-        let mut r = Reconciler::new(Demo);
+        let mut r = Matcher::new(Demo);
         r.upsert(1, Tx { amount: 100, date: 0 });
         r.upsert(2, Tx { amount: -100, date: 0 });
         r.upsert(3, Tx { amount: -50, date: 0 });
@@ -527,7 +534,7 @@ mod tests {
 
     #[test]
     fn remove_tx() {
-        let mut r = Reconciler::new(Demo);
+        let mut r = Matcher::new(Demo);
         r.upsert(1, Tx { amount: 100, date: 0 });
         r.upsert(2, Tx { amount: -100, date: 0 });
         r.solve();
@@ -567,15 +574,15 @@ mod tests {
         }
 
         // "Month 1": match a pair, then cache.
-        let mut r = Reconciler::new(SModel);
+        let mut r = Matcher::new(SModel);
         r.upsert(1, STx { amount: 100, date: 0 });
         r.upsert(2, STx { amount: -100, date: 0 });
         r.solve();
         let json = serde_json::to_string(&r.snapshot()).unwrap();
 
         // "Month 2": restore the cached basis, stream a new pair, warm-solve.
-        let snap: ReconSnapshot<STx> = serde_json::from_str(&json).unwrap();
-        let mut r2 = Reconciler::restore(SModel, snap);
+        let snap: MatcherSnapshot<STx> = serde_json::from_str(&json).unwrap();
+        let mut r2 = Matcher::restore(SModel, snap);
         assert_eq!(r2.groups().len(), 1); // basis survived the round-trip
         r2.upsert(3, STx { amount: 70, date: 1 });
         r2.upsert(4, STx { amount: -70, date: 1 });

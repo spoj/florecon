@@ -1,23 +1,24 @@
-//! Layer 3 — the consumption API.
+//! Layer 4 — the consumption surface (the `plan` API).
 //!
-//! This is the surface external hosts (a PyO3 wheel, a wasm-bindgen module, an
-//! agent emitting config) drive. It turns the closure-based combinators of
-//! [`crate::strategy`] into a **data-driven, serializable** pipeline so nothing
-//! but plans and results ever cross a language boundary.
+//! This is the surface external hosts (a Python wheel over wasmtime, a browser
+//! module, an agent emitting config) drive. It turns the closure-based
+//! combinators of [`crate::strategy`] into a **data-driven, serializable**
+//! pipeline so nothing but plans and results ever cross a language boundary.
 //!
-//! Three pieces:
-//! - [`Plan`] — the strategy tree *as data* (no host callbacks). Serializable,
-//!   so an agent can author it and a native interpreter runs it.
-//! - [`Session`] — a long-lived handle that owns the rows natively; hosts cross
-//!   the boundary only with coarse deltas ([`Session::upsert`] /
-//!   [`Session::remove`]) and a [`Session::solve`] call.
+//! Pieces:
+//! - [`Plan`] — the strategy tree *as data*, pricing included via [`CostSpec`]
+//!   (no host callbacks). Serializable, so an agent can author it and a native
+//!   interpreter runs it.
+//! - [`Recon`] — the one generic stateful facade (`upsert` / `remove` / `solve`
+//!   / `freeze` / `breakup` / …); [`Workspace`] is its [`Row`] + [`Plan`]
+//!   specialization and [`Session`] is the stateless one-shot form.
 //! - [`Report`] — the relational result (`assignments` + `groups` + `residual`).
 //!
-//! Conservation is enforced at the boundary: [`Session::solve`] verifies that
-//! every input id lands in exactly one group or in the residual, so a malformed
-//! plan can never silently lose or double-count mass.
+//! Conservation is enforced at the boundary: a solve verifies that every input
+//! id lands in exactly one group or in the residual, so a malformed plan can
+//! never silently lose or double-count mass.
 
-use crate::recon::{ExtId, Model};
+use crate::flow::{ExtId, Model};
 use crate::strategy::{
     Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
 };

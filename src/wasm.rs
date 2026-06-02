@@ -2,14 +2,14 @@
 //!
 //! No wasm-bindgen: this is a plain `wasm32` module callable from any runtime
 //! (wasmtime, browser, Wasmer). The host allocates an input buffer with
-//! [`alloc`], writes a [`crate::api::SolveRequest`] as JSON into it, calls
+//! [`alloc`], writes a [`crate::plan::SolveRequest`] as JSON into it, calls
 //! [`solve`], reads the returned JSON envelope, then frees both buffers with
 //! [`dealloc`]. State stays native; only plans and results cross.
 //!
 //! The return value of [`solve`] packs `(len << 32) | ptr` into a `u64`
 //! (wasm32 pointers are 32-bit), which every runtime can unpack.
 
-use crate::api::{Report, SolveRequest};
+use crate::plan::{Report, SolveRequest};
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
@@ -87,8 +87,8 @@ fn run(bytes: &[u8]) -> Vec<u8> {
 // Stateful interactive surface: one workspace, driven by JSON commands.
 // ---------------------------------------------------------------------------
 
-use crate::api::{Plan, Row, Schema, Workspace, WorkspaceReport};
-use crate::recon::ExtId;
+use crate::plan::{Plan, Row, Schema, Workspace, WorkspaceReport};
+use crate::flow::ExtId;
 
 thread_local! {
     static WS: RefCell<Option<Workspace>> = const { RefCell::new(None) };

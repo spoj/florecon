@@ -12,7 +12,7 @@
 //!
 //! Run: cargo run --release --example interco [path]
 
-use florecon::recon::Model;
+use florecon::flow::Model;
 use florecon::strategy::{Item, agg_net, exact_1to1, flow, partition_by, seq, signal_group};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Field;
