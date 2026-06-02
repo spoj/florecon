@@ -7,6 +7,14 @@ SolveRequest and read back a JSON envelope. See src/wasm.rs for the ABI.
 import json
 import wasmtime
 
+# The wire-contract version this host speaks; must equal the engine's
+# abi_version() export. Bump in lockstep with plan::CONTRACT_VERSION.
+CONTRACT_VERSION = 1
+
+
+class ContractMismatch(RuntimeError):
+    pass
+
 
 class Florecon:
     def __init__(self, wasm_path: str):
@@ -20,6 +28,12 @@ class Florecon:
         self._dealloc = ex["dealloc"]
         self._solve = ex["solve"]
         self._dispatch = ex["dispatch"]
+        self.engine_version = ex["abi_version"](self.store)
+        if self.engine_version != CONTRACT_VERSION:
+            raise ContractMismatch(
+                f"wasm contract v{self.engine_version} != host v{CONTRACT_VERSION}; "
+                "rebuild the wasm or update this host"
+            )
 
     def _call(self, fn, payload: dict) -> dict:
         data = json.dumps(payload).encode("utf-8")

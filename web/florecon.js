@@ -2,6 +2,10 @@
 // The module has no imports; i64 returns arrive as BigInt.
 
 export class Florecon {
+  // The wire-contract version this host speaks; must equal the engine's
+  // abi_version() export. Bump in lockstep with plan::CONTRACT_VERSION.
+  static CONTRACT_VERSION = 1;
+
   static async load(url) {
     const bytes = await (await fetch(url)).arrayBuffer();
     const { instance } = await WebAssembly.instantiate(bytes, {});
@@ -13,6 +17,14 @@ export class Florecon {
     this.mem = this.ex.memory;
     this.enc = new TextEncoder();
     this.dec = new TextDecoder();
+    const v = this.ex.abi_version();
+    if (v !== Florecon.CONTRACT_VERSION) {
+      throw new Error(
+        `wasm contract v${v} != host v${Florecon.CONTRACT_VERSION}; ` +
+          "rebuild the wasm or update this host",
+      );
+    }
+    this.engineVersion = v;
   }
 
   _call(fn, payload) {

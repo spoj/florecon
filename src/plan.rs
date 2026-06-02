@@ -19,6 +19,12 @@
 //! never silently lose or double-count mass.
 
 use crate::flow::{ExtId, Model};
+
+/// The wire-contract version: the shape of [`Plan`], [`Report`], and the WASM
+/// command set. Hosts (the Python wheel, the browser module) read it back from
+/// the engine and refuse to run against a mismatched binary. Bump it on any
+/// breaking change to those shapes.
+pub const CONTRACT_VERSION: u32 = 1;
 use crate::strategy::{
     Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
 };

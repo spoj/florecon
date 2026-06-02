@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://florecon.dev/schema/plan-1.json",
+  "title": "florecon wire contract",
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the Report. Contract version 1 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
+  "x-contract-version": 1,
+
+  "$defs": {
+    "Value": {
+      "description": "A typed column value: an integer (money in minor units, dates in days, or a partition/bucket key) or a list of pre-hashed reference tokens.",
+      "oneOf": [
+        { "type": "object", "properties": { "Int": { "type": "integer" } }, "required": ["Int"], "additionalProperties": false },
+        { "type": "object", "properties": { "Tokens": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }, "required": ["Tokens"], "additionalProperties": false }
+      ]
+    },
+
+    "Schema": {
+      "type": "object",
+      "properties": { "cols": { "type": "array", "items": { "type": "string" } } },
+      "required": ["cols"],
+      "additionalProperties": false
+    },
+
+    "Row": {
+      "type": "object",
+      "properties": { "values": { "type": "array", "items": { "$ref": "#/$defs/Value" } } },
+      "required": ["values"],
+      "additionalProperties": false
+    },
+
+    "IdRow": {
+      "description": "A (ExtId, Row) pair: a caller-owned u64 id and its positional row.",
+      "type": "array",
+      "prefixItems": [ { "type": "integer", "minimum": 0 }, { "$ref": "#/$defs/Row" } ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+
+    "Cond": {
+      "description": "A predicate on a candidate pair used by the flow cost model.",
+      "enum": ["token_shared", "amount_equal"]
+    },
+
+    "CostTier": {
+      "type": "object",
+      "properties": {
+        "when": { "type": "array", "items": { "$ref": "#/$defs/Cond" } },
+        "base": { "type": "number" },
+        "day_slope": { "type": "number", "default": 0 },
+        "max_day": { "type": ["integer", "null"], "default": null }
+      },
+      "required": ["when", "base"],
+      "additionalProperties": false
+    },
+
+    "CostSpec": {
+      "description": "The flow arbiter's cost as ordered confidence tiers; first satisfied tier wins, no tier means the pair is forbidden. Omitted in a Flow node means the default reference-bridge > exact-amount cascade.",
+      "type": "object",
+      "properties": { "tiers": { "type": "array", "items": { "$ref": "#/$defs/CostTier" } } },
+      "required": ["tiers"],
+      "additionalProperties": false
+    },
+
+    "Plan": {
+      "description": "A reconciliation pipeline as data. Tagged union on `op`; every leaf references columns by name.",
+      "oneOf": [
+        {
+          "title": "seq", "type": "object",
+          "properties": { "op": { "const": "seq" }, "steps": { "type": "array", "items": { "$ref": "#/$defs/Plan" } } },
+          "required": ["op", "steps"], "additionalProperties": false
+        },
+        {
+          "title": "partition", "type": "object",
+          "properties": { "op": { "const": "partition" }, "by": { "type": "string" }, "inner": { "$ref": "#/$defs/Plan" } },
+          "required": ["op", "by", "inner"], "additionalProperties": false
+        },
+        {
+          "title": "windowed", "type": "object",
+          "properties": { "op": { "const": "windowed" }, "order": { "type": "string" }, "width": { "type": "integer" }, "inner": { "$ref": "#/$defs/Plan" } },
+          "required": ["op", "order", "width", "inner"], "additionalProperties": false
+        },
+        {
+          "title": "agg_net", "type": "object",
+          "properties": { "op": { "const": "agg_net" }, "key": { "type": "string" }, "amount": { "type": "string" }, "tol": { "type": "integer" } },
+          "required": ["op", "key", "amount", "tol"], "additionalProperties": false
+        },
+        {
+          "title": "exact", "type": "object",
+          "properties": { "op": { "const": "exact" }, "amount": { "type": "string" } },
+          "required": ["op", "amount"], "additionalProperties": false
+        },
+        {
+          "title": "signal", "type": "object",
+          "properties": { "op": { "const": "signal" }, "signals": { "type": "string" }, "amount": { "type": "string" }, "tol": { "type": "integer" }, "cap": { "type": "integer", "minimum": 0 } },
+          "required": ["op", "signals", "amount", "tol", "cap"], "additionalProperties": false
+        },
+        {
+          "title": "flow", "type": "object",
+          "properties": {
+            "op": { "const": "flow" },
+            "amount": { "type": "string" },
+            "day": { "type": "string" },
+            "native": { "type": "string" },
+            "tokens": { "type": "string" },
+            "penalty": { "type": "number" },
+            "window": { "type": "integer" },
+            "cost": { "$ref": "#/$defs/CostSpec" }
+          },
+          "required": ["op", "amount", "day", "native", "tokens", "penalty", "window"],
+          "additionalProperties": false
+        }
+      ]
+    },
+
+    "SolveRequest": {
+      "description": "A self-contained batch solve: the JSON passed to the wasm `solve` export.",
+      "type": "object",
+      "properties": {
+        "schema": { "$ref": "#/$defs/Schema" },
+        "rows": { "type": "array", "items": { "$ref": "#/$defs/IdRow" } },
+        "plan": { "$ref": "#/$defs/Plan" }
+      },
+      "required": ["schema", "rows", "plan"],
+      "additionalProperties": false
+    },
+
+    "Cmd": {
+      "description": "An interactive command driving the stateful Workspace via the wasm `dispatch` export. Tagged union on `op`.",
+      "oneOf": [
+        { "type": "object", "properties": { "op": { "const": "init" }, "schema": { "$ref": "#/$defs/Schema" }, "plan": { "$ref": "#/$defs/Plan" }, "rows": { "type": "array", "items": { "$ref": "#/$defs/IdRow" } } }, "required": ["op", "schema", "plan", "rows"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "upsert" }, "rows": { "type": "array", "items": { "$ref": "#/$defs/IdRow" } } }, "required": ["op", "rows"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "remove" }, "ids": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }, "required": ["op", "ids"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "solve" } }, "required": ["op"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "freeze" }, "group_id": { "type": "integer", "minimum": 0 } }, "required": ["op", "group_id"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "freeze_clean" }, "tol": { "type": "integer" } }, "required": ["op", "tol"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "unfreeze" }, "group_id": { "type": "integer", "minimum": 0 } }, "required": ["op", "group_id"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "breakup" }, "group_id": { "type": "integer", "minimum": 0 } }, "required": ["op", "group_id"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "report" } }, "required": ["op"], "additionalProperties": false }
+      ]
+    },
+
+    "GroupOut": {
+      "type": "object",
+      "properties": {
+        "group_id": { "type": "integer", "minimum": 0 },
+        "origin": { "type": "string" },
+        "net": { "type": "integer" },
+        "size": { "type": "integer", "minimum": 0 },
+        "frozen": { "type": "boolean", "description": "present on Workspace (dispatch) reports only" }
+      },
+      "required": ["group_id", "origin", "net", "size"]
+    },
+
+    "Report": {
+      "description": "The relational result. `assignments` and `residual` partition the input ids exactly (verified before return).",
+      "type": "object",
+      "properties": {
+        "assignments": { "type": "array", "items": { "type": "array", "prefixItems": [ { "type": "integer" }, { "type": "integer" } ], "items": false, "minItems": 2, "maxItems": 2 } },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/GroupOut" } },
+        "residual": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+      },
+      "required": ["assignments", "groups", "residual"],
+      "additionalProperties": false
+    },
+
+    "Envelope": {
+      "description": "The response wrapper for both solve and dispatch: ok plus an optional report or error.",
+      "type": "object",
+      "properties": {
+        "ok": { "type": "boolean" },
+        "error": { "type": ["string", "null"] },
+        "report": { "anyOf": [ { "$ref": "#/$defs/Report" }, { "type": "null" } ] }
+      },
+      "required": ["ok"]
+    }
+  },
+
+  "$ref": "#/$defs/SolveRequest"
+}

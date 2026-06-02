@@ -13,6 +13,13 @@ use crate::plan::{Report, SolveRequest};
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
+/// The wire-contract version this binary implements. Hosts read it first and
+/// refuse to run against a mismatched build. See [`crate::plan::CONTRACT_VERSION`].
+#[unsafe(no_mangle)]
+pub extern "C" fn abi_version() -> u32 {
+    crate::plan::CONTRACT_VERSION
+}
+
 /// Allocate `len` bytes in wasm linear memory; returns the pointer (offset).
 /// The host writes its request bytes here before calling [`solve`].
 #[unsafe(no_mangle)]
