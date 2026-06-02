@@ -167,10 +167,10 @@ fn main() {
         let mut unit = [co.clone(), icp.clone()];
         unit.sort();
         let unit = (unit[0].clone(), unit[1].clone());
-        if let Some(u) = &only_unit {
-            if &unit != u {
-                continue;
-            }
+        if let Some(u) = &only_unit
+            && &unit != u
+        {
+            continue;
         }
         let toks = tokens(&[&refr, &ref2, &desc, &remark, &inv]);
         raws.push(Raw {
