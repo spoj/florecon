@@ -180,7 +180,10 @@ fn dispatch_json(bytes: &[u8]) -> Vec<u8> {
 fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
     // Init is the only command that may run without an existing workspace.
     if let Cmd::Init { schema, plan, rows } = cmd {
-        let mut ws = Workspace::new(schema, plan);
+        let mut ws = match Workspace::new(schema, plan) {
+            Ok(ws) => ws,
+            Err(e) => return WsEnvelope::err(e.to_string()),
+        };
         for (id, row) in rows {
             if let Err(e) = ws.upsert(id, row) {
                 return WsEnvelope::err(e.to_string());

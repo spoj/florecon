@@ -594,29 +594,30 @@ pub struct WorkspaceReport {
     pub residual: Vec<ExtId>,
 }
 
-/// A long-lived, editable reconciliation workspace.
+/// A long-lived, editable reconciliation workspace over items of type `E`,
+/// driven by any [`Strategy`]. This is the one stateful facade; [`Workspace`]
+/// is its `Row` + [`Plan`] specialization and a typed Rust caller can drive
+/// `Recon<MyTx>` directly with a strategy built from the combinators.
 ///
-/// Holds rows plus a stored [`Plan`], and supports the interactive loop a UI
-/// drives: [`solve`](Workspace::solve) recomputes the unfrozen pool;
-/// [`freeze`](Workspace::freeze) locks a group an analyst trusts so re-solves
-/// leave it alone; [`breakup`](Workspace::breakup) dissolves a group back to
-/// the pool. The conservation invariant — every row id is in exactly one group
-/// or in the residual — holds after every operation.
-pub struct Workspace {
-    schema: Schema,
-    plan: Plan,
-    rows: BTreeMap<ExtId, Row>,
+/// It supports the interactive loop a UI drives: [`solve`](Recon::solve)
+/// recomputes the unfrozen pool; [`freeze`](Recon::freeze) locks a group an
+/// analyst trusts so re-solves leave it alone; [`breakup`](Recon::breakup)
+/// dissolves a group back to the pool. The conservation invariant — every item
+/// id is in exactly one group or in the residual — holds after every operation.
+pub struct Recon<E> {
+    strategy: Box<dyn Strategy<E>>,
+    items: BTreeMap<ExtId, E>,
     groups: Vec<GroupRec>,
     residual: BTreeSet<ExtId>,
     next_id: u64,
 }
 
-impl Workspace {
-    pub fn new(schema: Schema, plan: Plan) -> Self {
-        Workspace {
-            schema,
-            plan,
-            rows: BTreeMap::new(),
+impl<E: Clone> Recon<E> {
+    /// Create an empty workspace driven by `strategy`.
+    pub fn new(strategy: Box<dyn Strategy<E>>) -> Self {
+        Recon {
+            strategy,
+            items: BTreeMap::new(),
             groups: Vec::new(),
             residual: BTreeSet::new(),
             next_id: 0,
@@ -624,31 +625,24 @@ impl Workspace {
     }
 
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.items.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.items.is_empty()
     }
 
-    /// Insert or replace a row. A new id starts life in the residual; the
+    /// Insert or replace an item. A new id starts life in the residual; the
     /// caller re-solves to fold it into groups.
-    pub fn upsert(&mut self, id: ExtId, row: Row) -> Result<(), ApiError> {
-        if row.values.len() != self.schema.len() {
-            return Err(ApiError::SchemaArity {
-                expected: self.schema.len(),
-                got: row.values.len(),
-            });
-        }
-        if self.rows.insert(id, row).is_none() && !self.in_group(id) {
+    pub fn upsert(&mut self, id: ExtId, item: E) {
+        if self.items.insert(id, item).is_none() && !self.in_group(id) {
             self.residual.insert(id);
         }
-        Ok(())
     }
 
-    /// Remove a row from the workspace and from wherever it currently sits.
+    /// Remove an item from the workspace and from wherever it currently sits.
     pub fn remove(&mut self, id: ExtId) {
-        self.rows.remove(&id);
+        self.items.remove(&id);
         self.residual.remove(&id);
         for g in &mut self.groups {
             g.members.retain(|&m| m != id);
@@ -670,28 +664,27 @@ impl Workspace {
         self.groups.iter().any(|g| g.members.contains(&id))
     }
 
-    /// Recompute the unfrozen pool: drop all live groups, run the plan over
-    /// every row not locked in a frozen group, and install fresh live groups.
+    /// Recompute the unfrozen pool: drop all live groups, run the strategy over
+    /// every item not locked in a frozen group, and install fresh live groups.
     /// Frozen groups are left untouched.
     pub fn solve(&mut self) -> Result<(), ApiError> {
-        let strategy = compile(&self.plan, &self.schema)?;
         let frozen_members: BTreeSet<ExtId> = self
             .groups
             .iter()
             .filter(|g| g.frozen)
             .flat_map(|g| g.members.iter().copied())
             .collect();
-        let bag: Vec<Item<Row>> = self
-            .rows
+        let bag: Vec<Item<E>> = self
+            .items
             .iter()
             .filter(|(id, _)| !frozen_members.contains(id))
-            .map(|(id, row)| Item {
+            .map(|(id, item)| Item {
                 id: *id,
-                data: row.clone(),
+                data: item.clone(),
             })
             .collect();
         let pool = bag.len();
-        let res = strategy.run(bag);
+        let res = self.strategy.run(bag);
 
         self.groups.retain(|g| g.frozen);
         let mut new_groups = res.groups;
@@ -787,6 +780,81 @@ impl Workspace {
             groups,
             residual: self.residual.iter().copied().collect(),
         }
+    }
+}
+
+/// The interactive [`Plan`]-driven workspace over [`Row`]s: a [`Recon<Row>`]
+/// plus its [`Schema`] (for arity validation). This is what the WASM `dispatch`
+/// surface drives.
+pub struct Workspace {
+    schema: Schema,
+    inner: Recon<Row>,
+}
+
+impl Workspace {
+    /// Compile `plan` against `schema` and create an empty workspace. Fails if
+    /// the plan references an unknown column.
+    pub fn new(schema: Schema, plan: Plan) -> Result<Self, ApiError> {
+        let strategy = compile(&plan, &schema)?;
+        Ok(Workspace {
+            schema,
+            inner: Recon::new(strategy),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Insert or replace a row (arity-checked against the schema).
+    pub fn upsert(&mut self, id: ExtId, row: Row) -> Result<(), ApiError> {
+        if row.values.len() != self.schema.len() {
+            return Err(ApiError::SchemaArity {
+                expected: self.schema.len(),
+                got: row.values.len(),
+            });
+        }
+        self.inner.upsert(id, row);
+        Ok(())
+    }
+
+    /// Remove a row from the workspace and from wherever it currently sits.
+    pub fn remove(&mut self, id: ExtId) {
+        self.inner.remove(id);
+    }
+
+    /// Recompute the unfrozen pool, preserving frozen groups.
+    pub fn solve(&mut self) -> Result<(), ApiError> {
+        self.inner.solve()
+    }
+
+    /// Lock a group so future solves leave it intact.
+    pub fn freeze(&mut self, group_id: u64) -> Result<(), ApiError> {
+        self.inner.freeze(group_id)
+    }
+
+    /// Freeze every live group whose net is within `tol`. Returns the count.
+    pub fn freeze_clean(&mut self, tol: i64) -> usize {
+        self.inner.freeze_clean(tol)
+    }
+
+    /// Unlock a frozen group; the next solve may reshape it.
+    pub fn unfreeze(&mut self, group_id: u64) -> Result<(), ApiError> {
+        self.inner.unfreeze(group_id)
+    }
+
+    /// Dissolve a group; its members return to the residual.
+    pub fn breakup(&mut self, group_id: u64) -> Result<(), ApiError> {
+        self.inner.breakup(group_id)
+    }
+
+    /// Snapshot the current state as a relational report.
+    pub fn report(&self) -> WorkspaceReport {
+        self.inner.report()
     }
 }
 
@@ -990,6 +1058,28 @@ mod tests {
         assert_eq!(rep.groups.len(), 1);
     }
 
+    #[test]
+    fn generic_recon_over_plain_items() {
+        // Recon<E> drives any Strategy over any item type -- here plain i64
+        // amounts with an exact-pair strategy, no Row/Schema/Plan involved.
+        use crate::strategy::exact_1to1;
+        let strat = exact_1to1(|a: &i64| Some(a.unsigned_abs()), |a: &i64| *a);
+        let mut r: Recon<i64> = Recon::new(strat);
+        r.upsert(1, 50);
+        r.upsert(2, -50);
+        r.upsert(3, 9);
+        r.solve().unwrap();
+        let rep = r.report();
+        assert_eq!(rep.groups.len(), 1);
+        assert_eq!(rep.residual, vec![3]);
+        // freeze survives a re-solve; breakup returns members to the pool.
+        let g = rep.groups[0].group_id;
+        r.freeze(g).unwrap();
+        r.upsert(4, 9);
+        r.solve().unwrap();
+        assert!(r.report().groups.iter().any(|x| x.group_id == g && x.frozen));
+    }
+
     fn ws_conserves(ws: &Workspace) {
         let rep = ws.report();
         let n = rep.assignments.len() + rep.residual.len();
@@ -998,7 +1088,7 @@ mod tests {
 
     #[test]
     fn workspace_solve_freeze_breakup() {
-        let mut ws = Workspace::new(schema(), full_pipeline());
+        let mut ws = Workspace::new(schema(), full_pipeline()).unwrap();
         ws.upsert(1, row(100, 1, 10, 100, &[])).unwrap();
         ws.upsert(2, row(-100, 2, 10, -100, &[])).unwrap();
         ws.upsert(3, row(50, 3, 20, 50, &[])).unwrap();
@@ -1034,7 +1124,7 @@ mod tests {
 
     #[test]
     fn workspace_remove_keeps_conservation() {
-        let mut ws = Workspace::new(schema(), full_pipeline());
+        let mut ws = Workspace::new(schema(), full_pipeline()).unwrap();
         ws.upsert(1, row(100, 1, 0, 100, &[])).unwrap();
         ws.upsert(2, row(-100, 2, 0, -100, &[])).unwrap();
         ws.solve().unwrap();
@@ -1049,7 +1139,7 @@ mod tests {
 
     #[test]
     fn workspace_unknown_group_errors() {
-        let mut ws = Workspace::new(schema(), full_pipeline());
+        let mut ws = Workspace::new(schema(), full_pipeline()).unwrap();
         assert_eq!(ws.freeze(99), Err(ApiError::UnknownGroup(99)));
         assert_eq!(ws.breakup(99), Err(ApiError::UnknownGroup(99)));
     }
