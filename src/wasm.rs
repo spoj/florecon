@@ -207,7 +207,7 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
             Err(e) => return WsEnvelope::err(e.to_string()),
         };
         for (id, row) in rows {
-            if let Err(e) = ws.upsert_raw(id, row) {
+            if let Err(e) = ws.upsert(id, row) {
                 return WsEnvelope::err(e.to_string());
             }
         }
@@ -223,7 +223,7 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
         Cmd::Init { .. } => unreachable!(),
         Cmd::Upsert { rows } => rows
             .into_iter()
-            .try_for_each(|(id, row)| ws.upsert_raw(id, row)),
+            .try_for_each(|(id, row)| ws.upsert(id, row)),
         Cmd::Remove { ids } => {
             ids.into_iter().for_each(|id| ws.remove(id));
             Ok(())

@@ -95,17 +95,6 @@ impl Schema {
         }
     }
 
-    /// Schema from names alone, every column [`Kind::Number`]. A convenience for
-    /// engine-level callers that build lowered [`LoweredRow`]s directly (the kind only
-    /// matters when lowering bare cells).
-    pub fn new<I, S>(cols: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Schema::typed(cols.into_iter().map(|c| (c, Kind::Number)))
-    }
-
     /// The per-column lowering kinds, positional against rows.
     pub fn kinds(&self) -> Vec<Kind> {
         self.cols.iter().map(|c| c.kind).collect()
@@ -144,10 +133,6 @@ pub struct LoweredRow {
 }
 
 impl LoweredRow {
-    pub fn new(values: Vec<LoweredCell>) -> Self {
-        LoweredRow { values }
-    }
-
     fn int(&self, idx: usize) -> i64 {
         match self.values.get(idx) {
             Some(LoweredCell::Int(i)) => *i,
@@ -574,11 +559,12 @@ impl Session {
         }
     }
 
-    /// Build a session from a schema and a batch of rows (the batch boundary
-    /// mode: the whole shard crosses once, e.g. from a WASM host).
+    /// Build a session from a schema and a batch of business rows (the batch
+    /// boundary mode: the whole shard crosses once, e.g. from a WASM host).
+    /// Rows are lowered against the schema.
     pub fn from_rows<I>(schema: Schema, rows: I) -> Result<Self, ApiError>
     where
-        I: IntoIterator<Item = (ExtId, LoweredRow)>,
+        I: IntoIterator<Item = (ExtId, Row)>,
     {
         let mut s = Session::new(schema);
         for (id, row) in rows {
@@ -599,15 +585,12 @@ impl Session {
         self.rows.is_empty()
     }
 
-    /// Insert or replace a row. One coarse boundary crossing per edit.
-    pub fn upsert(&mut self, id: ExtId, row: LoweredRow) -> Result<(), ApiError> {
-        if row.values.len() != self.schema.len() {
-            return Err(ApiError::SchemaArity {
-                expected: self.schema.len(),
-                got: row.values.len(),
-            });
-        }
-        self.rows.insert(id, row);
+    /// Insert or replace a row. Takes a business [`Row`] (bare cells) and lowers
+    /// it against the schema's per-column [`Kind`]s; one boundary crossing per
+    /// edit. Lowering arity-checks against the schema.
+    pub fn upsert(&mut self, id: ExtId, row: Row) -> Result<(), ApiError> {
+        let lowered = row.lower(&self.schema.kinds(), &self.schema.token_cfg())?;
+        self.rows.insert(id, lowered);
         Ok(())
     }
 
@@ -687,14 +670,7 @@ impl SolveRequest {
     /// Lower the rows against the schema, build the session, and run the plan
     /// (partition check included).
     pub fn run(self) -> Result<Report, ApiError> {
-        let cfg = self.schema.token_cfg();
-        let kinds = self.schema.kinds();
-        let rows = self
-            .rows
-            .into_iter()
-            .map(|(id, raw)| Ok((id, raw.lower(&kinds, &cfg)?)))
-            .collect::<Result<Vec<_>, ApiError>>()?;
-        let session = Session::from_rows(self.schema, rows)?;
+        let session = Session::from_rows(self.schema, self.rows)?;
         session.solve(&self.plan)
     }
 }
@@ -1118,23 +1094,13 @@ impl Workspace {
         self.inner.is_empty()
     }
 
-    /// Insert or replace a row (arity-checked against the schema).
-    pub fn upsert(&mut self, id: ExtId, row: LoweredRow) -> Result<(), ApiError> {
-        if row.values.len() != self.schema.len() {
-            return Err(ApiError::SchemaArity {
-                expected: self.schema.len(),
-                got: row.values.len(),
-            });
-        }
-        self.inner.upsert(id, row);
+    /// Insert or replace a row. Takes a business [`Row`] (bare cells) and lowers
+    /// it against the schema's per-column [`Kind`]s before storing. Lowering
+    /// arity-checks against the schema.
+    pub fn upsert(&mut self, id: ExtId, row: Row) -> Result<(), ApiError> {
+        let lowered = row.lower(&self.schema.kinds(), &self.schema.token_cfg())?;
+        self.inner.upsert(id, lowered);
         Ok(())
-    }
-
-    /// Insert or replace a row given bare cells, lowering them to engine ids via
-    /// the workspace's schema (per-column [`Kind`]) before [`Self::upsert`].
-    pub fn upsert_raw(&mut self, id: ExtId, raw: Row) -> Result<(), ApiError> {
-        let row = raw.lower(&self.schema.kinds(), &self.schema.token_cfg())?;
-        self.upsert(id, row)
     }
 
     /// Remove a row from the workspace and from wherever it currently sits.
@@ -1192,18 +1158,34 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lower::Cell;
 
     fn schema() -> Schema {
-        Schema::new(["usd", "day", "objsub", "native", "tokens"])
+        Schema::typed([
+            ("usd", Kind::Number),
+            ("day", Kind::Number),
+            ("objsub", Kind::Number),
+            ("native", Kind::Number),
+            ("tokens", Kind::Tokens),
+        ])
     }
 
-    fn row(usd: i64, day: i64, objsub: i64, native: i64, tokens: &[u64]) -> LoweredRow {
-        LoweredRow::new(vec![
-            LoweredCell::Int(usd),
-            LoweredCell::Int(day),
-            LoweredCell::Int(objsub),
-            LoweredCell::Int(native),
-            LoweredCell::Tokens(tokens.to_vec()),
+    // Build a business row. usd/day/objsub/native are genuine ints (Number
+    // columns, pass through); each token id becomes a distinct digit-bearing
+    // word so the Tokens column lowers to a set with the same overlap (the
+    // engine only cares about token equality, not the specific hash).
+    fn row(usd: i64, day: i64, objsub: i64, native: i64, tokens: &[u64]) -> Row {
+        let text = tokens
+            .iter()
+            .map(|n| format!("T{n:09}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Row::new(vec![
+            Cell::Num(usd),
+            Cell::Num(day),
+            Cell::Num(objsub),
+            Cell::Num(native),
+            Cell::Str(text),
         ])
     }
 
@@ -1305,7 +1287,7 @@ mod tests {
     #[test]
     fn arity_mismatch_rejected() {
         let mut s = Session::new(schema());
-        let bad = LoweredRow::new(vec![LoweredCell::Int(1)]);
+        let bad = Row::new(vec![Cell::Num(1)]);
         assert!(matches!(
             s.upsert(1, bad),
             Err(ApiError::SchemaArity { .. })
@@ -1653,7 +1635,7 @@ mod tests {
     // other leg. With every pair isolated, the min-cost-flow optimum is
     // *unique* (no equal-cost alternative arcs), so a warm re-solve and a fresh
     // cold solve must agree group-for-group, not merely on objective.
-    fn pair_rows(p: u64, shard: i64) -> ((ExtId, LoweredRow), (ExtId, LoweredRow)) {
+    fn pair_rows(p: u64, shard: i64) -> ((ExtId, Row), (ExtId, Row)) {
         let mag = (p as i64 + 1) * 101; // distinct magnitude per pair
         let token = 1_000 + p; // distinct token per pair
         let day = (p % 20) as i64;
@@ -1696,7 +1678,7 @@ mod tests {
     fn cold_partition(
         schema: &Schema,
         plan: &Plan,
-        rows: &BTreeMap<ExtId, LoweredRow>,
+        rows: &BTreeMap<ExtId, Row>,
     ) -> BTreeSet<Vec<ExtId>> {
         let mut s = Session::new(schema.clone());
         for (&id, r) in rows {
@@ -1731,7 +1713,7 @@ mod tests {
         let schema = schema();
         let mut rng = Lcg(seed);
         let mut ws = Workspace::new(schema.clone(), plan.clone()).unwrap();
-        let mut rows: BTreeMap<ExtId, LoweredRow> = BTreeMap::new();
+        let mut rows: BTreeMap<ExtId, Row> = BTreeMap::new();
         let pairs: u64 = 24;
 
         for _ in 0..300 {
