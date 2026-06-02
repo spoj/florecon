@@ -12,6 +12,7 @@ const state = {
   slicers: [],          // [{key,label,valueOf}] system dims first, then data dims
   detailCols: [],       // [{label, kind, render}]
   valueKey: "usd",      // which amount field is the conserved "value"
+  netKey: "native",     // display key holding the engine-conserved amount
   displayById: new Map(),
   tags: null,            // host-side TagStore (review/attention overlay)
   slicerByKey: new Map(),
@@ -62,6 +63,10 @@ function configureFromFields() {
   state.fields = fields;
   const valField = fields.find((f) => f.value) || { amt: "usd" };
   state.valueKey = valField.amt || "usd";
+  // The engine conserves its plan `amount` column, which may differ from the
+  // displayed value (e.g. native vs usd). Datasets name it explicitly; default
+  // to the legacy `native` so the bundled demo keeps working.
+  state.netKey = state.data.netKey || "native";
 
   // System slicers (engine-derived) lead; underlying-data dims follow.
   const sys = [
@@ -136,10 +141,11 @@ function configureFromFields() {
 }
 
 // ---- boot ----------------------------------------------------------------
-async function boot() {
+async function startApp(data) {
   setStatus("loading wasm + data…");
-  state.fe = await Florecon.load(WASM);
-  state.data = await (await fetch(DATA)).json();
+  if (!state.fe) state.fe = await Florecon.load(WASM);
+  state.data = data;
+  state.displayById = new Map();
   for (const d of state.data.display) state.displayById.set(d.id, d);
   // Tags persist under a key derived from a dataset hash (no dataset identity
   // exists in the wire today — derive one from the pair + the sorted row ids).
@@ -154,6 +160,14 @@ async function boot() {
   solve();
   wireUi();
 }
+
+// Load the bundled interco demo dataset and start.
+export async function startDemo() {
+  const data = await (await fetch(DATA)).json();
+  return startApp(data);
+}
+
+export { startApp };
 
 function solve() {
   const t0 = performance.now();
@@ -575,7 +589,7 @@ function groupCmds(cmds) {
 function matchSelected() {
   const ids = [...state.selectedLines];
   if (ids.length < 2) return setStatus("select at least two lines to match", true);
-  const net = ids.reduce((a, id) => a + Number(state.displayById.get(id)?.native || 0), 0);
+  const net = ids.reduce((a, id) => a + Number(state.displayById.get(id)?.[state.netKey] || 0), 0);
   const r = state.fe.dispatch({ op: "group", ids, net, origin: "manual" });
   if (!r.ok) return setStatus("match error: " + r.error, true);
   state.selectedLines.clear();
@@ -646,7 +660,7 @@ const taggedSelection = () => [...state.selectedLines].filter((id) => state.tags
 function promoteMatch() {
   const ids = taggedSelection();
   if (ids.length < 2) return setStatus("tag at least two lines to promote to a match", true);
-  const net = ids.reduce((a, id) => a + Number(state.displayById.get(id)?.native || 0), 0);
+  const net = ids.reduce((a, id) => a + Number(state.displayById.get(id)?.[state.netKey] || 0), 0);
   const r = state.fe.dispatch({ op: "group", ids, net, origin: "manual" });
   if (!r.ok) return setStatus("promote error: " + r.error, true);
   for (const id of ids) state.tags.clear(id);
@@ -707,4 +721,5 @@ function boot2() {
   solve();
 }
 
-boot().catch((e) => setStatus("fatal: " + e.message, true));
+// entry point is web/setup.js, which builds a dataset (demo or uploaded CSV)
+// and calls startApp().

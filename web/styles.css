@@ -166,3 +166,28 @@ button.ghost { border: none; background: none; color: var(--accent); padding: 5p
 
 .status { padding: 3px 14px; background: var(--panel); border-top: 1px solid var(--line); color: var(--dim); font-size: 11px; font-family: var(--mono); }
 .status.err { color: var(--bad); }
+
+/* ---- setup / upload screen ---- */
+.setup { position: fixed; inset: 0; display: flex; align-items: flex-start; justify-content: center; overflow: auto; background: var(--bg); padding: 40px 16px; z-index: 10; }
+.setup-card { width: 100%; max-width: 720px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 22px 24px; box-shadow: 0 4px 24px rgba(0,0,0,.06); }
+.setup-card .brand { font-size: 18px; }
+.setup-lead { color: var(--dim); font-size: 13px; margin: 6px 0 18px; }
+.dropzone { border: 2px dashed var(--line); border-radius: 8px; padding: 26px; text-align: center; cursor: pointer; color: var(--dim); transition: border-color .15s, background .15s; }
+.dropzone:hover, .dropzone.over { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.dropzone .file-name { margin-top: 8px; font-family: var(--mono); font-size: 11px; color: var(--accent); }
+.map-panel { margin-top: 20px; }
+.map-panel .panel-head { font-weight: 700; color: var(--text); border-bottom: 1px solid var(--line); padding: 8px 0 6px; margin-bottom: 8px; text-transform: none; }
+.map-body { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.map-row { display: grid; grid-template-columns: 130px 240px 1fr; align-items: center; gap: 10px; }
+.map-row label { font-size: 12px; color: var(--text); font-weight: 600; }
+.map-row label.req::after { content: " *"; color: var(--bad); }
+.map-row select, .map-row input { font: inherit; font-size: 12px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text); width: 100%; }
+.map-row .multi { display: flex; gap: 6px; }
+.map-row .hint { font-size: 11px; color: var(--dim); }
+.preview-wrap { overflow: auto; max-height: 200px; border: 1px solid var(--line); border-radius: 4px; }
+#preview { width: 100%; }
+#preview th { position: sticky; top: 0; background: var(--panel2); }
+#preview td, #preview th { white-space: nowrap; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+#run-recon { margin-top: 14px; }
+.setup-err { color: var(--bad); font-size: 12px; margin-top: 10px; min-height: 16px; }
+.setup-foot { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }

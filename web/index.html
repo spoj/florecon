@@ -7,7 +7,36 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <header id="topbar">
+  <section id="setup" class="setup">
+    <div class="setup-card">
+      <div class="brand">florecon <span class="sub">reconciliation workbench</span></div>
+      <p class="setup-lead">Upload a CSV, map its columns to recon roles, and solve — or open the bundled demo book.</p>
+
+      <div id="dropzone" class="dropzone">
+        <input id="file-input" type="file" accept=".csv,text/csv" hidden />
+        <div class="drop-inner">
+          <strong>Drop a CSV here</strong> or click to browse
+          <div id="file-name" class="file-name"></div>
+        </div>
+      </div>
+
+      <div id="map-panel" class="map-panel" hidden>
+        <div class="panel-head">Map columns to recon roles</div>
+        <div id="map-body" class="map-body"></div>
+        <div class="panel-head">Preview</div>
+        <div class="preview-wrap"><table id="preview" class="dense"></table></div>
+        <div id="preview-foot" class="foot"></div>
+        <button id="run-recon" class="primary">Run recon</button>
+      </div>
+
+      <div id="setup-err" class="setup-err"></div>
+      <div class="setup-foot">
+        <button id="load-demo" class="link">or open the interco demo →</button>
+      </div>
+    </div>
+  </section>
+
+  <header id="topbar" hidden>
     <div class="brand">florecon <span class="sub">reconciliation workbench</span></div>
     <div id="metrics" class="metrics"></div>
     <div class="actions">
@@ -17,7 +46,7 @@
     </div>
   </header>
 
-  <main>
+  <main id="main" hidden>
     <aside id="facets" class="panel">
       <div class="panel-head">Slicers <button id="clear-filters" class="link">clear</button></div>
       <div id="facet-list"></div>
@@ -60,7 +89,7 @@
     </aside>
   </main>
 
-  <div id="status" class="status">loading…</div>
-  <script type="module" src="app.js"></script>
+  <div id="status" class="status" hidden>loading…</div>
+  <script type="module" src="setup.js"></script>
 </body>
 </html>
