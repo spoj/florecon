@@ -129,6 +129,19 @@ impl Arc {
     }
 }
 
+/// Per-`solve` diagnostics, surfaced via [`Network::stats`]. Useful for
+/// watching how much work a warm re-solve actually did.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SolveStats {
+    /// Dual-repair pivots (RHS/bounds/removal fixes).
+    pub dual_pivots: u64,
+    /// Primal pricing pivots (cost-improvement steps).
+    pub primal_pivots: u64,
+    /// Total subtree nodes re-rooted across dual pivots (the dominant cost on
+    /// deep trees).
+    pub subtree_nodes: u64,
+}
+
 /// A chosen leaving arc for a dual pivot, with the data needed to apply it.
 struct DualLeave {
     /// Basic arc leaving the tree.
@@ -197,8 +210,8 @@ pub struct Network {
 
     needs_rebuild: bool,
     dirty: bool,
-    /// Diagnostics: (dual pivots, primal pivots, subtree work) of last solve.
-    dbg: (u64, u64, u64),
+    /// Diagnostics of the most recent `solve`.
+    dbg: SolveStats,
 }
 
 impl Default for Network {
@@ -237,7 +250,7 @@ impl Network {
             dual_dirty: false,
             needs_rebuild: false,
             dirty: true,
-            dbg: (0, 0, 0),
+            dbg: SolveStats::default(),
         };
         // The dummy node lives in slot 0 and has no penalty arc.
         net.dummy = net.raw_alloc_node(0, NONE);
@@ -652,7 +665,7 @@ impl Network {
             dual_dirty: false,
             needs_rebuild: false,
             dirty: true,
-            dbg: (0, 0, 0),
+            dbg: SolveStats::default(),
         };
         net.rebuild_inc();
         net
@@ -687,9 +700,8 @@ impl Network {
 
     /// Re-optimize from the cached basis. Returns when optimal or capped.
     ///
-    /// Diagnostics from the most recent `solve`: `(dual pivots, primal pivots,
-    /// total subtree nodes touched)`.
-    pub fn debug_counts(&self) -> (u64, u64, u64) {
+    /// Diagnostics from the most recent [`Network::solve`] call.
+    pub fn stats(&self) -> SolveStats {
         self.dbg
     }
 
@@ -723,7 +735,7 @@ impl Network {
         let n_alive = self.nodes.iter().filter(|n| n.alive).count();
         let max_iterations = (n_alive * n_alive * 2).max(1000);
         let mut status = SolveStatus::Optimal;
-        self.dbg = (0, 0, 0);
+        self.dbg = SolveStats::default();
 
         if self.dual_dirty && self.primal_dirty {
             // Mixed cost+RHS change: neither phase can warm-start safely alone
@@ -777,7 +789,7 @@ impl Network {
                 return SolveStatus::IterationLimit;
             }
             iterations += 1;
-            self.dbg.1 += 1;
+            self.dbg.primal_pivots += 1;
 
             let Some((entering, rc, dir)) = self.find_entering_block() else {
                 debug!("optimal after {iterations} primal iterations");
@@ -1361,7 +1373,7 @@ impl Network {
                 return SolveStatus::IterationLimit;
             }
             iterations += 1;
-            self.dbg.0 += 1;
+            self.dbg.dual_pivots += 1;
 
             let Some((leaving, beta, viol)) = self.find_leaving_dual() else {
                 debug!("primal-feasible after {iterations} dual iterations");
@@ -1374,7 +1386,7 @@ impl Network {
                 self.needs_rebuild = true;
                 return SolveStatus::Optimal;
             };
-            self.dbg.2 += self.subtree_buf.len() as u64;
+            self.dbg.subtree_nodes += self.subtree_buf.len() as u64;
             self.dual_pivot(entering, rc, dir, DualLeave { arc: leaving, beta, theta: viol });
 
             since_refactor += 1;

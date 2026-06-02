@@ -69,10 +69,13 @@ fn main() {
     net.set_supply(sources[pairs / 3], amount + 500);
     net.set_supply(sinks[pairs / 3], -(amount + 500));
     net.solve();
-    let (d, p, st) = net.debug_counts();
+    let s = net.stats();
     println!(
-        "warm supply edit (x2) + solve: {:.2?}  (dual={d} primal={p} subtree_nodes={st})",
-        t.elapsed()
+        "warm supply edit (x2) + solve: {:.2?}  (dual={} primal={} subtree_nodes={})",
+        t.elapsed(),
+        s.dual_pivots,
+        s.primal_pivots,
+        s.subtree_nodes,
     );
 
     // --- warm: remove a matched candidate arc (dual pivot-out) ---
@@ -80,8 +83,13 @@ fn main() {
         let t = Instant::now();
         net.remove_arc(a);
         net.solve();
-        let (d, p, _) = net.debug_counts();
-        println!("warm arc removal + solve: {:.2?}  (dual={d} primal={p})", t.elapsed());
+        let s = net.stats();
+        println!(
+            "warm arc removal + solve: {:.2?}  (dual={} primal={})",
+            t.elapsed(),
+            s.dual_pivots,
+            s.primal_pivots,
+        );
     }
 
     // --- warm: single cost change (primal) ---
