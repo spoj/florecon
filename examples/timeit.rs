@@ -1,5 +1,7 @@
-//! Throwaway profiler: replay a JSON SolveRequest (the web wire payload) and
-//! time the cascade. Run: FLORECON_TIME=1 cargo run --release --example timeit -- web/data.json
+//! Cascade profiler: replay a JSON SolveRequest (the web wire payload) and time
+//! the cold solve, broken down per strategy step. The driver for the
+//! `FLORECON_TIME` instrumentation in `strategy.rs` / `flow.rs`.
+//! Run: FLORECON_TIME=1 cargo run --release --example timeit -- web/data.json
 use florecon::plan::SolveRequest;
 use std::time::Instant;
 

@@ -9,7 +9,7 @@ import wasmtime
 
 # The wire-contract version this host speaks; must equal the engine's
 # abi_version() export. Bump in lockstep with plan::CONTRACT_VERSION.
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 
 class ContractMismatch(RuntimeError):
