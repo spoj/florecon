@@ -19,17 +19,25 @@ class Florecon:
         self._alloc = ex["alloc"]
         self._dealloc = ex["dealloc"]
         self._solve = ex["solve"]
+        self._dispatch = ex["dispatch"]
 
-    def solve(self, request: dict) -> dict:
-        data = json.dumps(request).encode("utf-8")
+    def _call(self, fn, payload: dict) -> dict:
+        data = json.dumps(payload).encode("utf-8")
         n = len(data)
         ptr = self._alloc(self.store, n)
         self.memory.write(self.store, data, ptr)
-        packed = self._solve(self.store, ptr, n)
+        packed = fn(self.store, ptr, n)
         self._dealloc(self.store, ptr, n)
-        # packed = (len << 32) | ptr  (wasm32 pointers are 32-bit)
         out_ptr = packed & 0xFFFFFFFF
         out_len = (packed >> 32) & 0xFFFFFFFF
         out = self.memory.read(self.store, out_ptr, out_ptr + out_len)
         self._dealloc(self.store, out_ptr, out_len)
         return json.loads(bytes(out))
+
+    def solve(self, request: dict) -> dict:
+        """Stateless batch solve."""
+        return self._call(self._solve, request)
+
+    def dispatch(self, command: dict) -> dict:
+        """Stateful interactive command (init/upsert/remove/solve/freeze/...)."""
+        return self._call(self._dispatch, command)

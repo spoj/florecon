@@ -21,7 +21,7 @@ use crate::recon::{ExtId, Model};
 use crate::strategy::{
     Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // ---------------------------------------------------------------------------
 // Typed records
@@ -156,6 +156,8 @@ pub enum ApiError {
     /// The pipeline did not partition the input: some id was lost or assigned
     /// to more than one group. Should be impossible — a bug guard.
     ConservationViolated { input: usize, accounted: usize },
+    /// A group id referenced by an interactive op does not exist.
+    UnknownGroup(u64),
 }
 
 impl std::fmt::Display for ApiError {
@@ -168,6 +170,7 @@ impl std::fmt::Display for ApiError {
             ApiError::ConservationViolated { input, accounted } => {
                 write!(f, "conservation violated: {accounted} accounted of {input}")
             }
+            ApiError::UnknownGroup(g) => write!(f, "unknown group id: {g}"),
         }
     }
 }
@@ -478,6 +481,223 @@ impl SolveRequest {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Workspace — the interactive, stateful surface
+// ---------------------------------------------------------------------------
+
+/// One group in a [`Workspace`], live or frozen. `group_id` is stable so a
+/// front-end can reference it across operations.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WsGroup {
+    pub group_id: u64,
+    pub origin: String,
+    pub net: i64,
+    pub size: usize,
+    /// Frozen groups are locked: a re-solve never disturbs them.
+    pub frozen: bool,
+}
+
+struct GroupRec {
+    id: u64,
+    members: Vec<ExtId>,
+    origin: String,
+    net: i64,
+    frozen: bool,
+}
+
+/// The interactive result: stable group ids, frozen flags, and the residual.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct WorkspaceReport {
+    pub assignments: Vec<(ExtId, u64)>,
+    pub groups: Vec<WsGroup>,
+    pub residual: Vec<ExtId>,
+}
+
+/// A long-lived, editable reconciliation workspace.
+///
+/// Holds rows plus a stored [`Plan`], and supports the interactive loop a UI
+/// drives: [`solve`](Workspace::solve) recomputes the unfrozen pool;
+/// [`freeze`](Workspace::freeze) locks a group an analyst trusts so re-solves
+/// leave it alone; [`breakup`](Workspace::breakup) dissolves a group back to
+/// the pool. The conservation invariant — every row id is in exactly one group
+/// or in the residual — holds after every operation.
+pub struct Workspace {
+    schema: Schema,
+    plan: Plan,
+    rows: BTreeMap<ExtId, Row>,
+    groups: Vec<GroupRec>,
+    residual: BTreeSet<ExtId>,
+    next_id: u64,
+}
+
+impl Workspace {
+    pub fn new(schema: Schema, plan: Plan) -> Self {
+        Workspace {
+            schema,
+            plan,
+            rows: BTreeMap::new(),
+            groups: Vec::new(),
+            residual: BTreeSet::new(),
+            next_id: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Insert or replace a row. A new id starts life in the residual; the
+    /// caller re-solves to fold it into groups.
+    pub fn upsert(&mut self, id: ExtId, row: Row) -> Result<(), ApiError> {
+        if row.values.len() != self.schema.len() {
+            return Err(ApiError::SchemaArity {
+                expected: self.schema.len(),
+                got: row.values.len(),
+            });
+        }
+        if self.rows.insert(id, row).is_none() && !self.in_group(id) {
+            self.residual.insert(id);
+        }
+        Ok(())
+    }
+
+    /// Remove a row from the workspace and from wherever it currently sits.
+    pub fn remove(&mut self, id: ExtId) {
+        self.rows.remove(&id);
+        self.residual.remove(&id);
+        for g in &mut self.groups {
+            g.members.retain(|&m| m != id);
+        }
+        // A group reduced below two members can no longer net; dissolve it.
+        let mut orphaned = Vec::new();
+        self.groups.retain(|g| {
+            if g.members.len() < 2 {
+                orphaned.extend(g.members.iter().copied());
+                false
+            } else {
+                true
+            }
+        });
+        self.residual.extend(orphaned);
+    }
+
+    fn in_group(&self, id: ExtId) -> bool {
+        self.groups.iter().any(|g| g.members.contains(&id))
+    }
+
+    /// Recompute the unfrozen pool: drop all live groups, run the plan over
+    /// every row not locked in a frozen group, and install fresh live groups.
+    /// Frozen groups are left untouched.
+    pub fn solve(&mut self) -> Result<(), ApiError> {
+        let strategy = compile(&self.plan, &self.schema)?;
+        let frozen_members: BTreeSet<ExtId> = self
+            .groups
+            .iter()
+            .filter(|g| g.frozen)
+            .flat_map(|g| g.members.iter().copied())
+            .collect();
+        let bag: Vec<Item<Row>> = self
+            .rows
+            .iter()
+            .filter(|(id, _)| !frozen_members.contains(id))
+            .map(|(id, row)| Item {
+                id: *id,
+                data: row.clone(),
+            })
+            .collect();
+        let pool = bag.len();
+        let res = strategy.run(bag);
+
+        self.groups.retain(|g| g.frozen);
+        let mut new_groups = res.groups;
+        new_groups.sort_by_key(|g| g.members.iter().copied().min().unwrap_or(0));
+        let mut accounted = 0;
+        for g in new_groups {
+            accounted += g.members.len();
+            self.groups.push(GroupRec {
+                id: self.next_id,
+                members: g.members,
+                origin: g.origin.to_string(),
+                net: g.net,
+                frozen: false,
+            });
+            self.next_id += 1;
+        }
+        self.residual = res.residual.into_iter().map(|i| i.id).collect();
+        accounted += self.residual.len();
+        if accounted != pool {
+            return Err(ApiError::ConservationViolated {
+                input: pool,
+                accounted,
+            });
+        }
+        Ok(())
+    }
+
+    /// Lock a group so future solves leave it intact.
+    pub fn freeze(&mut self, group_id: u64) -> Result<(), ApiError> {
+        self.group_mut(group_id)?.frozen = true;
+        Ok(())
+    }
+
+    /// Unlock a frozen group; the next solve may reshape it.
+    pub fn unfreeze(&mut self, group_id: u64) -> Result<(), ApiError> {
+        self.group_mut(group_id)?.frozen = false;
+        Ok(())
+    }
+
+    /// Dissolve a group (live or frozen); its members return to the residual
+    /// until the next explicit solve.
+    pub fn breakup(&mut self, group_id: u64) -> Result<(), ApiError> {
+        let pos = self
+            .groups
+            .iter()
+            .position(|g| g.id == group_id)
+            .ok_or(ApiError::UnknownGroup(group_id))?;
+        let g = self.groups.remove(pos);
+        self.residual.extend(g.members);
+        Ok(())
+    }
+
+    fn group_mut(&mut self, group_id: u64) -> Result<&mut GroupRec, ApiError> {
+        self.groups
+            .iter_mut()
+            .find(|g| g.id == group_id)
+            .ok_or(ApiError::UnknownGroup(group_id))
+    }
+
+    /// Snapshot the current state as a relational report.
+    pub fn report(&self) -> WorkspaceReport {
+        let mut assignments = Vec::new();
+        let mut groups = Vec::with_capacity(self.groups.len());
+        for g in &self.groups {
+            for &m in &g.members {
+                assignments.push((m, g.id));
+            }
+            groups.push(WsGroup {
+                group_id: g.id,
+                origin: g.origin.clone(),
+                net: g.net,
+                size: g.members.len(),
+                frozen: g.frozen,
+            });
+        }
+        assignments.sort();
+        groups.sort_by_key(|g| g.group_id);
+        WorkspaceReport {
+            assignments,
+            groups,
+            residual: self.residual.iter().copied().collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +841,69 @@ mod tests {
         s.upsert(2, row(-100, 2, 0, -100, &[])).unwrap();
         let rep = s.solve(&back).unwrap();
         assert_eq!(rep.assignments.len(), 2);
+    }
+
+    fn ws_conserves(ws: &Workspace) {
+        let rep = ws.report();
+        let n = rep.assignments.len() + rep.residual.len();
+        assert_eq!(n, ws.len(), "every row is in exactly one group or residual");
+    }
+
+    #[test]
+    fn workspace_solve_freeze_breakup() {
+        let mut ws = Workspace::new(schema(), full_pipeline());
+        ws.upsert(1, row(100, 1, 10, 100, &[])).unwrap();
+        ws.upsert(2, row(-100, 2, 10, -100, &[])).unwrap();
+        ws.upsert(3, row(50, 3, 20, 50, &[])).unwrap();
+        ws.upsert(4, row(-50, 4, 20, -50, &[])).unwrap();
+        // Before solving, everything is residual.
+        assert_eq!(ws.report().groups.len(), 0);
+        ws_conserves(&ws);
+
+        ws.solve().unwrap();
+        let rep = ws.report();
+        assert_eq!(rep.groups.len(), 2);
+        ws_conserves(&ws);
+
+        // Freeze one group, then break up the other and re-solve.
+        let g0 = rep.groups[0].group_id;
+        let g1 = rep.groups[1].group_id;
+        ws.freeze(g0).unwrap();
+        ws.breakup(g1).unwrap();
+        // g1's members are back in residual; g0 still grouped.
+        let rep = ws.report();
+        assert_eq!(rep.groups.len(), 1);
+        assert!(rep.groups[0].frozen);
+        assert_eq!(rep.residual.len(), 2);
+        ws_conserves(&ws);
+
+        // Re-solve: frozen group survives with its id; the pool reforms.
+        ws.solve().unwrap();
+        let rep = ws.report();
+        assert!(rep.groups.iter().any(|g| g.group_id == g0 && g.frozen));
+        assert_eq!(rep.groups.len(), 2);
+        ws_conserves(&ws);
+    }
+
+    #[test]
+    fn workspace_remove_keeps_conservation() {
+        let mut ws = Workspace::new(schema(), full_pipeline());
+        ws.upsert(1, row(100, 1, 0, 100, &[])).unwrap();
+        ws.upsert(2, row(-100, 2, 0, -100, &[])).unwrap();
+        ws.solve().unwrap();
+        assert_eq!(ws.report().groups.len(), 1);
+        // Removing one member dissolves the now-singleton group.
+        ws.remove(2);
+        let rep = ws.report();
+        assert_eq!(rep.groups.len(), 0);
+        assert_eq!(rep.residual, vec![1]);
+        ws_conserves(&ws);
+    }
+
+    #[test]
+    fn workspace_unknown_group_errors() {
+        let mut ws = Workspace::new(schema(), full_pipeline());
+        assert_eq!(ws.freeze(99), Err(ApiError::UnknownGroup(99)));
+        assert_eq!(ws.breakup(99), Err(ApiError::UnknownGroup(99)));
     }
 }
