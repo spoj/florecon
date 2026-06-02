@@ -7,7 +7,7 @@ import json
 import wasmtime
 
 # Must equal the engine's abi_version() export (plan::CONTRACT_VERSION).
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 
 class ContractMismatch(RuntimeError):
@@ -99,6 +99,12 @@ class Workspace:
         self.last = self.fe.dispatch({"op": "freeze", "group_id": group_id})
         return _ok(self.last)
 
+    def freeze_singletons(self, ids) -> dict:
+        """Freeze the live singleton groups holding `ids` (accepted unmatched
+        exceptions) in one crossing — the "freeze N unmatched" path."""
+        self.last = self.fe.dispatch({"op": "freeze_singletons", "ids": list(ids)})
+        return _ok(self.last)
+
     def freeze_clean(self, tol: int) -> dict:
         self.last = self.fe.dispatch({"op": "freeze_clean", "tol": tol})
         return _ok(self.last)
@@ -109,6 +115,21 @@ class Workspace:
 
     def breakup(self, group_id: int) -> dict:
         self.last = self.fe.dispatch({"op": "breakup", "group_id": group_id})
+        return _ok(self.last)
+
+    def group(self, ids, net: int = 0, origin: str = "manual") -> dict:
+        """Manually assert a frozen group over `ids` (analyst override). `net` is
+        the conserved-amount sum the host computes; rows are pulled out of any
+        live group (a live singleton or a proposed match), never a frozen one."""
+        self.last = self.fe.dispatch(
+            {"op": "group", "ids": list(ids), "net": int(net), "origin": origin}
+        )
+        return _ok(self.last)
+
+    def ungroup(self, ids) -> dict:
+        """Send `ids` back to live singletons, removing them from their live
+        group (the unified model has no separate residual set)."""
+        self.last = self.fe.dispatch({"op": "ungroup", "ids": list(ids)})
         return _ok(self.last)
 
     def report(self) -> dict:

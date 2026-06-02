@@ -7,9 +7,11 @@ export interface Report {
     origin: string;
     net: number;
     size: number;
+    /** Recalc-status axis: live (machine opinion) or frozen (operator decision). */
+    status: "live" | "frozen";
+    /** Derived alias of `status === "frozen"`, kept for soft migration. */
     frozen?: boolean;
   }[];
-  residual: number[];
 }
 
 export interface Envelope {

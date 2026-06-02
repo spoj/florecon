@@ -26,17 +26,18 @@
     <section id="groups" class="panel">
       <div class="panel-head">
         <span id="groups-title">Groups</span>
-        <input id="search" type="search" placeholder="filter reference / account / id…" />
+        <span class="grow"></span>
+        <button id="clear-groupsel" class="link" hidden>clear selection</button>
       </div>
       <div class="table-wrap">
-        <table id="groups-table">
+        <table id="groups-table" class="dense">
           <thead>
             <tr>
-              <th data-sort="gid">#</th>
-              <th data-sort="origin">strategy</th>
-              <th data-sort="status">status</th>
-              <th data-sort="size" class="num">lines</th>
-              <th data-sort="value" class="num">value (usd)</th>
+              <th data-sort="status">st</th>
+              <th data-sort="group_id">#</th>
+              <th data-sort="origin">strat</th>
+              <th data-sort="size" class="num">n</th>
+              <th data-sort="value" class="num">value</th>
               <th data-sort="net" class="num">net</th>
             </tr>
           </thead>
@@ -50,17 +51,12 @@
       <div class="panel-head" id="detail-head">Detail</div>
       <div id="detail-actions" class="detail-actions"></div>
       <div class="table-wrap">
-        <table id="detail-table">
-          <thead>
-            <tr>
-              <th>date</th><th>pol</th><th>co→icp</th>
-              <th class="num">native</th><th class="num">usd</th>
-              <th>account</th><th>reference</th>
-            </tr>
-          </thead>
+        <table id="detail-table" class="dense">
+          <thead id="detail-head-row"></thead>
           <tbody id="detail-body"></tbody>
         </table>
       </div>
+      <div id="detail-foot" class="foot"></div>
     </aside>
   </main>
 

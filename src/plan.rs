@@ -24,9 +24,10 @@ use crate::flow::{ExtId, Model};
 /// command set. Hosts (the Python wheel, the browser module) read it back from
 /// the engine and refuse to run against a mismatched binary. Bump it on any
 /// breaking change to those shapes.
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 use crate::strategy::{
-    Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
+    Item, ShardKey, Strategy, agg_net, exact_1to1, flow, flow_cached, partition_by, seq,
+    signal_group, windowed,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -237,6 +238,12 @@ pub enum ApiError {
     ConservationViolated { input: usize, accounted: usize },
     /// A group id referenced by an interactive op does not exist.
     UnknownGroup(u64),
+    /// A manual op referenced an id that is not in the workspace.
+    UnknownId(ExtId),
+    /// A manual op would disturb a frozen (signed-off) group; unfreeze first.
+    FrozenMember(ExtId),
+    /// A manual group needs at least two distinct members.
+    DegenerateGroup,
 }
 
 impl std::fmt::Display for ApiError {
@@ -250,6 +257,11 @@ impl std::fmt::Display for ApiError {
                 write!(f, "conservation violated: {accounted} accounted of {input}")
             }
             ApiError::UnknownGroup(g) => write!(f, "unknown group id: {g}"),
+            ApiError::UnknownId(id) => write!(f, "unknown row id: {id}"),
+            ApiError::FrozenMember(id) => {
+                write!(f, "row {id} is in a frozen group; unfreeze it first")
+            }
+            ApiError::DegenerateGroup => write!(f, "a manual group needs at least two rows"),
         }
     }
 }
@@ -331,18 +343,27 @@ impl Model for PlanModel {
 // Compiler: Plan -> Strategy<Row>
 // ---------------------------------------------------------------------------
 
-fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiError> {
+fn compile(
+    plan: &Plan,
+    schema: &Schema,
+    partition_cols: &[usize],
+    stateful: bool,
+) -> Result<Box<dyn Strategy<Row>>, ApiError> {
     Ok(match plan {
         Plan::Seq { steps } => {
             let mut compiled = Vec::with_capacity(steps.len());
             for s in steps {
-                compiled.push(compile(s, schema)?);
+                compiled.push(compile(s, schema, partition_cols, stateful)?);
             }
             seq(compiled)
         }
         Plan::Partition { by, inner } => {
             let k = schema.index(by)?;
-            partition_by(move |r: &Row| r.int(k), compile(inner, schema)?)
+            // Accumulate this partition column so the warm flow leaf below can
+            // recover the full shard-key path from a row.
+            let mut cols = partition_cols.to_vec();
+            cols.push(k);
+            partition_by(move |r: &Row| r.int(k), compile(inner, schema, &cols, stateful)?)
         }
         Plan::Windowed {
             order,
@@ -350,7 +371,11 @@ fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiEr
             inner,
         } => {
             let o = schema.index(order)?;
-            windowed(move |r: &Row| r.int(o), *width, compile(inner, schema)?)
+            windowed(
+                move |r: &Row| r.int(o),
+                *width,
+                compile(inner, schema, partition_cols, stateful)?,
+            )
         }
         Plan::AggNet { key, amount, tol } => {
             let (k, a) = (schema.index(key)?, schema.index(amount)?);
@@ -388,15 +413,28 @@ fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiEr
             penalty,
             window,
             cost,
-        } => flow(PlanModel {
-            amount: schema.index(amount)?,
-            day: schema.index(day)?,
-            native: schema.index(native)?,
-            tokens: schema.index(tokens)?,
-            penalty: *penalty,
-            window: *window,
-            cost: cost.clone(),
-        }),
+        } => {
+            let model = PlanModel {
+                amount: schema.index(amount)?,
+                day: schema.index(day)?,
+                native: schema.index(native)?,
+                tokens: schema.index(tokens)?,
+                penalty: *penalty,
+                window: *window,
+                cost: cost.clone(),
+            };
+            if stateful {
+                // Warm leaf: the shard key is the tuple of accumulated
+                // partition-column values read off each row.
+                let cols = partition_cols.to_vec();
+                flow_cached(model, move |r: &Row| -> ShardKey {
+                    cols.iter().map(|&i| r.int(i)).collect()
+                })
+            } else {
+                // Cold one-shot leaf (Session path), unchanged behavior.
+                flow(model)
+            }
+        }
     })
 }
 
@@ -417,6 +455,12 @@ pub struct GroupOut {
 
 /// The relational result of [`Session::solve`]. `assignments` ⊎ `residual`
 /// partitions the input ids exactly (verified before this is returned).
+///
+/// Note the deliberate divergence from the interactive [`WorkspaceReport`]:
+/// the batch path is one-shot and holds no operator state, so it keeps an
+/// explicit `residual` list rather than collapsing unmatched rows into live
+/// singleton groups. Only the stateful workspace adopts the unified
+/// everything-is-a-group model (§1 of the state-model design).
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Report {
@@ -492,7 +536,8 @@ impl Session {
     /// Run a plan over the current rows and return the partitioned result.
     /// Verifies conservation before returning.
     pub fn solve(&self, plan: &Plan) -> Result<Report, ApiError> {
-        let strategy = compile(plan, &self.schema)?;
+        // Session is a stateless one-shot: compile the cold flow leaf.
+        let mut strategy = compile(plan, &self.schema, &[], false)?;
         // Materialize in id order for deterministic candidate generation.
         let bag: Vec<Item<Row>> = self
             .rows
@@ -571,8 +616,23 @@ impl SolveRequest {
 // Workspace — the interactive, stateful surface
 // ---------------------------------------------------------------------------
 
-/// One group in a [`Workspace`], live or frozen. `group_id` is stable so a
-/// front-end can reference it across operations.
+/// The single recalc-status axis of a group. Only a human operator flips a
+/// group between these: `live` is the machine's current opinion (subject to
+/// recalc), `frozen` is the operator's decision (inviolable). Combined with
+/// arity it expresses matched/unmatched × proposed/forced — a live singleton is
+/// an unmatched row, a frozen singleton an accepted exception.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Status {
+    Live,
+    Frozen,
+}
+
+/// One group in a [`Workspace`], live or frozen. `group_id` is stable for
+/// frozen groups so a front-end can reference them across operations; live
+/// singleton ids are ephemeral (re-minted every solve). `group_id` is stable so
+/// a front-end can reference it across operations.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WsGroup {
@@ -580,7 +640,10 @@ pub struct WsGroup {
     pub origin: String,
     pub net: i64,
     pub size: usize,
-    /// Frozen groups are locked: a re-solve never disturbs them.
+    /// The recalc-status axis: `live` or `frozen`.
+    pub status: Status,
+    /// Derived alias of `status == Frozen`, kept for one release so hosts can
+    /// cut over to `status` without a flag day (soft migration).
     pub frozen: bool,
 }
 
@@ -589,16 +652,23 @@ struct GroupRec {
     members: Vec<ExtId>,
     origin: String,
     net: i64,
-    frozen: bool,
+    status: Status,
 }
 
-/// The interactive result: stable group ids, frozen flags, and the residual.
+impl GroupRec {
+    fn is_frozen(&self) -> bool {
+        self.status == Status::Frozen
+    }
+}
+
+/// The interactive result: a single partition of every input id into groups,
+/// each carrying its [`Status`]. There is no separate residual set — an
+/// unmatched row is a live singleton group (origin `"residual"`).
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WorkspaceReport {
     pub assignments: Vec<(ExtId, u64)>,
     pub groups: Vec<WsGroup>,
-    pub residual: Vec<ExtId>,
 }
 
 /// A long-lived, editable reconciliation workspace over items of type `E`,
@@ -610,12 +680,13 @@ pub struct WorkspaceReport {
 /// recomputes the unfrozen pool; [`freeze`](Recon::freeze) locks a group an
 /// analyst trusts so re-solves leave it alone; [`breakup`](Recon::breakup)
 /// dissolves a group back to the pool. The conservation invariant — every item
-/// id is in exactly one group or in the residual — holds after every operation.
+/// id is in exactly one group — holds after every operation. An unmatched row
+/// is simply a live singleton group (origin `"residual"`); there is no separate
+/// residual set.
 pub struct Recon<E> {
     strategy: Box<dyn Strategy<E>>,
     items: BTreeMap<ExtId, E>,
     groups: Vec<GroupRec>,
-    residual: BTreeSet<ExtId>,
     next_id: u64,
 }
 
@@ -626,7 +697,6 @@ impl<E: Clone> Recon<E> {
             strategy,
             items: BTreeMap::new(),
             groups: Vec::new(),
-            residual: BTreeSet::new(),
             next_id: 0,
         }
     }
@@ -639,46 +709,67 @@ impl<E: Clone> Recon<E> {
         self.items.is_empty()
     }
 
-    /// Insert or replace an item. A new id starts life in the residual; the
-    /// caller re-solves to fold it into groups.
+    /// Push a fresh live singleton group (origin `"residual"`) for `id`. Live
+    /// singleton ids are ephemeral: each solve dissolves and re-mints them.
+    fn push_live_singleton(&mut self, id: ExtId) {
+        self.groups.push(GroupRec {
+            id: self.next_id,
+            members: vec![id],
+            origin: "residual".to_string(),
+            net: 0,
+            status: Status::Live,
+        });
+        self.next_id += 1;
+    }
+
+    /// Insert or replace an item. A new id starts life as a live singleton
+    /// group; the caller re-solves to fold it into matches.
     pub fn upsert(&mut self, id: ExtId, item: E) {
         if self.items.insert(id, item).is_none() && !self.in_group(id) {
-            self.residual.insert(id);
+            self.push_live_singleton(id);
         }
     }
 
-    /// Remove an item from the workspace and from wherever it currently sits.
+    /// Remove an item from the workspace and from its group. A match that loses
+    /// a member dissolves; its survivor returns to a fresh live singleton.
     pub fn remove(&mut self, id: ExtId) {
         self.items.remove(&id);
-        self.residual.remove(&id);
-        for g in &mut self.groups {
-            g.members.retain(|&m| m != id);
-        }
-        // A group reduced below two members can no longer net; dissolve it.
         let mut orphaned = Vec::new();
-        self.groups.retain(|g| {
-            if g.members.len() < 2 {
+        self.groups.retain_mut(|g| {
+            if !g.members.contains(&id) {
+                return true;
+            }
+            g.members.retain(|&m| m != id);
+            if g.members.is_empty() {
+                false
+            } else if g.members.len() == 1 {
+                // A match reduced to one member can no longer net; its survivor
+                // returns to the live pool as a fresh singleton.
                 orphaned.extend(g.members.iter().copied());
                 false
             } else {
                 true
             }
         });
-        self.residual.extend(orphaned);
+        for o in orphaned {
+            self.push_live_singleton(o);
+        }
     }
 
     fn in_group(&self, id: ExtId) -> bool {
         self.groups.iter().any(|g| g.members.contains(&id))
     }
 
-    /// Recompute the unfrozen pool: drop all live groups, run the strategy over
-    /// every item not locked in a frozen group, and install fresh live groups.
-    /// Frozen groups are left untouched.
+    /// Recompute the live pool: dissolve every live group (singletons included)
+    /// into a flat pool, run the strategy, and install fresh live groups plus a
+    /// live singleton for each leftover. Frozen groups are kept verbatim with
+    /// stable ids.
     pub fn solve(&mut self) -> Result<(), ApiError> {
+        let total = self.items.len();
         let frozen_members: BTreeSet<ExtId> = self
             .groups
             .iter()
-            .filter(|g| g.frozen)
+            .filter(|g| g.is_frozen())
             .flat_map(|g| g.members.iter().copied())
             .collect();
         let bag: Vec<Item<E>> = self
@@ -690,62 +781,83 @@ impl<E: Clone> Recon<E> {
                 data: item.clone(),
             })
             .collect();
-        let pool = bag.len();
         let res = self.strategy.run(bag);
 
-        self.groups.retain(|g| g.frozen);
+        // Dissolve all live groups; keep frozen ones verbatim.
+        self.groups.retain(|g| g.is_frozen());
         let mut new_groups = res.groups;
         new_groups.sort_by_key(|g| g.members.iter().copied().min().unwrap_or(0));
-        let mut accounted = 0;
         for g in new_groups {
-            accounted += g.members.len();
             self.groups.push(GroupRec {
                 id: self.next_id,
                 members: g.members,
                 origin: g.origin.to_string(),
                 net: g.net,
-                frozen: false,
+                status: Status::Live,
             });
             self.next_id += 1;
         }
-        self.residual = res.residual.into_iter().map(|i| i.id).collect();
-        accounted += self.residual.len();
-        if accounted != pool {
+        // Leftovers become live singleton groups (origin "residual").
+        let mut leftover: Vec<ExtId> = res.residual.into_iter().map(|i| i.id).collect();
+        leftover.sort_unstable();
+        for id in leftover {
+            self.push_live_singleton(id);
+        }
+        // Conservation airlock: the members across all groups equal the input
+        // id set — every input id is in exactly one group (total-input relative,
+        // frozen members included).
+        let accounted: usize = self.groups.iter().map(|g| g.members.len()).sum();
+        if accounted != total {
             return Err(ApiError::ConservationViolated {
-                input: pool,
+                input: total,
                 accounted,
             });
         }
         Ok(())
     }
 
-    /// Lock a group so future solves leave it intact.
+    /// Lock a group so future solves leave it intact. Valid on singletons too:
+    /// freezing a live singleton records an accepted unmatched exception.
     pub fn freeze(&mut self, group_id: u64) -> Result<(), ApiError> {
-        self.group_mut(group_id)?.frozen = true;
+        self.group_mut(group_id)?.status = Status::Frozen;
         Ok(())
     }
 
-    /// Freeze every live group whose net is within `tol` (a clean group).
-    /// Returns how many were newly frozen.
+    /// Freeze every live *match* (size >= 2) whose net is within `tol` (a clean
+    /// group). Returns how many were newly frozen. Live singletons (unmatched
+    /// rows) are never "clean" and are left alone; use [`freeze`](Recon::freeze)
+    /// or [`freeze_singletons`](Recon::freeze_singletons) to accept those.
     pub fn freeze_clean(&mut self, tol: i64) -> usize {
         let mut n = 0;
         for g in &mut self.groups {
-            if !g.frozen && g.net.abs() <= tol {
-                g.frozen = true;
+            if !g.is_frozen() && g.members.len() >= 2 && g.net.abs() <= tol {
+                g.status = Status::Frozen;
                 n += 1;
             }
         }
         n
     }
 
+    /// Freeze the live singleton groups holding any of `ids` (accepted unmatched
+    /// exceptions) in one crossing — the FE "Freeze N unmatched" path. Ids that
+    /// are not currently live singletons are ignored.
+    pub fn freeze_singletons(&mut self, ids: &[ExtId]) {
+        let want: BTreeSet<ExtId> = ids.iter().copied().collect();
+        for g in &mut self.groups {
+            if !g.is_frozen() && g.members.len() == 1 && want.contains(&g.members[0]) {
+                g.status = Status::Frozen;
+            }
+        }
+    }
+
     /// Unlock a frozen group; the next solve may reshape it.
     pub fn unfreeze(&mut self, group_id: u64) -> Result<(), ApiError> {
-        self.group_mut(group_id)?.frozen = false;
+        self.group_mut(group_id)?.status = Status::Live;
         Ok(())
     }
 
-    /// Dissolve a group (live or frozen); its members return to the residual
-    /// until the next explicit solve.
+    /// Dissolve a group (live or frozen); each member returns to the pool as a
+    /// fresh live singleton until the next explicit solve.
     pub fn breakup(&mut self, group_id: u64) -> Result<(), ApiError> {
         let pos = self
             .groups
@@ -753,7 +865,108 @@ impl<E: Clone> Recon<E> {
             .position(|g| g.id == group_id)
             .ok_or(ApiError::UnknownGroup(group_id))?;
         let g = self.groups.remove(pos);
-        self.residual.extend(g.members);
+        for m in g.members {
+            self.push_live_singleton(m);
+        }
+        Ok(())
+    }
+
+    /// Manually assert a group over `ids` with a caller-supplied `net` and
+    /// `origin`. This is the analyst override: rows are pulled out of any
+    /// *live* group they currently sit in (a live group that falls below two
+    /// members dissolves, its survivor returning to a live singleton — nothing
+    /// is lost). Pulling a row out of a *frozen* group is refused, so a
+    /// signed-off reconciliation is never silently disturbed. The new group is
+    /// frozen, because a manual match is itself a signoff that a re-solve must
+    /// not reshape. Returns the new stable group id.
+    pub fn group(&mut self, ids: &[ExtId], net: i64, origin: &str) -> Result<u64, ApiError> {
+        let mut members: Vec<ExtId> = Vec::new();
+        for &id in ids {
+            if !members.contains(&id) {
+                members.push(id);
+            }
+        }
+        if members.len() < 2 {
+            return Err(ApiError::DegenerateGroup);
+        }
+        for &id in &members {
+            if !self.items.contains_key(&id) {
+                return Err(ApiError::UnknownId(id));
+            }
+            if self
+                .groups
+                .iter()
+                .any(|g| g.is_frozen() && g.members.contains(&id))
+            {
+                return Err(ApiError::FrozenMember(id));
+            }
+        }
+        // Pull the chosen ids out of any live group.
+        let claim: BTreeSet<ExtId> = members.iter().copied().collect();
+        self.pull_from_live(&claim);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.groups.push(GroupRec {
+            id,
+            members,
+            origin: origin.to_string(),
+            net,
+            status: Status::Frozen,
+        });
+        Ok(id)
+    }
+
+    /// Remove `claim` from every live group, dropping emptied groups and
+    /// re-minting any survivor of a now-singleton live group. Frozen groups are
+    /// untouched (callers guard against frozen members first).
+    fn pull_from_live(&mut self, claim: &BTreeSet<ExtId>) {
+        for g in &mut self.groups {
+            if !g.is_frozen() {
+                g.members.retain(|m| !claim.contains(m));
+            }
+        }
+        let mut orphaned = Vec::new();
+        self.groups.retain(|g| {
+            if g.is_frozen() {
+                return true;
+            }
+            if g.members.is_empty() {
+                false
+            } else if g.members.len() == 1 {
+                orphaned.extend(g.members.iter().copied());
+                false
+            } else {
+                true
+            }
+        });
+        for o in orphaned {
+            self.push_live_singleton(o);
+        }
+    }
+
+    /// Send `ids` back to live singletons, removing them from their live group.
+    /// Rows in a frozen group are refused (unfreeze or break it up first). A
+    /// live group that falls below two members dissolves. Idempotent for ids
+    /// already standing as live singletons.
+    pub fn ungroup(&mut self, ids: &[ExtId]) -> Result<(), ApiError> {
+        for &id in ids {
+            if !self.items.contains_key(&id) {
+                return Err(ApiError::UnknownId(id));
+            }
+            if self
+                .groups
+                .iter()
+                .any(|g| g.is_frozen() && g.members.contains(&id))
+            {
+                return Err(ApiError::FrozenMember(id));
+            }
+        }
+        let claim: BTreeSet<ExtId> = ids.iter().copied().collect();
+        self.pull_from_live(&claim);
+        // Each claimed id stands alone as a fresh live singleton.
+        for id in claim {
+            self.push_live_singleton(id);
+        }
         Ok(())
     }
 
@@ -764,7 +977,8 @@ impl<E: Clone> Recon<E> {
             .ok_or(ApiError::UnknownGroup(group_id))
     }
 
-    /// Snapshot the current state as a relational report.
+    /// Snapshot the current state as a relational report — a single partition of
+    /// every id into groups, each carrying its status.
     pub fn report(&self) -> WorkspaceReport {
         let mut assignments = Vec::new();
         let mut groups = Vec::with_capacity(self.groups.len());
@@ -777,7 +991,8 @@ impl<E: Clone> Recon<E> {
                 origin: g.origin.clone(),
                 net: g.net,
                 size: g.members.len(),
-                frozen: g.frozen,
+                status: g.status,
+                frozen: g.is_frozen(),
             });
         }
         assignments.sort();
@@ -785,7 +1000,6 @@ impl<E: Clone> Recon<E> {
         WorkspaceReport {
             assignments,
             groups,
-            residual: self.residual.iter().copied().collect(),
         }
     }
 }
@@ -802,7 +1016,9 @@ impl Workspace {
     /// Compile `plan` against `schema` and create an empty workspace. Fails if
     /// the plan references an unknown column.
     pub fn new(schema: Schema, plan: Plan) -> Result<Self, ApiError> {
-        let strategy = compile(&plan, &schema)?;
+        // The interactive workspace persists across solves (Recon stores the
+        // strategy once), so compile the warm, shard-keyed flow leaf.
+        let strategy = compile(&plan, &schema, &[], true)?;
         Ok(Workspace {
             schema,
             inner: Recon::new(strategy),
@@ -844,9 +1060,15 @@ impl Workspace {
         self.inner.freeze(group_id)
     }
 
-    /// Freeze every live group whose net is within `tol`. Returns the count.
+    /// Freeze every clean (size >= 2, |net| <= tol) live group. Returns count.
     pub fn freeze_clean(&mut self, tol: i64) -> usize {
         self.inner.freeze_clean(tol)
+    }
+
+    /// Freeze the live singleton groups holding any of `ids` (accepted
+    /// unmatched exceptions) in one crossing.
+    pub fn freeze_singletons(&mut self, ids: &[ExtId]) {
+        self.inner.freeze_singletons(ids)
     }
 
     /// Unlock a frozen group; the next solve may reshape it.
@@ -854,9 +1076,19 @@ impl Workspace {
         self.inner.unfreeze(group_id)
     }
 
-    /// Dissolve a group; its members return to the residual.
+    /// Dissolve a group; each member returns to a live singleton.
     pub fn breakup(&mut self, group_id: u64) -> Result<(), ApiError> {
         self.inner.breakup(group_id)
+    }
+
+    /// Manually assert a frozen group over `ids` with a caller-supplied `net`.
+    pub fn group(&mut self, ids: &[ExtId], net: i64, origin: &str) -> Result<u64, ApiError> {
+        self.inner.group(ids, net, origin)
+    }
+
+    /// Send `ids` back to live singletons, removing them from their live group.
+    pub fn ungroup(&mut self, ids: &[ExtId]) -> Result<(), ApiError> {
+        self.inner.ungroup(ids)
     }
 
     /// Snapshot the current state as a relational report.
@@ -1077,10 +1309,12 @@ mod tests {
         r.upsert(3, 9);
         r.solve().unwrap();
         let rep = r.report();
-        assert_eq!(rep.groups.len(), 1);
-        assert_eq!(rep.residual, vec![3]);
+        // the pair plus a live singleton for the unmatched 9
+        assert_eq!(rep.groups.len(), 2);
+        let pair = rep.groups.iter().find(|g| g.size == 2).unwrap();
+        assert_eq!(rep.groups.iter().filter(|g| g.size == 1).count(), 1);
         // freeze survives a re-solve; breakup returns members to the pool.
-        let g = rep.groups[0].group_id;
+        let g = pair.group_id;
         r.freeze(g).unwrap();
         r.upsert(4, 9);
         r.solve().unwrap();
@@ -1089,8 +1323,9 @@ mod tests {
 
     fn ws_conserves(ws: &Workspace) {
         let rep = ws.report();
-        let n = rep.assignments.len() + rep.residual.len();
-        assert_eq!(n, ws.len(), "every row is in exactly one group or residual");
+        // Every row is in exactly one group (no separate residual set).
+        let n = rep.assignments.len();
+        assert_eq!(n, ws.len(), "every row is in exactly one group");
     }
 
     #[test]
@@ -1100,8 +1335,9 @@ mod tests {
         ws.upsert(2, row(-100, 2, 10, -100, &[])).unwrap();
         ws.upsert(3, row(50, 3, 20, 50, &[])).unwrap();
         ws.upsert(4, row(-50, 4, 20, -50, &[])).unwrap();
-        // Before solving, everything is residual.
-        assert_eq!(ws.report().groups.len(), 0);
+        // Before solving, every fresh id stands as a live singleton group.
+        assert_eq!(ws.report().groups.len(), 4);
+        assert!(ws.report().groups.iter().all(|g| g.size == 1 && !g.frozen));
         ws_conserves(&ws);
 
         ws.solve().unwrap();
@@ -1114,11 +1350,11 @@ mod tests {
         let g1 = rep.groups[1].group_id;
         ws.freeze(g0).unwrap();
         ws.breakup(g1).unwrap();
-        // g1's members are back in residual; g0 still grouped.
+        // g1's members are now live singletons; g0 still grouped + frozen.
         let rep = ws.report();
-        assert_eq!(rep.groups.len(), 1);
-        assert!(rep.groups[0].frozen);
-        assert_eq!(rep.residual.len(), 2);
+        assert_eq!(rep.groups.len(), 3);
+        assert_eq!(rep.groups.iter().filter(|g| g.frozen).count(), 1);
+        assert_eq!(rep.groups.iter().filter(|g| g.size == 1).count(), 2);
         ws_conserves(&ws);
 
         // Re-solve: frozen group survives with its id; the pool reforms.
@@ -1136,11 +1372,14 @@ mod tests {
         ws.upsert(2, row(-100, 2, 0, -100, &[])).unwrap();
         ws.solve().unwrap();
         assert_eq!(ws.report().groups.len(), 1);
-        // Removing one member dissolves the now-singleton group.
+        // Removing one member dissolves the pair; survivor becomes a live
+        // singleton.
         ws.remove(2);
         let rep = ws.report();
-        assert_eq!(rep.groups.len(), 0);
-        assert_eq!(rep.residual, vec![1]);
+        assert_eq!(rep.groups.len(), 1);
+        assert_eq!(rep.groups[0].size, 1);
+        assert!(!rep.groups[0].frozen);
+        assert_eq!(rep.assignments, vec![(1, rep.groups[0].group_id)]);
         ws_conserves(&ws);
     }
 
@@ -1149,5 +1388,318 @@ mod tests {
         let mut ws = Workspace::new(schema(), full_pipeline()).unwrap();
         assert_eq!(ws.freeze(99), Err(ApiError::UnknownGroup(99)));
         assert_eq!(ws.breakup(99), Err(ApiError::UnknownGroup(99)));
+    }
+
+    #[test]
+    fn workspace_manual_group_and_ungroup() {
+        let mut ws = Workspace::new(schema(), full_pipeline()).unwrap();
+        // Four rows that the pipeline would not pair (distinct objsub, no net).
+        ws.upsert(1, row(100, 1, 11, 100, &[])).unwrap();
+        ws.upsert(2, row(-90, 2, 22, -90, &[])).unwrap();
+        ws.upsert(3, row(40, 3, 33, 40, &[])).unwrap();
+        ws.upsert(4, row(-50, 4, 44, -50, &[])).unwrap();
+        ws.solve().unwrap();
+
+        // A degenerate (single-row) manual group is refused.
+        assert_eq!(ws.group(&[1], 100, "manual"), Err(ApiError::DegenerateGroup));
+        assert_eq!(ws.group(&[1, 999], 0, "manual"), Err(ApiError::UnknownId(999)));
+
+        // Manually match two residual rows; the group is frozen and net is
+        // exactly what the caller supplied.
+        let gid = ws.group(&[1, 2], 10, "manual").unwrap();
+        let rep = ws.report();
+        let g = rep.groups.iter().find(|g| g.group_id == gid).unwrap();
+        assert!(g.frozen && g.origin == "manual" && g.size == 2 && g.net == 10);
+        ws_conserves(&ws);
+
+        // A re-solve must not disturb the manual (frozen) group.
+        ws.solve().unwrap();
+        assert!(ws.report().groups.iter().any(|g| g.group_id == gid));
+
+        // Stealing a row out of a frozen group is refused.
+        assert_eq!(ws.group(&[1, 3], 0, "manual"), Err(ApiError::FrozenMember(1)));
+        assert_eq!(ws.ungroup(&[1]), Err(ApiError::FrozenMember(1)));
+
+        // Ungroup sends live-group rows back to live singletons.
+        ws.ungroup(&[3, 4]).unwrap();
+        let rep = ws.report();
+        let singletons: BTreeSet<ExtId> = rep
+            .groups
+            .iter()
+            .filter(|g| g.size == 1 && !g.frozen)
+            .flat_map(|g| rep.assignments.iter().filter(move |(_, gid)| *gid == g.group_id).map(|(id, _)| *id))
+            .collect();
+        assert!(singletons.contains(&3) && singletons.contains(&4));
+        ws_conserves(&ws);
+    }
+
+    #[test]
+    fn workspace_frozen_singleton_survives_solve() {
+        // Freezing a live singleton is the "accept an exception" path: it
+        // becomes a persistent frozen group, untouched by re-solve, id stable.
+        let mut ws = Workspace::new(schema(), full_pipeline()).unwrap();
+        ws.upsert(1, row(7, 1, 0, 7, &[])).unwrap(); // never pairs
+        ws.solve().unwrap();
+        let rep = ws.report();
+        let g = rep.groups.iter().find(|g| g.size == 1).unwrap();
+        let gid = g.group_id;
+        assert_eq!(g.status, Status::Live);
+        assert_eq!(g.origin, "residual");
+
+        ws.freeze_singletons(&[1]);
+        let g = ws.report().groups.into_iter().find(|g| g.group_id == gid).unwrap();
+        assert!(g.frozen && g.size == 1 && g.status == Status::Frozen);
+
+        // A re-solve leaves the frozen singleton untouched, id stable.
+        ws.solve().unwrap();
+        assert!(
+            ws.report()
+                .groups
+                .iter()
+                .any(|g| g.group_id == gid && g.frozen && g.size == 1)
+        );
+        ws_conserves(&ws);
+    }
+
+    #[test]
+    fn workspace_live_singleton_id_is_ephemeral() {
+        // Live singletons are re-minted every solve: nothing should reference a
+        // live singleton id across a solve.
+        let mut ws = Workspace::new(schema(), full_pipeline()).unwrap();
+        ws.upsert(1, row(7, 1, 0, 7, &[])).unwrap();
+        ws.solve().unwrap();
+        let id1 = ws
+            .report()
+            .groups
+            .into_iter()
+            .find(|g| g.size == 1)
+            .unwrap()
+            .group_id;
+        ws.solve().unwrap();
+        let id2 = ws
+            .report()
+            .groups
+            .into_iter()
+            .find(|g| g.size == 1)
+            .unwrap()
+            .group_id;
+        assert_ne!(id1, id2, "live singleton ids are ephemeral across solves");
+
+        // Freezing pins the id: it persists across the next solve.
+        ws.freeze_singletons(&[1]);
+        let frozen_id = ws
+            .report()
+            .groups
+            .into_iter()
+            .find(|g| g.size == 1)
+            .unwrap()
+            .group_id;
+        ws.solve().unwrap();
+        assert!(ws.report().groups.iter().any(|g| g.group_id == frozen_id));
+    }
+
+    // A tiny deterministic LCG so the equivalence tests are reproducible
+    // without pulling in a `rand` dependency.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 17
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    // The two rows of pair `p`, each carrying a token and native magnitude
+    // unique to that pair, so the only viable flow partner for one leg is the
+    // other leg. With every pair isolated, the min-cost-flow optimum is
+    // *unique* (no equal-cost alternative arcs), so a warm re-solve and a fresh
+    // cold solve must agree group-for-group, not merely on objective.
+    fn pair_rows(p: u64, shard: i64) -> ((ExtId, Row), (ExtId, Row)) {
+        let mag = (p as i64 + 1) * 101; // distinct magnitude per pair
+        let token = 1_000 + p; // distinct token per pair
+        let day = (p % 20) as i64;
+        let a = (2 * p + 1, row(mag, day, shard, mag, &[token]));
+        let b = (2 * p + 2, row(-mag, day + 1, shard, -mag, &[token]));
+        (a, b)
+    }
+
+    // The multi-member matched-group partition (sets of members, ids sorted).
+    fn report_partition<'a, I>(assignments: &[(ExtId, u64)], multi: I) -> BTreeSet<Vec<ExtId>>
+    where
+        I: IntoIterator<Item = &'a u64>,
+    {
+        let multi: BTreeSet<u64> = multi.into_iter().copied().collect();
+        let mut by_gid: BTreeMap<u64, Vec<ExtId>> = BTreeMap::new();
+        for &(id, gid) in assignments {
+            if multi.contains(&gid) {
+                by_gid.entry(gid).or_default().push(id);
+            }
+        }
+        by_gid
+            .into_values()
+            .map(|mut m| {
+                m.sort_unstable();
+                m
+            })
+            .collect()
+    }
+
+    fn warm_partition(rep: &WorkspaceReport) -> BTreeSet<Vec<ExtId>> {
+        let multi: Vec<u64> = rep
+            .groups
+            .iter()
+            .filter(|g| g.size >= 2)
+            .map(|g| g.group_id)
+            .collect();
+        report_partition(&rep.assignments, &multi)
+    }
+
+    fn cold_partition(schema: &Schema, plan: &Plan, rows: &BTreeMap<ExtId, Row>) -> BTreeSet<Vec<ExtId>> {
+        let mut s = Session::new(schema.clone());
+        for (&id, r) in rows {
+            s.upsert(id, r.clone()).unwrap();
+        }
+        let rep = s.solve(plan).unwrap();
+        let multi: Vec<u64> = rep
+            .groups
+            .iter()
+            .filter(|g| g.size >= 2)
+            .map(|g| g.group_id)
+            .collect();
+        report_partition(&rep.assignments, &multi)
+    }
+
+    fn flow_only_plan() -> Plan {
+        Plan::Flow {
+            amount: "usd".into(),
+            day: "day".into(),
+            native: "native".into(),
+            tokens: "tokens".into(),
+            penalty: 1000.0,
+            window: 30,
+            cost: CostSpec::default(),
+        }
+    }
+
+    // Drive a random sequence of single-row upserts/removes drawn from a fixed
+    // universe of unique-optimum pairs through the warm Workspace, comparing the
+    // matched partition to a fresh cold Session at every step.
+    fn run_equiv(plan: Plan, shard_of: impl Fn(u64) -> i64, seed: u64) {
+        let schema = schema();
+        let mut rng = Lcg(seed);
+        let mut ws = Workspace::new(schema.clone(), plan.clone()).unwrap();
+        let mut rows: BTreeMap<ExtId, Row> = BTreeMap::new();
+        let pairs: u64 = 24;
+
+        for _ in 0..300 {
+            // Pick one leg of a random pair and toggle its presence.
+            let p = rng.below(pairs);
+            let shard = shard_of(p);
+            let (a, b) = pair_rows(p, shard);
+            let leg = if rng.below(2) == 0 { a } else { b };
+            let (id, r) = leg;
+            if rows.contains_key(&id) && rng.below(2) == 0 {
+                rows.remove(&id);
+                ws.remove(id);
+            } else {
+                rows.insert(id, r.clone());
+                ws.upsert(id, r).unwrap();
+            }
+            ws.solve().unwrap();
+
+            let rep = ws.report();
+            assert_eq!(rep.assignments.len(), ws.len(), "conservation");
+            let warm = warm_partition(&rep);
+            let cold = cold_partition(&schema, &plan, &rows);
+            assert_eq!(warm, cold, "warm flow grouping diverged from a fresh cold solve");
+        }
+    }
+
+    #[test]
+    fn warm_flow_matches_cold_solve_under_random_edits() {
+        // §2 equivalence (global, un-partitioned shard): warm interactive
+        // Workspace == fresh cold Session, group-for-group, across a random
+        // upsert/remove sequence. Each warm solve also runs the in-leaf debug
+        // determinism guard (warm objective == cold objective).
+        run_equiv(flow_only_plan(), |_p| 0, 0x1234_5678_9abc_def0);
+    }
+
+    #[test]
+    fn warm_flow_partitioned_matches_cold() {
+        // Same equivalence with a partitioned plan, exercising shard-key
+        // recovery: pairs are sharded by `objsub` (3 shards) and each shard
+        // keeps its own warm Matcher keyed by the accumulated partition column.
+        let plan = Plan::Partition {
+            by: "objsub".into(),
+            inner: Box::new(flow_only_plan()),
+        };
+        run_equiv(plan, |p| (p % 3) as i64, 0xfeed_face_cafe_d00d);
+    }
+
+    #[test]
+    fn warm_flow_objective_stable_under_contention() {
+        // Heavy-contention data (many equal magnitudes, a tiny token space) over
+        // the full cascade with random upsert/remove/freeze. The optimal
+        // *matching* is degenerate here, but the in-leaf determinism guard
+        // (warm objective == cold objective) must hold on every solve, and
+        // conservation must never break.
+        let schema = schema();
+        let plan = full_pipeline();
+        let mut rng = Lcg(0x0bad_c0de_dead_beef);
+        let mut ws = Workspace::new(schema, plan).unwrap();
+        let mut next_id: ExtId = 1;
+        let mut live_ids: Vec<ExtId> = Vec::new();
+
+        let contended = |rng: &mut Lcg| {
+            let mag = (1 + rng.below(6)) as i64 * 10;
+            let sign = if rng.below(2) == 0 { 1 } else { -1 };
+            let amt = sign * mag;
+            let day = rng.below(40) as i64;
+            let token = rng.below(8);
+            row(amt, day, 7_000 + amt, amt, &[token])
+        };
+
+        for _ in 0..200 {
+            match rng.below(4) {
+                0 if !live_ids.is_empty() => {
+                    let pick = rng.below(live_ids.len() as u64) as usize;
+                    let id = live_ids.remove(pick);
+                    ws.remove(id);
+                }
+                1 => {
+                    ws.freeze_clean(0);
+                }
+                2 => {
+                    let rep = ws.report();
+                    let singles: Vec<ExtId> = rep
+                        .groups
+                        .iter()
+                        .filter(|g| g.size == 1 && !g.frozen)
+                        .flat_map(|g| {
+                            rep.assignments
+                                .iter()
+                                .filter(move |(_, gid)| *gid == g.group_id)
+                                .map(|(id, _)| *id)
+                        })
+                        .take(2)
+                        .collect();
+                    ws.freeze_singletons(&singles);
+                }
+                _ => {
+                    let id = next_id;
+                    next_id += 1;
+                    let r = contended(&mut rng);
+                    ws.upsert(id, r).unwrap();
+                    live_ids.push(id);
+                }
+            }
+            ws.solve().unwrap();
+            assert_eq!(ws.report().assignments.len(), ws.len());
+        }
     }
 }

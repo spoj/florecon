@@ -10,35 +10,17 @@ Carries two views, joined by id:
 import sys
 import json
 import pyarrow.parquet as pq
+from florecon import Interner
 
 OUT = "web/data.json"
 FIELDS = ["reference", "reference2", "description", "name_remark_explanation", "invoice_no"]
-COLS = ["company", "icp", "source_policy", "account_description", "objsub",
+# Business-legible source columns the UI renders. Optional ones (doc_company,
+# doc_type) are tolerated if the book does not carry them.
+CORE = ["company", "icp", "source_policy", "account_description", "objsub",
         "indicative_usd_amt", "base_currency", "trx_currency", "trx_amt", "fc_amt",
-        "gl_date", "is_offset", "doc_no"] + FIELDS
-
-
-def fnv1a(s: str) -> int:
-    h = 0xCBF29CE484222325
-    for b in s.encode("utf-8"):
-        h ^= b
-        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return h
-
-
-def tokens(parts):
-    out = []
-    for field in parts:
-        if not field:
-            continue
-        for raw in field.split():
-            t = "".join(c for c in raw if c.isalnum()).upper()
-            if len(t) < 6 or len(t) > 40 or t == "OFFSETENTRY" or t.isalpha():
-                continue
-            h = fnv1a(t)
-            if h not in out:
-                out.append(h)
-    return out
+        "gl_date", "is_offset", "doc_no"]
+OPTIONAL = ["doc_company", "doc_type"]
+COLS = CORE + OPTIONAL + FIELDS
 
 
 def plan():
@@ -53,6 +35,25 @@ def plan():
             "inner": {"op": "partition", "by": "ccy", "inner": leg}}
 
 
+def fields_spec():
+    # Portable display descriptor: the UI renders slicers and detail columns
+    # from this, so a different book only has to ship a different list.
+    return [
+        {"key": "date", "label": "gl date", "kind": "date", "slicer": False, "detail": True},
+        {"key": "gl_co", "label": "gl co", "kind": "dim", "slicer": True, "detail": True},
+        {"key": "doc_co", "label": "doc co", "kind": "dim", "slicer": True, "detail": True},
+        {"key": "policy", "label": "policy", "kind": "dim", "slicer": True, "detail": True},
+        {"key": "doc_type", "label": "doc type", "kind": "dim", "slicer": True, "detail": True},
+        {"key": "doc", "label": "doc no", "kind": "text", "slicer": False, "detail": True},
+        {"key": "account", "label": "account", "kind": "dim", "slicer": True, "detail": True},
+        {"key": "ccy", "label": "ccy", "kind": "dim", "slicer": True, "detail": False},
+        {"key": "trx", "label": "trx", "kind": "amount", "ccy": "trx_ccy", "amt": "trx_amt", "detail": True},
+        {"key": "base", "label": "base", "kind": "amount", "ccy": "base_ccy", "amt": "base_amt", "detail": True},
+        {"key": "usd", "label": "usd", "kind": "amount", "amt": "usd", "ccy": None, "detail": True, "value": True},
+        {"key": "ref", "label": "reference", "kind": "text", "slicer": False, "detail": True},
+    ]
+
+
 def main():
     args = sys.argv[1:]
     pair, maxrows, positional, i = None, None, [], 0
@@ -65,8 +66,12 @@ def main():
             positional.append(args[i]); i += 1
     path = positional[0] if positional else "data/ledger.parquet"
 
-    t = pq.read_table(path, columns=COLS)
-    cols = {n: t.column(n).to_pylist() for n in COLS}
+    have = set(pq.ParquetFile(path).schema.names)
+    read_cols = [c for c in COLS if c in have]
+    t = pq.read_table(path, columns=read_cols)
+    cols = {n: t.column(n).to_pylist() for n in read_cols}
+    for missing in COLS:
+        cols.setdefault(missing, [None] * t.num_rows)
     if pair is None:
         # Default to the busiest bilateral pair in the data (no hardcoded ids).
         from collections import Counter
@@ -77,6 +82,7 @@ def main():
                 cnt[frozenset((co, icp))] += 1
         pair = cnt.most_common(1)[0][0]
     schema = ["unit", "ccy", "day", "objsub", "native", "tokens"]
+    it = Interner()  # interning lives at the boundary, not in this script
     rows, display = [], []
     for k in range(t.num_rows):
         if cols["is_offset"][k]:
@@ -84,7 +90,6 @@ def main():
         co, icp = cols["company"][k] or "", cols["icp"][k] or ""
         if not co or not icp or co == icp or frozenset((co, icp)) != pair:
             continue
-        lo, hi = sorted((co, icp))
         usd = cols["indicative_usd_amt"][k] or 0.0
         trx = cols["trx_amt"][k] or 0.0
         if abs(trx) >= 0.005:
@@ -98,22 +103,35 @@ def main():
         gl_day = gl.toordinal() - 719163 if gl else 0
         rid = len(rows)
         rows.append([rid, {"values": [
-            {"Int": fnv1a(f"{lo}|{hi}") & 0x7FFFFFFFFFFFFFFF},
-            {"Int": fnv1a(ccy_s) & 0x7FFFFFFFFFFFFFFF},
+            it.pair(co, icp),
+            it.cat(ccy_s),
             {"Int": gl_day},
-            {"Int": fnv1a(cols["objsub"][k] or "") & 0x7FFFFFFFFFFFFFFF},
+            it.cat(cols["objsub"][k] or ""),
             {"Int": native_cents},
-            {"Tokens": tokens([cols[f][k] for f in FIELDS])},
+            it.tokens([cols[f][k] for f in FIELDS], drop=("OFFSETENTRY",)),
         ]}])
         ref = " ".join(s for s in (cols["reference"][k], cols["reference2"][k],
                                    cols["description"][k]) if s).strip()
+        base_ccy = cols["base_currency"][k] or ""
+        base_amt = cols["fc_amt"][k] or 0.0
+        trx_ccy = cols["trx_currency"][k] or base_ccy
+        trx_amt = cols["trx_amt"][k] or 0.0
+        if abs(trx_amt) < 0.005:
+            trx_ccy, trx_amt = base_ccy, base_amt
         display.append({
             "id": rid,
             "co": co, "icp": icp,
+            "gl_co": co,
+            "doc_co": cols["doc_company"][k] or co,
+            "doc_type": cols["doc_type"][k] or "",
             "policy": cols["source_policy"][k] or "?",
             "ccy": ccy_s,
             "native": native_cents,
             "usd": usd_cents,
+            "trx_ccy": trx_ccy,
+            "trx_amt": round(trx_amt * 100.0),
+            "base_ccy": base_ccy,
+            "base_amt": round(base_amt * 100.0),
             "date": str(gl) if gl else "",
             "account": (cols["account_description"][k] or "")[:40],
             "ref": ref[:80],
@@ -123,7 +141,7 @@ def main():
             break
 
     out = {"pair": " / ".join(sorted(pair)), "schema": {"cols": schema},
-           "plan": plan(), "rows": rows, "display": display}
+           "plan": plan(), "fields": fields_spec(), "rows": rows, "display": display}
     import os
     os.makedirs("web", exist_ok=True)
     with open(OUT, "w") as f:

@@ -204,6 +204,19 @@ impl<M: Model> Matcher<M> {
         self.net.solve()
     }
 
+    /// Total objective of the current solution (matched arc costs plus
+    /// unmatched penalties). This is the invariant a warm re-solve preserves
+    /// exactly versus a cold rebuild: the optimal *cost* is unique even when
+    /// the optimal *matching* is degenerate (equal-cost arcs interchangeable).
+    pub fn objective(&self) -> f64 {
+        self.net.total_cost()
+    }
+
+    /// Total real candidate arcs in the graph (for diagnostics).
+    pub fn arc_count(&self) -> usize {
+        self.entries.values().map(|e| e.arcs.len()).sum::<usize>() / 2
+    }
+
     /// Compute the reconciled groups from the current solution.
     pub fn groups(&self) -> Vec<Group> {
         // Union-find over matched transactions by ExtId.

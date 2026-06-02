@@ -122,10 +122,24 @@ enum Cmd {
     Freeze { group_id: u64 },
     /// Freeze every clean (|net| <= tol) live group in one shot.
     FreezeClean { tol: i64 },
+    /// Freeze the live singleton groups holding `ids` (accepted unmatched
+    /// exceptions) in one crossing.
+    FreezeSingletons { ids: Vec<ExtId> },
     /// Unlock a frozen group.
     Unfreeze { group_id: u64 },
-    /// Dissolve a group back to the residual.
+    /// Dissolve a group back to live singletons.
     Breakup { group_id: u64 },
+    /// Manually assert a frozen group over `ids`, with a host-computed `net`
+    /// (sum of the conserved amount) and an `origin` label (default `manual`).
+    Group {
+        ids: Vec<ExtId>,
+        #[serde(default)]
+        net: i64,
+        #[serde(default)]
+        origin: Option<String>,
+    },
+    /// Send `ids` back to live singletons, removing them from their live group.
+    Ungroup { ids: Vec<ExtId> },
     /// Return the current state without recomputing.
     Report,
 }
@@ -219,8 +233,16 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
             ws.freeze_clean(tol);
             Ok(())
         }
+        Cmd::FreezeSingletons { ids } => {
+            ws.freeze_singletons(&ids);
+            Ok(())
+        }
         Cmd::Unfreeze { group_id } => ws.unfreeze(group_id),
         Cmd::Breakup { group_id } => ws.breakup(group_id),
+        Cmd::Group { ids, net, origin } => ws
+            .group(&ids, net, origin.as_deref().unwrap_or("manual"))
+            .map(|_| ()),
+        Cmd::Ungroup { ids } => ws.ungroup(&ids),
         Cmd::Report => Ok(()),
     };
     match result {

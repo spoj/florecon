@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the Report. Contract version 1 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
-  "x-contract-version": 1,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the Report. Contract version 2 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
+  "x-contract-version": 2,
 
   "$defs": {
     "Value": {
@@ -133,9 +133,12 @@
         { "type": "object", "properties": { "op": { "const": "remove" }, "ids": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }, "required": ["op", "ids"], "additionalProperties": false },
         { "type": "object", "properties": { "op": { "const": "solve" } }, "required": ["op"], "additionalProperties": false },
         { "type": "object", "properties": { "op": { "const": "freeze" }, "group_id": { "type": "integer", "minimum": 0 } }, "required": ["op", "group_id"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "freeze_singletons" }, "ids": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }, "required": ["op", "ids"], "additionalProperties": false },
         { "type": "object", "properties": { "op": { "const": "freeze_clean" }, "tol": { "type": "integer" } }, "required": ["op", "tol"], "additionalProperties": false },
         { "type": "object", "properties": { "op": { "const": "unfreeze" }, "group_id": { "type": "integer", "minimum": 0 } }, "required": ["op", "group_id"], "additionalProperties": false },
         { "type": "object", "properties": { "op": { "const": "breakup" }, "group_id": { "type": "integer", "minimum": 0 } }, "required": ["op", "group_id"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "group" }, "ids": { "type": "array", "items": { "type": "integer", "minimum": 0 } }, "net": { "type": "integer" }, "origin": { "type": "string" } }, "required": ["op", "ids"], "additionalProperties": false },
+        { "type": "object", "properties": { "op": { "const": "ungroup" }, "ids": { "type": "array", "items": { "type": "integer", "minimum": 0 } } }, "required": ["op", "ids"], "additionalProperties": false },
         { "type": "object", "properties": { "op": { "const": "report" } }, "required": ["op"], "additionalProperties": false }
       ]
     },
@@ -147,7 +150,8 @@
         "origin": { "type": "string" },
         "net": { "type": "integer" },
         "size": { "type": "integer", "minimum": 0 },
-        "frozen": { "type": "boolean", "description": "present on Workspace (dispatch) reports only" }
+        "status": { "enum": ["live", "frozen"], "description": "recalc axis; present on Workspace (dispatch) reports only" },
+        "frozen": { "type": "boolean", "description": "derived alias of status==frozen; Workspace reports only" }
       },
       "required": ["group_id", "origin", "net", "size"]
     },

@@ -23,6 +23,7 @@ native extension to compile.
 
 from ._host import CONTRACT_VERSION, ContractMismatch, Florecon, Workspace
 from .data import Int, Tokens, row
+from .intern import Interner
 from . import plan
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     "Int",
     "Tokens",
     "row",
+    "Interner",
     "CONTRACT_VERSION",
     "ContractMismatch",
 ]

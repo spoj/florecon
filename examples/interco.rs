@@ -200,7 +200,7 @@ fn main() {
     // The pipeline.
     const TOL: i64 = 100; // 1.00 in native minor units
     const CAP: usize = 256;
-    let pipeline = partition_by(
+    let mut pipeline = partition_by(
         |t: &Tx| t.unit,
         partition_by(
             |t: &Tx| t.ccy,

@@ -11,7 +11,7 @@ the partition.
 import sys
 import time
 import pyarrow.parquet as pq
-from florecon import Florecon
+from florecon import Florecon, Interner
 
 WASM = "target/wasm32-unknown-unknown/release/florecon.wasm"
 FIELDS = ["reference", "reference2", "description", "name_remark_explanation", "invoice_no"]
@@ -19,34 +19,12 @@ COLS = ["company", "icp", "objsub", "indicative_usd_amt", "gl_date", "base_curre
         "trx_currency", "trx_amt", "fc_amt", "is_offset"] + FIELDS
 
 
-def fnv1a(s: str) -> int:
-    h = 0xCBF29CE484222325
-    for b in s.encode("utf-8"):
-        h ^= b
-        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return h
-
-
-def tokens(parts) -> list:
-    out = []
-    for field in parts:
-        if not field:
-            continue
-        for raw in field.split():
-            t = "".join(c for c in raw if c.isalnum()).upper()
-            if len(t) < 6 or len(t) > 40 or t == "OFFSETENTRY" or t.isalpha():
-                continue
-            h = fnv1a(t)
-            if h not in out:
-                out.append(h)
-    return out
-
-
 def ingest(path, pair=None, maxrows=None):
     t = pq.read_table(path, columns=COLS)
     cols = {n: t.column(n).to_pylist() for n in COLS}
     n = t.num_rows
     schema = ["unit", "ccy", "day", "objsub", "native", "tokens"]
+    it = Interner()  # interning lives at the boundary, not in this script
     rows, usd_by_id = [], []
     for i in range(n):
         if cols["is_offset"][i]:
@@ -56,7 +34,6 @@ def ingest(path, pair=None, maxrows=None):
             continue
         if pair and frozenset((co, icp)) != pair:
             continue
-        lo, hi = sorted((co, icp))
         usd = cols["indicative_usd_amt"][i] or 0.0
         trx = cols["trx_amt"][i] or 0.0
         if abs(trx) >= 0.005:
@@ -71,12 +48,12 @@ def ingest(path, pair=None, maxrows=None):
         rid = len(rows)
         usd_by_id.append(usd_cents)
         rows.append([rid, {"values": [
-            {"Int": fnv1a(f"{lo}|{hi}") & 0x7FFFFFFFFFFFFFFF},
-            {"Int": fnv1a(ccy_s) & 0x7FFFFFFFFFFFFFFF},
+            it.pair(co, icp),
+            it.cat(ccy_s),
             {"Int": gl_day},
-            {"Int": fnv1a(cols["objsub"][i] or "") & 0x7FFFFFFFFFFFFFFF},
+            it.cat(cols["objsub"][i] or ""),
             {"Int": snative},
-            {"Tokens": tokens([cols[f][i] for f in FIELDS])},
+            it.tokens([cols[f][i] for f in FIELDS], drop=("OFFSETENTRY",)),
         ]}])
         if maxrows and len(rows) >= maxrows:
             break
