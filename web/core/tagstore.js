@@ -1,4 +1,6 @@
-// Host-side tag overlay (§3 of docs/design/state-model-and-warmstart.md).
+// Host-side tag overlay: a review/attention axis orthogonal to the engine's
+// recalc status (live|frozen), keyed by stable row id (ExtId) and persisted in
+// localStorage. Never crosses into the conservation engine.
 //
 // Tags are a many-to-many *review/attention* axis that is orthogonal to the
 // engine's live|frozen partition. They are owned entirely by the host: the

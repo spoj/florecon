@@ -151,7 +151,7 @@ button.ghost { border: none; background: none; color: var(--accent); padding: 5p
 .neg { color: var(--bad); }
 .dirty { color: var(--bad); font-weight: 600; }
 
-/* tags (§3 review/attention overlay) */
+/* tags (review/attention overlay) */
 .tag-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
 .tag-chip {
   display: inline-block; font-size: 10px; line-height: 1.5; padding: 0 5px; margin-right: 3px;

@@ -298,7 +298,7 @@ where
                 // left for downstream leaves (and the flow arbiter) is stable
                 // across re-solves. Without this, HashMap/stack order would pick
                 // a different equal-magnitude row to leave each solve, changing
-                // the flow input set and defeating warm-start (§2).
+                // the flow input set and defeating warm-start.
                 pos.sort_unstable_by_key(|i| i.id);
                 neg.sort_unstable_by_key(|i| i.id);
                 let pairs = pos.len().min(neg.len());

@@ -13,7 +13,7 @@ const state = {
   detailCols: [],       // [{label, kind, render}]
   valueKey: "usd",      // which amount field is the conserved "value"
   displayById: new Map(),
-  tags: null,            // host-side TagStore (review/attention overlay, §3)
+  tags: null,            // host-side TagStore (review/attention overlay)
   slicerByKey: new Map(),
   report: null,
   lines: [],            // joined display + group attrs
@@ -75,7 +75,7 @@ function configureFromFields() {
   state.slicers = [...sys, ...dataDims].map((s) => ({
     ...s, valueOf: (l) => l[s.key],
   }));
-  // Tag facet (§3): a many-to-many overlay, so it exposes `valuesOf` (a list)
+  // Tag facet: a many-to-many overlay, so it exposes `valuesOf` (a list)
   // instead of `valueOf` (one value). A line can match several tag values.
   state.slicers.push({
     key: "tag", label: "tag", system: true, multi: true,
@@ -431,7 +431,7 @@ function renderDetail(fl) {
     `<button id="act-tag">Tag\u2026</button>`,
     `<button id="act-untag">Untag</button>`,
   ] : [];
-  // Commit verbs (§3): a tagged selection is a pre-decision "review bucket".
+  // Commit verbs: a tagged selection is a pre-decision "review bucket".
   // Each verb reuses an existing engine op, then drops the tags (no new state).
   const taggedSel = [...state.selectedLines].filter((id) => state.tags.tagsOf(id).size > 0);
   const commitActs = taggedSel.length ? [
@@ -615,7 +615,7 @@ function unmatchSelected() {
   setStatus(`unmatched ${ids.length} lines back to residual`);
 }
 
-// ---- tag overlay (§3): host-side, no engine dispatch -----------------------
+// ---- tag overlay: host-side, no engine dispatch ----------------------------
 // Tag the selected lines into a review bucket. Tags are keyed by row id, so
 // they survive recalc automatically.
 function tagSelected() {

@@ -17,15 +17,16 @@ const tColdStart = performance.now();
 r = fe.dispatch({ op: "solve" });
 if (!r.ok) throw new Error("solve: " + r.error);
 const coldMs = performance.now() - tColdStart;
-// Warm-start recalc (§2): the flow Matcher is kept alive per shard inside the
-// stored strategy, so a no-op re-solve applies an empty delta and warm-solves
-// from the cached basis. It must be dramatically faster than the cold solve.
+// Warm-start recalc: each shard's flow Matcher is kept alive inside the stored
+// strategy (PartitionBy holds one warm child per shard), so a no-op re-solve
+// applies an empty delta and warm-solves from the cached basis. It must be
+// dramatically faster than the cold solve.
 const tWarmStart = performance.now();
 const r1 = fe.dispatch({ op: "solve" });
 if (!r1.ok) throw new Error("warm solve: " + r1.error);
 const warmMs = performance.now() - tWarmStart;
 // Use the warm re-solve's report from here on: a re-solve re-mints ephemeral
-// live-singleton ids (§1), so the cold report's group ids are stale.
+// live-singleton ids, so the cold report's group ids are stale.
 const rep = r1.report;
 const warmConserve = rep.assignments.length === data.rows.length;
 const speedup = warmMs > 0 ? coldMs / warmMs : Infinity;

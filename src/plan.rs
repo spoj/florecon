@@ -342,6 +342,21 @@ impl Model for PlanModel {
 // Compiler: Plan -> Strategy<Row>
 // ---------------------------------------------------------------------------
 
+/// The conservation airlock, defined once. Asserts that exactly `input` ids were
+/// accounted for: each landing in exactly one group, or — at the batch boundary
+/// — in `assignments ⊎ residual`. The combinator algebra conserves *by
+/// construction*; this O(n) count at every public boundary is the belt that
+/// turns a hypothetical `compile` or `Strategy` bug into a loud error rather
+/// than a silently corrupted ledger. The two callers differ only in how they
+/// *count* (their two state models partition differently); the invariant and its
+/// error live here.
+fn conservation_airlock(input: usize, accounted: usize) -> Result<(), ApiError> {
+    if accounted != input {
+        return Err(ApiError::ConservationViolated { input, accounted });
+    }
+    Ok(())
+}
+
 fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiError> {
     Ok(match plan {
         Plan::Seq { steps } => {
@@ -447,7 +462,7 @@ pub struct GroupOut {
 /// the batch path is one-shot and holds no operator state, so it keeps an
 /// explicit `residual` list rather than collapsing unmatched rows into live
 /// singleton groups. Only the stateful workspace adopts the unified
-/// everything-is-a-group model (§1 of the state-model design).
+/// everything-is-a-group model.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Report {
@@ -562,10 +577,7 @@ impl Session {
 
         // Conservation airlock: assigned ⊎ residual must equal the input ids,
         // with no id counted twice.
-        let accounted = assignments.len() + residual.len();
-        if accounted != input {
-            return Err(ApiError::ConservationViolated { input, accounted });
-        }
+        conservation_airlock(input, assignments.len() + residual.len())?;
 
         Ok(Report {
             assignments,
@@ -672,6 +684,12 @@ pub struct Recon<E> {
     strategy: Box<dyn Strategy<E>>,
     items: BTreeMap<ExtId, E>,
     groups: Vec<GroupRec>,
+    /// Monotonic group-id allocator. **Never reset, never reused** — this is what
+    /// makes live-singleton id ephemerality *safe*: each solve dissolves the
+    /// live pool and re-mints its groups with brand-new ids, so a stale id held
+    /// by a host across a solve can never silently land on a *different* group.
+    /// It either still names the same frozen group (frozen ids are stable) or
+    /// fails loudly as [`ApiError::UnknownGroup`].
     next_id: u64,
 }
 
@@ -792,12 +810,7 @@ impl<E: Clone> Recon<E> {
         // id set — every input id is in exactly one group (total-input relative,
         // frozen members included).
         let accounted: usize = self.groups.iter().map(|g| g.members.len()).sum();
-        if accounted != total {
-            return Err(ApiError::ConservationViolated {
-                input: total,
-                accounted,
-            });
-        }
+        conservation_airlock(total, accounted)?;
         Ok(())
     }
 
@@ -1468,6 +1481,12 @@ mod tests {
             .unwrap()
             .group_id;
         assert_ne!(id1, id2, "live singleton ids are ephemeral across solves");
+        // Crucially, the stale id was not *reassigned* to a different group, so a
+        // host that cached it fails loudly (UnknownGroup) instead of silently
+        // mis-targeting whatever now holds that slot.
+        assert!(ws.report().groups.iter().all(|g| g.group_id != id1));
+        assert_eq!(ws.breakup(id1), Err(ApiError::UnknownGroup(id1)));
+        assert_eq!(ws.freeze(id1), Err(ApiError::UnknownGroup(id1)));
 
         // Freezing pins the id: it persists across the next solve.
         ws.freeze_singletons(&[1]);
@@ -1606,7 +1625,7 @@ mod tests {
 
     #[test]
     fn warm_flow_matches_cold_solve_under_random_edits() {
-        // §2 equivalence (global, un-partitioned shard): warm interactive
+        // Warm-vs-cold equivalence (global, un-partitioned shard): warm interactive
         // Workspace == fresh cold Session, group-for-group, across a random
         // upsert/remove sequence. Each warm solve also runs the in-leaf debug
         // determinism guard (warm objective == cold objective).
