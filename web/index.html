@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>florecon — reconciliation workbench</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">florecon <span class="sub">reconciliation workbench</span></div>
+    <div id="metrics" class="metrics"></div>
+    <div class="actions">
+      <button id="recalc" title="Re-solve the unfrozen pool">Recalc</button>
+      <button id="freeze-clean" title="Freeze every clean (net≈0) live group">Freeze clean</button>
+      <button id="reset" title="Reload and re-solve from scratch">Reset</button>
+    </div>
+  </header>
+
+  <main>
+    <aside id="facets" class="panel">
+      <div class="panel-head">Slicers <button id="clear-filters" class="link">clear</button></div>
+      <div id="facet-list"></div>
+    </aside>
+
+    <section id="groups" class="panel">
+      <div class="panel-head">
+        <span id="groups-title">Groups</span>
+        <input id="search" type="search" placeholder="filter reference / account / id…" />
+      </div>
+      <div class="table-wrap">
+        <table id="groups-table">
+          <thead>
+            <tr>
+              <th data-sort="gid">#</th>
+              <th data-sort="origin">strategy</th>
+              <th data-sort="status">status</th>
+              <th data-sort="size" class="num">lines</th>
+              <th data-sort="value" class="num">value (usd)</th>
+              <th data-sort="net" class="num">net</th>
+            </tr>
+          </thead>
+          <tbody id="groups-body"></tbody>
+        </table>
+      </div>
+      <div id="groups-foot" class="foot"></div>
+    </section>
+
+    <aside id="detail" class="panel">
+      <div class="panel-head" id="detail-head">Detail</div>
+      <div id="detail-actions" class="detail-actions"></div>
+      <div class="table-wrap">
+        <table id="detail-table">
+          <thead>
+            <tr>
+              <th>date</th><th>pol</th><th>co→icp</th>
+              <th class="num">native</th><th class="num">usd</th>
+              <th>account</th><th>reference</th>
+            </tr>
+          </thead>
+          <tbody id="detail-body"></tbody>
+        </table>
+      </div>
+    </aside>
+  </main>
+
+  <div id="status" class="status">loading…</div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

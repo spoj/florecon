@@ -646,6 +646,19 @@ impl Workspace {
         Ok(())
     }
 
+    /// Freeze every live group whose net is within `tol` (a clean group).
+    /// Returns how many were newly frozen.
+    pub fn freeze_clean(&mut self, tol: i64) -> usize {
+        let mut n = 0;
+        for g in &mut self.groups {
+            if !g.frozen && g.net.abs() <= tol {
+                g.frozen = true;
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Unlock a frozen group; the next solve may reshape it.
     pub fn unfreeze(&mut self, group_id: u64) -> Result<(), ApiError> {
         self.group_mut(group_id)?.frozen = false;

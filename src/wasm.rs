@@ -113,6 +113,8 @@ enum Cmd {
     Solve,
     /// Lock a group so re-solves leave it intact.
     Freeze { group_id: u64 },
+    /// Freeze every clean (|net| <= tol) live group in one shot.
+    FreezeClean { tol: i64 },
     /// Unlock a frozen group.
     Unfreeze { group_id: u64 },
     /// Dissolve a group back to the residual.
@@ -203,6 +205,10 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
         }
         Cmd::Solve => ws.solve(),
         Cmd::Freeze { group_id } => ws.freeze(group_id),
+        Cmd::FreezeClean { tol } => {
+            ws.freeze_clean(tol);
+            Ok(())
+        }
         Cmd::Unfreeze { group_id } => ws.unfreeze(group_id),
         Cmd::Breakup { group_id } => ws.breakup(group_id),
         Cmd::Report => Ok(()),

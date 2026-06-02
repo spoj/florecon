@@ -55,6 +55,26 @@ python python/run_interco.py [path.parquet] [--pair COMPANY ICP] [--max N]
 # full file via wasm: 87.7% count, 85.2% value — exact match to native
 ```
 
+## Workbench (browser + WASM)
+
+An interactive reconciliation UI: cross-filtering slicers, a groups table, a
+line-level detail pane, and the interactive verbs (freeze / break up / recalc)
+driven by the stateful `Workspace`. All computation runs in the WASM module in
+the browser — the data never leaves the client.
+
+```bash
+cargo build --release --target wasm32-unknown-unknown --features wasm --lib
+. .venv/bin/activate && python python/export_web.py [--pair COMPANY ICP]  # -> web/data.json
+python -m http.server 8000        # serve from the repo root
+# open http://localhost:8000/web/index.html
+node web/smoke.mjs                # headless check of the browser host ABI
+```
+
+The browser host (`web/florecon.js`) is the exact analog of the Python host:
+allocate, write a JSON command, call `dispatch`, read the JSON report. The
+workbench owns only display records and filter state; the engine owns the rows
+and the conserved partition.
+
 ## Features
 
 - `serde` — serialize snapshots and `Plan`s.
