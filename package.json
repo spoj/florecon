@@ -1,0 +1,13 @@
+{
+  "name": "florecon-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "smoke": "node web/smoke.mjs",
+    "smoke:ingest": "node web/ingest.smoke.mjs",
+    "smoke:dom": "node web/dom.smoke.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  }
+}

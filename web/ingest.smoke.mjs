@@ -29,12 +29,12 @@ ok(toEpochDay("2024-01-01") === 19723, "epoch day " + toEpochDay("2024-01-01"));
 // Two entities (ACME/GLOBEX), each with an offsetting +/- pair on the same
 // account + currency; one stray unmatched line.
 const csv = [
-  "Entity,Currency,Account,Date,Amount,Memo",
-  "ACME,USD,4000,2024-01-02,100.00,INV0001 widgets",
-  "ACME,USD,4000,2024-01-03,-100.00,INV0001 credit",
-  "GLOBEX,EUR,5000,2024-02-01,250.50,INV0009 services",
-  "GLOBEX,EUR,5000,2024-02-04,-250.50,INV0009 reversal",
-  "ACME,USD,4000,2024-01-05,42.00,INV0002 stray",
+  "Entity,Currency,Account,Date,Amount,Ref,Memo",
+  "ACME,USD,4000,2024-01-02,100.00,INV0001,widgets",
+  "ACME,USD,4000,2024-01-03,-100.00,INV0001,credit",
+  "GLOBEX,EUR,5000,2024-02-01,250.50,INV0009,services",
+  "GLOBEX,EUR,5000,2024-02-04,-250.50,INV0009,reversal",
+  "ACME,USD,4000,2024-01-05,42.00,INV0002,stray",
 ].join("\n");
 const parsed = parseCsv(csv);
 parsed.name = "smoke";
@@ -42,7 +42,7 @@ const H = parsed.header;
 const col = (n) => H.indexOf(n);
 const mapping = {
   amount: col("Amount"), gkey: col("Account"), date: col("Date"),
-  tokens: col("Memo"), partitions: [col("Entity"), col("Currency")],
+  tokens: [col("Ref"), col("Memo")], partitions: [col("Entity"), col("Currency")],
   tol: 0, name: "smoke",
 };
 const data = buildDataset({ header: H, rows: parsed.rows, mapping });
@@ -54,6 +54,7 @@ ok(data.plan.op === "partition" && data.plan.by === "p0", "outer partition");
 // cells positional: [p0,p1,gkey,date,amount,tokens]
 ok(data.rows[0][1][4] === 10000, "amount cents in cell");
 ok(typeof data.rows[0][1][0] === "string", "key cell is string");
+ok(data.rows[0][1][5] === "INV0001 widgets", "multi-column reference concatenated: " + data.rows[0][1][5]);
 ok(data.display[0].amount === 10000, "display amount cents");
 
 let r = fe.dispatch({ op: "init", schema: data.schema, plan: data.plan, rows: data.rows });

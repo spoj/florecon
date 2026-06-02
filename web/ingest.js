@@ -74,7 +74,7 @@ export function toEpochDay(raw) {
 //   amount:     <colIndex>,              // required, the conserved value
 //   gkey:       <colIndex> | null,       // net-to-zero aggregation key
 //   date:       <colIndex> | null,       // for the time-windowed flow
-//   tokens:     <colIndex> | null,       // free-text reference matching
+//   tokens:     <colIndex>[] | <colIndex> | null,  // free-text columns, concatenated
 //   partitions: [<colIndex>, ...],       // independent sub-books (0..n)
 //   tol:        <integer minor units>,   // net tolerance for "clean"
 //   name:       <string>,                // dataset label
@@ -96,8 +96,12 @@ export function buildDataset({ header, rows, mapping }) {
   if (mapping.date != null)
     cols.push({ name: "date", kind: "number", ci: mapping.date, label: header[mapping.date], date: true });
   cols.push({ name: "amount", kind: "number", ci: mapping.amount, label: header[mapping.amount], amount: true });
-  if (mapping.tokens != null)
-    cols.push({ name: "tokens", kind: "tokens", ci: mapping.tokens, label: header[mapping.tokens], text: true });
+  // Reference text may span several CSV columns; they are concatenated into one
+  // free-text tokens column (invoice nos, refs, memos mined for shared tokens).
+  const tok = mapping.tokens;
+  const tokCis = (Array.isArray(tok) ? tok : tok != null ? [tok] : []).filter((i) => i != null);
+  if (tokCis.length)
+    cols.push({ name: "tokens", kind: "tokens", cis: tokCis, label: tokCis.map((i) => header[i]).join(" + "), text: true });
 
   const schema = { cols: cols.map((c) => ({ name: c.name, kind: c.kind })), token_drop: [] };
 
@@ -106,9 +110,9 @@ export function buildDataset({ header, rows, mapping }) {
   const steps = [];
   if (mapping.gkey != null) steps.push({ op: "agg_net", key: "gkey", amount: "amount", tol });
   steps.push({ op: "exact", amount: "amount" });
-  if (mapping.tokens != null)
+  if (tokCis.length)
     steps.push({ op: "signal", signals: "tokens", amount: "amount", tol, cap: 256 });
-  if (mapping.tokens != null && mapping.date != null)
+  if (tokCis.length && mapping.date != null)
     steps.push({
       op: "flow", amount: "amount", day: "date", native: "amount",
       tokens: "tokens", penalty: 1000.0, window: -1,
@@ -122,17 +126,18 @@ export function buildDataset({ header, rows, mapping }) {
   const outRows = [], display = [];
   rows.forEach((r, id) => {
     const cells = cols.map((c) => {
-      const raw = r[c.ci];
-      if (c.amount) return toCents(raw);
-      if (c.date) return toEpochDay(raw);
-      if (c.kind === "number") return toInt(raw);
-      return String(raw ?? "");
+      if (c.amount) return toCents(r[c.ci]);
+      if (c.date) return toEpochDay(r[c.ci]);
+      if (c.text) return c.cis.map((i) => String(r[i] ?? "")).filter(Boolean).join(" ");
+      if (c.kind === "number") return toInt(r[c.ci]);
+      return String(r[c.ci] ?? "");
     });
     outRows.push([id, cells]);
     const d = { id };
     for (const c of cols) {
       if (c.amount) d.amount = toCents(r[c.ci]);
       else if (c.date) d.date = String(r[c.ci] ?? "");
+      else if (c.text) d[c.name] = c.cis.map((i) => String(r[i] ?? "")).filter(Boolean).join(" ");
       else d[c.name] = String(r[c.ci] ?? "");
     }
     d.native = d.amount; // engine-conserved column, for manual-group net

@@ -3,7 +3,7 @@
 // the workbench. The workbench (app.js) is otherwise unchanged and data-driven.
 
 import { startApp, startDemo } from "./app.js";
-import { parseCsv, buildDataset } from "./ingest.js";
+import { parseCsv, buildDataset, toCents } from "./ingest.js";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, attrs = {}, kids = []) => {
@@ -19,13 +19,13 @@ const el = (tag, attrs = {}, kids = []) => {
 };
 
 // Engine roles the mapping UI exposes. `req` roles must be assigned; `multi`
-// roles (partitions) accept several columns.
+// roles accept several columns (partitions nest; reference columns concatenate).
 const ROLES = [
   { key: "amount", label: "Amount", req: true, hint: "the conserved value (money). Net-to-zero is computed on this." },
   { key: "gkey", label: "Group key", hint: "rows sharing this key net against each other first (e.g. account)." },
   { key: "partitions", label: "Partition by", multi: true, hint: "split into independent sub-books solved separately (e.g. entity, currency)." },
   { key: "date", label: "Date", hint: "enables time-windowed flow matching." },
-  { key: "tokens", label: "Reference text", hint: "free text mined for shared tokens (invoice nos, refs)." },
+  { key: "tokens", label: "Reference text", multi: true, hint: "one or more free-text columns mined for shared tokens (invoice nos, refs). Ctrl/⌘-click to pick several." },
 ];
 
 let parsed = null; // { header, rows }
@@ -64,11 +64,10 @@ function renderMapping() {
     const g = guess(role.key);
     let control;
     if (role.multi) {
-      // Two optional partition selects (entity, currency, …).
-      const a = el("select", { id: "map-p0" }, colOptions(true));
-      const b = el("select", { id: "map-p1" }, colOptions(true));
-      if (g >= 0) a.value = String(g);
-      control = el("div", { class: "multi" }, [a, b]);
+      // A multi-select listing every column; pick none, one, or several.
+      const sel = el("select", { id: "map-" + role.key, multiple: "", size: "4" }, colOptions(false));
+      if (g >= 0) sel.options[g].selected = true;
+      control = sel;
     } else {
       const s = el("select", { id: "map-" + role.key }, colOptions(!role.req));
       if (g >= 0) s.value = String(g);
@@ -82,8 +81,8 @@ function renderMapping() {
   }
   const tolWrap = el("div", { class: "map-row" }, [
     el("label", {}, "Net tolerance"),
-    el("input", { id: "map-tol", type: "number", value: "0", min: "0", step: "1" }),
-    el("div", { class: "hint", text: "a group is 'clean' if |net| ≤ this, in minor units (cents)." }),
+    el("input", { id: "map-tol", type: "number", value: "0", min: "0", step: "0.01" }),
+    el("div", { class: "hint", text: "a group is 'clean' if |net| ≤ this, in the amount's own unit (e.g. dollars)." }),
   ]);
   body.append(tolWrap);
   renderPreview();
@@ -101,31 +100,38 @@ function renderPreview() {
 }
 
 function readMapping() {
-  const v = (id) => { const e = $(id); return e && e.value !== "" ? Number(e.value) : null; };
-  const partitions = [v("map-p0"), v("map-p1")].filter((x) => x != null);
+  const one = (id) => { const e = $(id); return e && e.value !== "" ? Number(e.value) : null; };
+  const many = (id) => { const e = $(id); return e ? [...e.selectedOptions].map((o) => Number(o.value)) : []; };
+  // Tolerance is entered in the amount's own unit (e.g. dollars); the engine
+  // works in integer minor units, so scale it the same way amounts are scaled.
+  const tol = toCents($("map-tol") ? $("map-tol").value : 0);
   return {
-    amount: v("map-amount"),
-    gkey: v("map-gkey"),
-    date: v("map-date"),
-    tokens: v("map-tokens"),
-    partitions,
-    tol: Math.max(0, Number($("map-tol").value) || 0),
+    amount: one("map-amount"),
+    gkey: one("map-gkey"),
+    date: one("map-date"),
+    tokens: many("map-tokens"),
+    partitions: many("map-partitions"),
+    tol: Math.max(0, tol),
     name: parsed.name || "uploaded",
   };
 }
 
 async function runUpload() {
-  const m = readMapping();
-  if (m.amount == null) { $("setup-err").textContent = "Pick an Amount column — it is the conserved value."; return; }
   $("setup-err").textContent = "";
   try {
+    if (!parsed) throw new Error("Upload a CSV first.");
+    const m = readMapping();
+    if (m.amount == null) throw new Error("Pick an Amount column — it is the conserved value.");
     const data = buildDataset({ header: parsed.header, rows: parsed.rows, mapping: m });
-    if (!data.display.length) { $("setup-err").textContent = "No data rows after parsing."; return; }
-    show("app");
+    if (!data.display.length) throw new Error("No data rows after parsing.");
+    // Build + solve while still on the setup screen; only reveal the workbench
+    // once it succeeds, so a failure stays visible here instead of a blank app.
     await startApp(data);
+    show("app");
   } catch (e) {
+    console.error("run recon failed:", e);
     show("setup");
-    $("setup-err").textContent = "Build failed: " + e.message;
+    $("setup-err").textContent = "Could not run: " + (e && e.message ? e.message : e);
   }
 }
 
@@ -155,9 +161,9 @@ function wire() {
   };
   $("run-recon").onclick = runUpload;
   $("load-demo").onclick = async () => {
-    show("app");
-    try { await startDemo(); }
-    catch (e) { show("setup"); $("setup-err").textContent = "Demo failed: " + e.message; }
+    $("setup-err").textContent = "";
+    try { await startDemo(); show("app"); }
+    catch (e) { console.error(e); show("setup"); $("setup-err").textContent = "Demo failed: " + e.message; }
   };
 }
 

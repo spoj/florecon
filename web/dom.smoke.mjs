@@ -1,0 +1,86 @@
+// Headless DOM smoke for the upload front-end: drives the real setup.js through
+// a jsdom document — upload CSV, map columns (incl. multi-select partitions and
+// multi-column reference text), set a tolerance, click Run — and asserts the
+// workbench transitions and solves. The demo path is exercised too.
+//
+//   npm i   &&   node web/dom.smoke.mjs
+//
+// Degrades gracefully (skips) if jsdom is not installed, so it never hard-fails
+// an environment that only runs the node/Rust smokes.
+import { readFileSync } from "fs";
+
+let JSDOM;
+try { ({ JSDOM } = await import("jsdom")); }
+catch { console.log("DOM SMOKE SKIPPED (jsdom not installed; run `npm i`)"); process.exit(0); }
+
+const here = new URL(".", import.meta.url);
+const ok = (cond, msg) => { if (!cond) { console.error("FAIL: " + msg); process.exit(1); } };
+
+// One fresh document + globals per run; setup.js wires itself on import.
+async function freshDom() {
+  const html = readFileSync(new URL("index.html", here), "utf8");
+  const dom = new JSDOM(html, { url: "http://localhost/web/", pretendToBeVisual: true });
+  const { window } = dom;
+  Object.assign(global, {
+    window, document: window.document, FileReader: window.FileReader,
+    File: window.File, Event: window.Event, localStorage: window.localStorage,
+  });
+  global.TextEncoder = TextEncoder; global.TextDecoder = TextDecoder;
+  // Serve local files (wasm, data.json) the way fetch() would over http.
+  global.fetch = async (u) => {
+    const b = readFileSync(new URL(String(u), here));
+    return {
+      arrayBuffer: async () => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength),
+      json: async () => JSON.parse(b.toString()),
+    };
+  };
+  // Bust the ESM cache so each run re-imports a setup.js bound to this document.
+  await import(`./setup.js?t=${Date.now()}`);
+  return (id) => window.document.getElementById(id);
+}
+const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// --- upload path ----------------------------------------------------------
+{
+  const $ = await freshDom();
+  const csv = [
+    "Entity,Currency,Account,Date,Amount,Ref,Memo",
+    "ACME,USD,4000,2024-01-02,100.00,INV0001,widgets",
+    "ACME,USD,4000,2024-01-03,-100.00,INV0001,credit",
+    "GLOBEX,EUR,5000,2024-02-01,250.50,INV0009,services",
+    "GLOBEX,EUR,5000,2024-02-04,-250.50,INV0009,reversal",
+    "ACME,USD,4000,2024-01-05,42.00,INV0002,stray",
+  ].join("\n");
+  const input = $("file-input");
+  Object.defineProperty(input, "files", { value: [new window.File([csv], "book.csv")], configurable: true });
+  input.dispatchEvent(new window.Event("change"));
+  await tick(200);
+  ok(!$("map-panel").hidden, "mapping panel shown after upload");
+  ok($("map-tokens").multiple, "reference text is a multi-select");
+  ok($("map-partitions").multiple, "partition is a multi-select");
+
+  $("map-amount").value = "4"; $("map-gkey").value = "2"; $("map-date").value = "3";
+  for (const o of $("map-partitions").options) if (o.value === "0" || o.value === "1") o.selected = true;
+  for (const o of $("map-tokens").options) if (o.value === "5" || o.value === "6") o.selected = true;
+  $("map-tol").value = "0.01"; // dollars -> 1 cent
+  $("run-recon").dispatchEvent(new window.Event("click"));
+  await tick(600);
+  ok($("setup-err").textContent === "", "no error: " + $("setup-err").textContent);
+  ok($("setup").hidden && !$("main").hidden, "transitioned to workbench");
+  ok(/solved in/.test($("status").textContent), "solved: " + $("status").textContent);
+  console.log("  upload   : " + $("status").textContent.trim());
+}
+
+// --- demo path ------------------------------------------------------------
+{
+  const $ = await freshDom();
+  $("load-demo").dispatchEvent(new window.Event("click"));
+  await tick(4000); // cold solve of the full demo book
+  ok($("setup-err").textContent === "", "demo no error: " + $("setup-err").textContent);
+  ok($("setup").hidden && !$("main").hidden, "demo transitioned to workbench");
+  ok(/solved in/.test($("status").textContent), "demo solved: " + $("status").textContent);
+  console.log("  demo     : " + $("status").textContent.trim());
+}
+
+console.log("DOM SMOKE OK");
+process.exit(0);

@@ -7,3 +7,4 @@ py/dist/
 py/build/
 **/*.egg-info/
 web/core/engine.wasm
+/node_modules
