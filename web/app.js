@@ -182,7 +182,9 @@ function rebuild() {
   state.groupsById = new Map();
   for (const g of rep.groups) {
     state.groupsById.set(g.group_id, {
-      ...g, members: [], value: 0, clean: Math.abs(g.net) <= TOL,
+      // The wire carries only `status`; derive the local `frozen` convenience
+      // boolean here so the rest of the UI can stay terse.
+      ...g, frozen: g.status === "frozen", members: [], value: 0, clean: Math.abs(g.net) <= TOL,
     });
   }
   // drop selections that no longer exist after a recalc/breakup
@@ -192,7 +194,7 @@ function rebuild() {
   const vk = state.valueKey;
   state.lines = state.data.display.map((d) => {
     // Every id now lands in exactly one group (no separate residual set); an
-    // unmatched row is a live singleton group (origin "residual").
+    // unmatched row is a live singleton group (origin "unmatched").
     const gid = gidOf.has(d.id) ? gidOf.get(d.id) : -1;
     const g = state.groupsById.get(gid);
     if (g) { g.members.push(d.id); g.value += Math.abs(Number(d[vk] || 0)); }
@@ -201,7 +203,7 @@ function rebuild() {
       ...d,
       gid,
       month: (d.date || "").slice(0, 7),
-      origin: g ? g.origin : "residual",
+      origin: g ? g.origin : "unmatched",
       // Render-time status from (status × arity): live match / frozen match /
       // live singleton (unmatched) / frozen singleton (accepted exception).
       status: g

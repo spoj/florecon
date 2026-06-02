@@ -7,10 +7,9 @@ export interface Report {
     origin: string;
     net: number;
     size: number;
-    /** Recalc-status axis: live (machine opinion) or frozen (operator decision). */
+    /** The single recalc-status axis: live (machine opinion) or frozen (operator
+     * decision). Matched vs unmatched is arity (`size`), not status. */
     status: "live" | "frozen";
-    /** Derived alias of `status === "frozen"`, kept for soft migration. */
-    frozen?: boolean;
   }[];
 }
 

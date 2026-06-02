@@ -37,9 +37,9 @@ console.log(
 );
 // No separate residual set: an unmatched row is a live singleton group
 // (status==live && size==1). Helpers derive the old "residual" view from groups.
-const residCount = (rp) => rp.groups.filter((g) => !g.frozen && g.size === 1).length;
+const residCount = (rp) => rp.groups.filter((g) => g.status !== "frozen" && g.size === 1).length;
 const singletonIds = (rp) => {
-  const live = new Set(rp.groups.filter((g) => !g.frozen && g.size === 1).map((g) => g.group_id));
+  const live = new Set(rp.groups.filter((g) => g.status !== "frozen" && g.size === 1).map((g) => g.group_id));
   return rp.assignments.filter(([, gid]) => live.has(gid)).map(([id]) => id);
 };
 const total = data.rows.length;
@@ -57,13 +57,13 @@ console.log(`  solve    : ${(performance.now() - t0).toFixed(0)} ms`);
 // exercise the interactive verbs the UI uses
 const g = rep.groups.find((x) => x.size >= 2);
 let n = fe.dispatch({ op: "freeze", group_id: g.group_id }).report.groups.find((x) => x.group_id === g.group_id);
-console.log(`  freeze   : group ${g.group_id} frozen=${n.frozen}`);
+console.log(`  freeze   : group ${g.group_id} frozen=${n.status === "frozen"}`);
 const g2 = rep.groups.filter((x) => x.size >= 2)[1].group_id;
 const after = fe.dispatch({ op: "breakup", group_id: g2 }).report;
 const stillThere = after.groups.some((x) => x.group_id === g2);
 console.log(`  breakup  : group ${g2} present=${stillThere} residual=${residCount(after)}`);
 const re = fe.dispatch({ op: "solve" }).report;
-const frozenKept = re.groups.some((x) => x.group_id === g.group_id && x.frozen);
+const frozenKept = re.groups.some((x) => x.group_id === g.group_id && x.status === "frozen");
 const reConserve = re.assignments.length === total;
 console.log(`  re-solve : frozen kept=${frozenKept} conserve=${reConserve} groups=${re.groups.length}`);
 // manual match (group) over two live singletons -> a frozen "manual" group
@@ -72,7 +72,7 @@ let manualOk = false, frozenRefused = false, ungroupOk = false;
 if (pick.length === 2) {
   const gm = fe.dispatch({ op: "group", ids: pick, net: 0, origin: "manual" });
   const mg = gm.ok && gm.report.assignments.filter(([id]) => pick.includes(id)).length === 2;
-  const frozenManual = gm.ok && gm.report.groups.some((x) => x.origin === "manual" && x.frozen);
+  const frozenManual = gm.ok && gm.report.groups.some((x) => x.origin === "manual" && x.status === "frozen");
   manualOk = mg && frozenManual;
   // a frozen group's members cannot be ungrouped (signed-off is protected)
   frozenRefused = fe.dispatch({ op: "ungroup", ids: pick }).ok === false;
@@ -84,14 +84,14 @@ let exceptionOk = false;
 if (exId != null) {
   const fr = fe.dispatch({ op: "freeze_singletons", ids: [exId] }).report;
   const exGid = fr.assignments.find(([id]) => id === exId)?.[1];
-  const frozenSingleton = fr.groups.some((x) => x.group_id === exGid && x.frozen && x.size === 1);
+  const frozenSingleton = fr.groups.some((x) => x.group_id === exGid && x.status === "frozen" && x.size === 1);
   const sur = fe.dispatch({ op: "solve" }).report;
-  const kept = sur.groups.some((x) => x.group_id === exGid && x.frozen && x.size === 1);
+  const kept = sur.groups.some((x) => x.group_id === exGid && x.status === "frozen" && x.size === 1);
   exceptionOk = frozenSingleton && kept;
   console.log(`  freeze1  : exception frozen=${frozenSingleton} survives-solve=${kept}`);
 }
 // ungroup a LIVE group's members -> back to live singletons
-const live = fe.dispatch({ op: "report" }).report.groups.find((x) => !x.frozen && x.size >= 2);
+const live = fe.dispatch({ op: "report" }).report.groups.find((x) => x.status !== "frozen" && x.size >= 2);
 if (live) {
   const cur = fe.dispatch({ op: "report" }).report;
   const mem = cur.assignments.filter(([, gid]) => gid === live.group_id).map(([id]) => id);

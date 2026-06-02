@@ -150,8 +150,7 @@
         "origin": { "type": "string" },
         "net": { "type": "integer" },
         "size": { "type": "integer", "minimum": 0 },
-        "status": { "enum": ["live", "frozen"], "description": "recalc axis; present on Workspace (dispatch) reports only" },
-        "frozen": { "type": "boolean", "description": "derived alias of status==frozen; Workspace reports only" }
+        "status": { "enum": ["live", "frozen"], "description": "the single recalc axis; present on Workspace (dispatch) reports only" }
       },
       "required": ["group_id", "origin", "net", "size"]
     },

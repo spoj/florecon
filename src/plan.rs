@@ -627,11 +627,9 @@ pub struct WsGroup {
     pub origin: String,
     pub net: i64,
     pub size: usize,
-    /// The recalc-status axis: `live` or `frozen`.
+    /// The single recalc-status axis: `live` or `frozen`. (Matched vs unmatched
+    /// is arity — `size` — not status.)
     pub status: Status,
-    /// Derived alias of `status == Frozen`, kept for one release so hosts can
-    /// cut over to `status` without a flag day (soft migration).
-    pub frozen: bool,
 }
 
 struct GroupRec {
@@ -650,7 +648,7 @@ impl GroupRec {
 
 /// The interactive result: a single partition of every input id into groups,
 /// each carrying its [`Status`]. There is no separate residual set — an
-/// unmatched row is a live singleton group (origin `"residual"`).
+/// unmatched row is a live singleton group (origin `"unmatched"`).
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WorkspaceReport {
@@ -668,7 +666,7 @@ pub struct WorkspaceReport {
 /// analyst trusts so re-solves leave it alone; [`breakup`](Recon::breakup)
 /// dissolves a group back to the pool. The conservation invariant — every item
 /// id is in exactly one group — holds after every operation. An unmatched row
-/// is simply a live singleton group (origin `"residual"`); there is no separate
+/// is simply a live singleton group (origin `"unmatched"`); there is no separate
 /// residual set.
 pub struct Recon<E> {
     strategy: Box<dyn Strategy<E>>,
@@ -696,13 +694,13 @@ impl<E: Clone> Recon<E> {
         self.items.is_empty()
     }
 
-    /// Push a fresh live singleton group (origin `"residual"`) for `id`. Live
+    /// Push a fresh live singleton group (origin `"unmatched"`) for `id`. Live
     /// singleton ids are ephemeral: each solve dissolves and re-mints them.
     fn push_live_singleton(&mut self, id: ExtId) {
         self.groups.push(GroupRec {
             id: self.next_id,
             members: vec![id],
-            origin: "residual".to_string(),
+            origin: "unmatched".to_string(),
             net: 0,
             status: Status::Live,
         });
@@ -784,7 +782,7 @@ impl<E: Clone> Recon<E> {
             });
             self.next_id += 1;
         }
-        // Leftovers become live singleton groups (origin "residual").
+        // Leftovers become live singleton groups (origin "unmatched").
         let mut leftover: Vec<ExtId> = res.residual.into_iter().map(|i| i.id).collect();
         leftover.sort_unstable();
         for id in leftover {
@@ -979,7 +977,6 @@ impl<E: Clone> Recon<E> {
                 net: g.net,
                 size: g.members.len(),
                 status: g.status,
-                frozen: g.is_frozen(),
             });
         }
         assignments.sort();
@@ -1305,7 +1302,7 @@ mod tests {
         r.freeze(g).unwrap();
         r.upsert(4, 9);
         r.solve().unwrap();
-        assert!(r.report().groups.iter().any(|x| x.group_id == g && x.frozen));
+        assert!(r.report().groups.iter().any(|x| x.group_id == g && x.status == Status::Frozen));
     }
 
     fn ws_conserves(ws: &Workspace) {
@@ -1324,7 +1321,7 @@ mod tests {
         ws.upsert(4, row(-50, 4, 20, -50, &[])).unwrap();
         // Before solving, every fresh id stands as a live singleton group.
         assert_eq!(ws.report().groups.len(), 4);
-        assert!(ws.report().groups.iter().all(|g| g.size == 1 && !g.frozen));
+        assert!(ws.report().groups.iter().all(|g| g.size == 1 && g.status == Status::Live));
         ws_conserves(&ws);
 
         ws.solve().unwrap();
@@ -1340,14 +1337,14 @@ mod tests {
         // g1's members are now live singletons; g0 still grouped + frozen.
         let rep = ws.report();
         assert_eq!(rep.groups.len(), 3);
-        assert_eq!(rep.groups.iter().filter(|g| g.frozen).count(), 1);
+        assert_eq!(rep.groups.iter().filter(|g| g.status == Status::Frozen).count(), 1);
         assert_eq!(rep.groups.iter().filter(|g| g.size == 1).count(), 2);
         ws_conserves(&ws);
 
         // Re-solve: frozen group survives with its id; the pool reforms.
         ws.solve().unwrap();
         let rep = ws.report();
-        assert!(rep.groups.iter().any(|g| g.group_id == g0 && g.frozen));
+        assert!(rep.groups.iter().any(|g| g.group_id == g0 && g.status == Status::Frozen));
         assert_eq!(rep.groups.len(), 2);
         ws_conserves(&ws);
     }
@@ -1365,7 +1362,7 @@ mod tests {
         let rep = ws.report();
         assert_eq!(rep.groups.len(), 1);
         assert_eq!(rep.groups[0].size, 1);
-        assert!(!rep.groups[0].frozen);
+        assert!(rep.groups[0].status == Status::Live);
         assert_eq!(rep.assignments, vec![(1, rep.groups[0].group_id)]);
         ws_conserves(&ws);
     }
@@ -1396,7 +1393,7 @@ mod tests {
         let gid = ws.group(&[1, 2], 10, "manual").unwrap();
         let rep = ws.report();
         let g = rep.groups.iter().find(|g| g.group_id == gid).unwrap();
-        assert!(g.frozen && g.origin == "manual" && g.size == 2 && g.net == 10);
+        assert!(g.status == Status::Frozen && g.origin == "manual" && g.size == 2 && g.net == 10);
         ws_conserves(&ws);
 
         // A re-solve must not disturb the manual (frozen) group.
@@ -1413,7 +1410,7 @@ mod tests {
         let singletons: BTreeSet<ExtId> = rep
             .groups
             .iter()
-            .filter(|g| g.size == 1 && !g.frozen)
+            .filter(|g| g.size == 1 && g.status == Status::Live)
             .flat_map(|g| rep.assignments.iter().filter(move |(_, gid)| *gid == g.group_id).map(|(id, _)| *id))
             .collect();
         assert!(singletons.contains(&3) && singletons.contains(&4));
@@ -1431,11 +1428,11 @@ mod tests {
         let g = rep.groups.iter().find(|g| g.size == 1).unwrap();
         let gid = g.group_id;
         assert_eq!(g.status, Status::Live);
-        assert_eq!(g.origin, "residual");
+        assert_eq!(g.origin, "unmatched");
 
         ws.freeze_singletons(&[1]);
         let g = ws.report().groups.into_iter().find(|g| g.group_id == gid).unwrap();
-        assert!(g.frozen && g.size == 1 && g.status == Status::Frozen);
+        assert!(g.size == 1 && g.status == Status::Frozen);
 
         // A re-solve leaves the frozen singleton untouched, id stable.
         ws.solve().unwrap();
@@ -1443,7 +1440,7 @@ mod tests {
             ws.report()
                 .groups
                 .iter()
-                .any(|g| g.group_id == gid && g.frozen && g.size == 1)
+                .any(|g| g.group_id == gid && g.status == Status::Frozen && g.size == 1)
         );
         ws_conserves(&ws);
     }
@@ -1666,7 +1663,7 @@ mod tests {
                     let singles: Vec<ExtId> = rep
                         .groups
                         .iter()
-                        .filter(|g| g.size == 1 && !g.frozen)
+                        .filter(|g| g.size == 1 && g.status == Status::Live)
                         .flat_map(|g| {
                             rep.assignments
                                 .iter()
