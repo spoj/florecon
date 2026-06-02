@@ -36,6 +36,7 @@
 //! assert!(r.groups()[0].clean);
 //! ```
 
+pub mod api;
 pub mod net;
 pub mod recon;
 pub mod strategy;
