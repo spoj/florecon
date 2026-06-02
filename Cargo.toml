@@ -3,12 +3,18 @@ name = "florecon"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 log = "0.4"
 serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
-serde = ["dep:serde"]
+serde = ["dep:serde", "dep:serde_json"]
+# The WASM consumption surface (C-ABI exports over linear memory).
+wasm = ["serde"]
 
 [dev-dependencies]
 csv = "1.3"

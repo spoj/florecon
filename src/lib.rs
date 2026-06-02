@@ -41,5 +41,8 @@ pub mod net;
 pub mod recon;
 pub mod strategy;
 
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
 pub use net::{ArcId, Network, NodeId, SolveStatus};
 pub use recon::{ExtId, Group, Model, Reconciler};

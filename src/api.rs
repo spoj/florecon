@@ -222,13 +222,18 @@ impl Model for PlanModel {
             let (na, nb) = (a.int(self.native), b.int(self.native));
             na != 0 && na.abs() == nb.abs()
         };
-        let dd = (a.int(self.day) - b.int(self.day)).abs() as f64 * 0.001;
+        let dd = (a.int(self.day) - b.int(self.day)).abs() as f64;
+        let eps = 0.5;
         // Confidence tiers: a shared reference token is the strongest signal,
-        // exact native amount next; otherwise forbid the pair.
+        // exact native amount next (but only within a date window); otherwise
+        // forbid the pair.
         if shared {
-            Some(0.5 + dd)
+            Some(1.0 + eps + dd * 0.002 + if amt_match { 0.0 } else { 0.5 })
         } else if amt_match {
-            Some(1.0 + dd)
+            if dd > 92.0 {
+                return None;
+            }
+            Some(4.0 + eps + dd * 0.02)
         } else {
             None
         }
@@ -353,6 +358,19 @@ impl Session {
         }
     }
 
+    /// Build a session from a schema and a batch of rows (the batch boundary
+    /// mode: the whole shard crosses once, e.g. from a WASM host).
+    pub fn from_rows<I>(schema: Schema, rows: I) -> Result<Self, ApiError>
+    where
+        I: IntoIterator<Item = (ExtId, Row)>,
+    {
+        let mut s = Session::new(schema);
+        for (id, row) in rows {
+            s.upsert(id, row)?;
+        }
+        Ok(s)
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -433,6 +451,30 @@ impl Session {
             groups: group_out,
             residual,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batch request (the portable wire shape for a whole-shard solve)
+// ---------------------------------------------------------------------------
+
+/// A self-contained batch solve: schema + rows + plan. This is the JSON a WASM
+/// or other batch host ships across the boundary in one coarse crossing.
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SolveRequest {
+    pub schema: Schema,
+    pub rows: Vec<(ExtId, Row)>,
+    pub plan: Plan,
+}
+
+#[cfg(feature = "serde")]
+impl SolveRequest {
+    /// Build the session and run the plan, partition check included.
+    pub fn run(self) -> Result<Report, ApiError> {
+        let session = Session::from_rows(self.schema, self.rows)?;
+        session.solve(&self.plan)
     }
 }
 
