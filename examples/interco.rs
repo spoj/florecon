@@ -23,6 +23,8 @@ use std::fs::File;
 struct Tx {
     usd_cents: i64, // signed numeraire the engine conserves
     gl_day: i64,
+    ccy: u64,       // hashed native currency
+    amt_cents: i64, // |native amount| (trx, or base as fallback)
     tokens: Vec<u64>, // hashed reference tokens (cross-book bridge keys)
 }
 
@@ -42,17 +44,37 @@ impl Model for Interco {
         tx.gl_day
     }
     fn window(&self) -> i64 {
-        -1 // disable proximity generation; candidacy comes from reference tokens
+        -1 // disable proximity generation; candidacy comes from match keys
     }
     fn match_keys(&self, tx: &Tx) -> Vec<u64> {
-        tx.tokens.clone()
+        // Reference tokens (the strong cross-book bridge) plus a native
+        // (currency, amount) key so unbridged rows -- GA postings with no
+        // reference -- can still pair on an exact amount.
+        let mut k = tx.tokens.clone();
+        if tx.amt_cents > 0 {
+            k.push(fnv1a(&format!("AMT:{}:{}", tx.ccy, tx.amt_cents)));
+        }
+        k
     }
     fn cost(&self, a: &Tx, b: &Tx) -> Option<f64> {
-        // Candidacy already implies a shared reference token. Score by date
-        // proximity, plus a fixed per-leg activation cost (epsilon) so the
-        // solver prefers tight 1-to-1 / small groups over sprawl.
+        // Tier by confidence. A shared reference token is the trustworthy
+        // signal (it survives 1-to-many splits); an exact native amount with
+        // no reference is weaker and only allowed within a date window.
+        let ref_bridge = a.tokens.iter().any(|t| b.tokens.contains(t));
+        let amt_match = a.ccy == b.ccy && a.amt_cents == b.amt_cents && a.amt_cents > 0;
         let dd = (a.gl_day - b.gl_day).abs() as f64;
-        Some(1.0 + dd * 0.002 + 0.5)
+        let eps = 0.5; // per-leg activation: discourage sprawl
+        if ref_bridge {
+            // Trusted: cheapest when the amount also agrees (clean 1-to-1).
+            Some(1.0 + eps + dd * 0.002 + if amt_match { 0.0 } else { 0.5 })
+        } else if amt_match {
+            if dd > 92.0 {
+                return None; // amount-only across distant dates: coincidence
+            }
+            Some(4.0 + eps + dd * 0.02)
+        } else {
+            None // no signal
+        }
     }
 }
 
@@ -143,6 +165,8 @@ fn main() {
         let row = row.expect("row");
         let (mut co, mut icp) = (String::new(), String::new());
         let (mut usd, mut gl) = (0.0, 0i64);
+        let (mut bccy, mut tccy) = (String::new(), String::new());
+        let (mut trx, mut fc) = (0.0, 0.0);
         let (mut refr, mut ref2, mut desc, mut remark, mut inv) =
             (String::new(), String::new(), String::new(), String::new(), String::new());
         let mut is_off = false;
@@ -152,6 +176,10 @@ fn main() {
                 "icp" => icp = fstr(f),
                 "indicative_usd_amt" => usd = fdouble(f),
                 "gl_date" => gl = fday(f),
+                "base_currency" => bccy = fstr(f),
+                "trx_currency" => tccy = fstr(f),
+                "trx_amt" => trx = fdouble(f),
+                "fc_amt" => fc = fdouble(f),
                 "reference" => refr = fstr(f),
                 "reference2" => ref2 = fstr(f),
                 "description" => desc = fstr(f),
@@ -172,12 +200,21 @@ fn main() {
         {
             continue;
         }
+        // Native amount: transaction currency, falling back to base when the
+        // transaction amount is blank.
+        let (ccy_s, amt) = if trx.abs() >= 0.005 {
+            (tccy.as_str(), trx)
+        } else {
+            (bccy.as_str(), fc)
+        };
         let toks = tokens(&[&refr, &ref2, &desc, &remark, &inv]);
         raws.push(Raw {
             unit,
             tx: Tx {
                 usd_cents: (usd * 100.0).round() as i64,
                 gl_day: gl,
+                ccy: fnv1a(ccy_s),
+                amt_cents: (amt.abs() * 100.0).round() as i64,
                 tokens: toks,
             },
         });
@@ -194,11 +231,26 @@ fn main() {
     let mut agg = Stats::default();
     let mut per_unit: Vec<(String, usize, usize, usize, i64)> = Vec::new();
     let mut rate_buckets = [0usize; 5]; // <20,<50,<80,<95,>=95 % matched
+    let mut one_sided = 0usize; // units with rows on only one side (unmatchable)
+    let mut unit_net_abs = 0i64; // sum of |unit net| = irreducible residual
     let t1 = std::time::Instant::now();
     for (unit, txs) in &units {
         if unit.0 == unit.1 {
             continue; // self-pair (icp == company): not a counterparty
         }
+        let pos = txs.iter().filter(|t| t.usd_cents > 0).count();
+        if pos == 0 || pos == txs.len() {
+            one_sided += 1;
+            continue; // nothing to reconcile against
+        }
+        let pos = txs.iter().filter(|t| t.usd_cents > 0).count();
+        if pos == 0 || pos == txs.len() {
+            one_sided += 1;
+            continue; // nothing to reconcile against
+        }
+        // Irreducible residual: a unit's total net is what stays unreconciled
+        // no matter how we group (conservation).
+        unit_net_abs += txs.iter().map(|t| t.usd_cents).sum::<i64>().abs();
         let s = run_unit(txs);
         let rate = s.matched_rows as f64 / txs.len().max(1) as f64;
         rate_buckets[match rate {
@@ -231,16 +283,34 @@ fn main() {
 
     println!("\n=== totals over {} units ===", units.len());
     println!("  rows                : {}", agg.rows);
-    println!("  matched rows        : {} ({:.1}%)", agg.matched_rows, 100.0 * agg.matched_rows as f64 / agg.rows.max(1) as f64);
+    println!(
+        "  matched rows        : {} ({:.1}% by count)",
+        agg.matched_rows,
+        100.0 * agg.matched_rows as f64 / agg.rows.max(1) as f64
+    );
+    println!(
+        "  matched value       : {:.0} of {:.0} usd ({:.1}% by value)",
+        agg.matched_value as f64 / 100.0,
+        agg.total_value as f64 / 100.0,
+        100.0 * agg.matched_value as f64 / agg.total_value.max(1) as f64
+    );
     println!("  groups              : {}", agg.groups);
     println!("    1-to-1            : {}", agg.one_to_one);
     println!("    1-to-many         : {}", agg.one_to_many);
     println!("  clean groups (<=$1) : {}", agg.clean_groups);
-    println!("  sum |residual| usd  : {:.2}", agg.residual_abs as f64 / 100.0);
+    println!(
+        "  group gross residual: {:.2} usd (incl. genuine large-value discrepancies)",
+        agg.residual_abs as f64 / 100.0
+    );
+    println!(
+        "  irreducible residual: {:.2} usd (sum of |unit net| -- the real unreconciled total)",
+        unit_net_abs as f64 / 100.0
+    );
     println!(
         "  unit matched-rate   : <20%={} <50%={} <80%={} <95%={} >=95%={}",
         rate_buckets[0], rate_buckets[1], rate_buckets[2], rate_buckets[3], rate_buckets[4]
     );
+    println!("  one-sided units     : {} (no counterparty rows; excluded above)", one_sided);
     println!("  solve wall time     : {:.2?}", solve_time);
 }
 
@@ -248,6 +318,8 @@ fn main() {
 struct Stats {
     rows: usize,
     matched_rows: usize,
+    total_value: i64,
+    matched_value: i64,
     groups: usize,
     one_to_one: usize,
     one_to_many: usize,
@@ -258,6 +330,8 @@ impl Stats {
     fn add(&mut self, o: &Stats) {
         self.rows += o.rows;
         self.matched_rows += o.matched_rows;
+        self.total_value += o.total_value;
+        self.matched_value += o.matched_value;
         self.groups += o.groups;
         self.one_to_one += o.one_to_one;
         self.one_to_many += o.one_to_many;
@@ -275,11 +349,13 @@ fn run_unit(txs: &[Tx]) -> Stats {
     let groups = r.groups();
     let mut s = Stats {
         rows: txs.len(),
+        total_value: txs.iter().map(|t| t.usd_cents.abs()).sum(),
         ..Default::default()
     };
     for g in &groups {
         s.groups += 1;
         s.matched_rows += g.members.len();
+        s.matched_value += g.members.iter().map(|id| txs[*id as usize].usd_cents.abs()).sum::<i64>();
         if g.members.len() <= 2 {
             s.one_to_one += 1;
         } else {
