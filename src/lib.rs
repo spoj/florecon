@@ -1,6 +1,6 @@
 //! florecon — incremental financial reconciliation via min-cost transportation.
 //!
-//! Two layers:
+//! Four layers, each a thin lowering of the one above:
 //!
 //! - [`net`] — a domain-agnostic network-simplex engine with stable
 //!   [`net::NodeId`]/[`net::ArcId`] handles, single-dummy transportation model,
@@ -9,6 +9,17 @@
 //! - [`recon`] — an ergonomic facade: describe your domain once via
 //!   [`recon::Model`], then drive it with `upsert` / `remove` / `solve` and read
 //!   back netted [`recon::Group`]s.
+//! - [`strategy`] — a combinator algebra over an unordered bag of items:
+//!   `Strategy: Bag -> (Groups, residual)`, conserving by construction. Cheap
+//!   deterministic primitives (`exact_1to1`, `agg_net`, `signal_group`,
+//!   `running_zero`) cascade ahead of the `flow` arbiter via `seq`,
+//!   `partition_by`, and `windowed`.
+//! - [`api`] — the consumption surface: a serializable [`api::Plan`] (the
+//!   strategy tree as data), a stateful [`api::Session`] that owns rows
+//!   natively, and a relational [`api::Report`]. Conservation is enforced at
+//!   the boundary, so a malformed plan degrades to a bad proposal, never a
+//!   broken ledger. With the `wasm` feature, [`wasm`] exports this as a
+//!   single C-ABI module any runtime (wasmtime, browser) can drive.
 //!
 //! Enable the `serde` feature to serialize [`net::Snapshot`] / `ReconSnapshot`
 //! to disk and warm-start next month off this month's tree.
