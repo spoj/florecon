@@ -104,7 +104,7 @@ impl Row {
 
 /// A reconciliation pipeline expressed as data. Compiles to the closure-based
 /// combinators of [`crate::strategy`]; every leaf references columns by name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "op", rename_all = "snake_case"))]
 pub enum Plan {
@@ -145,7 +145,79 @@ pub enum Plan {
         tokens: String,
         penalty: f64,
         window: i64,
+        /// The cost model as data. Omitted in serialized plans means the
+        /// default reference-bridge > exact-amount cascade.
+        #[cfg_attr(feature = "serde", serde(default))]
+        cost: CostSpec,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Flow cost model as data
+// ---------------------------------------------------------------------------
+
+/// A predicate on a candidate pair, evaluated by the flow [`CostSpec`].
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Cond {
+    /// The two rows share at least one reference token.
+    TokenShared,
+    /// The two rows have equal, non-zero absolute native amount.
+    AmountEqual,
+}
+
+/// One confidence tier. A candidate pair takes the first tier whose `when`
+/// conditions all hold and whose `|Δday|` is within `max_day`; its cost is
+/// `base + day_slope * |Δday|`. A pair matched by no tier is forbidden.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CostTier {
+    pub when: Vec<Cond>,
+    pub base: f64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub day_slope: f64,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_day: Option<i64>,
+}
+
+/// The flow arbiter's cost model as ordered confidence tiers. This is the last
+/// piece of strategy that used to be hardcoded; making it data closes the gap
+/// between the serializable [`Plan`] and the closure-based strategy algebra.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CostSpec {
+    pub tiers: Vec<CostTier>,
+}
+
+impl Default for CostSpec {
+    /// The interco cascade: a shared reference token (cheapest, then cheaper
+    /// still if the amount also matches) outranks an exact native amount, which
+    /// is only trusted within a 92-day window.
+    fn default() -> Self {
+        CostSpec {
+            tiers: vec![
+                CostTier {
+                    when: vec![Cond::TokenShared, Cond::AmountEqual],
+                    base: 1.5,
+                    day_slope: 0.002,
+                    max_day: None,
+                },
+                CostTier {
+                    when: vec![Cond::TokenShared],
+                    base: 2.0,
+                    day_slope: 0.002,
+                    max_day: None,
+                },
+                CostTier {
+                    when: vec![Cond::AmountEqual],
+                    base: 4.5,
+                    day_slope: 0.02,
+                    max_day: Some(92),
+                },
+            ],
+        }
+    }
 }
 
 /// Errors from compiling or running a [`Plan`].
@@ -189,6 +261,7 @@ struct PlanModel {
     tokens: usize,
     penalty: f64,
     window: i64,
+    cost: CostSpec,
 }
 
 impl Model for PlanModel {
@@ -217,29 +290,33 @@ impl Model for PlanModel {
         keys
     }
     fn cost(&self, a: &Row, b: &Row) -> Option<f64> {
-        let shared = {
+        let token_shared = {
             let bt = b.tokens(self.tokens);
             a.tokens(self.tokens).iter().any(|t| bt.contains(t))
         };
-        let amt_match = {
+        let amount_equal = {
             let (na, nb) = (a.int(self.native), b.int(self.native));
             na != 0 && na.abs() == nb.abs()
         };
-        let dd = (a.int(self.day) - b.int(self.day)).abs() as f64;
-        let eps = 0.5;
-        // Confidence tiers: a shared reference token is the strongest signal,
-        // exact native amount next (but only within a date window); otherwise
-        // forbid the pair.
-        if shared {
-            Some(1.0 + eps + dd * 0.002 + if amt_match { 0.0 } else { 0.5 })
-        } else if amt_match {
-            if dd > 92.0 {
-                return None;
+        let dd = (a.int(self.day) - b.int(self.day)).abs();
+        // First tier whose conditions hold and whose date gap is in range wins;
+        // a pair matched by no tier is forbidden (no arc).
+        for tier in &self.cost.tiers {
+            let holds = tier.when.iter().all(|c| match c {
+                Cond::TokenShared => token_shared,
+                Cond::AmountEqual => amount_equal,
+            });
+            if !holds {
+                continue;
             }
-            Some(4.0 + eps + dd * 0.02)
-        } else {
-            None
+            if let Some(md) = tier.max_day
+                && dd > md
+            {
+                continue; // out of range for this tier; try a looser one
+            }
+            return Some(tier.base + tier.day_slope * dd as f64);
         }
+        None
     }
 }
 
@@ -303,6 +380,7 @@ fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiEr
             tokens,
             penalty,
             window,
+            cost,
         } => flow(PlanModel {
             amount: schema.index(amount)?,
             day: schema.index(day)?,
@@ -310,6 +388,7 @@ fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiEr
             tokens: schema.index(tokens)?,
             penalty: *penalty,
             window: *window,
+            cost: cost.clone(),
         }),
     })
 }
@@ -753,6 +832,7 @@ mod tests {
                     tokens: "tokens".into(),
                     penalty: 1000.0,
                     window: 30,
+                    cost: CostSpec::default(),
                 },
             ],
         }
@@ -854,6 +934,60 @@ mod tests {
         s.upsert(2, row(-100, 2, 0, -100, &[])).unwrap();
         let rep = s.solve(&back).unwrap();
         assert_eq!(rep.assignments.len(), 2);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn flow_cost_defaults_when_omitted() {
+        // A serialized Flow node without a `cost` field fills the default
+        // cascade, so existing plans keep working and the data-driven cost is
+        // backward compatible.
+        let json = r#"{"op":"flow","amount":"usd","day":"day","native":"native","tokens":"tokens","penalty":1000.0,"window":30}"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        match plan {
+            Plan::Flow { cost, .. } => assert_eq!(cost, CostSpec::default()),
+            _ => panic!("expected flow"),
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn custom_cost_spec_round_trips_and_steers() {
+        // A hand-authored cost: only a shared token may pair, exact amount is
+        // forbidden. Two equal-amount rows with no shared token must NOT match.
+        let plan = Plan::Seq {
+            steps: vec![Plan::Flow {
+                amount: "usd".into(),
+                day: "day".into(),
+                native: "native".into(),
+                tokens: "tokens".into(),
+                penalty: 1000.0,
+                window: -1,
+                cost: CostSpec {
+                    tiers: vec![CostTier {
+                        when: vec![Cond::TokenShared],
+                        base: 1.0,
+                        day_slope: 0.0,
+                        max_day: None,
+                    }],
+                },
+            }],
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(plan, serde_json::from_str::<Plan>(&json).unwrap());
+
+        let mut s = Session::new(schema());
+        s.upsert(1, row(100, 1, 0, 100, &[])).unwrap(); // equal amount,
+        s.upsert(2, row(-100, 2, 0, -100, &[])).unwrap(); // no shared token
+        let rep = s.solve(&plan).unwrap();
+        assert_eq!(rep.groups.len(), 0, "amount-only forbidden by this cost");
+        assert_eq!(rep.residual.len(), 2);
+
+        // Give them a shared token and the same cost now pairs them.
+        s.upsert(1, row(100, 1, 0, 100, &[7])).unwrap();
+        s.upsert(2, row(-100, 2, 0, -100, &[7])).unwrap();
+        let rep = s.solve(&plan).unwrap();
+        assert_eq!(rep.groups.len(), 1);
     }
 
     fn ws_conserves(ws: &Workspace) {
