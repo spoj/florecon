@@ -18,9 +18,12 @@ SCHEMA = json.load(open(ROOT / "schema" / "plan.schema.json"))
 
 def validate(path: Path) -> None:
     doc = json.load(open(path))
-    jsonschema.validate(doc, SCHEMA)
+    # A workbench bundle (web/data.json) carries extra UI fields alongside the
+    # request; project to the SolveRequest subset the contract defines.
+    req = {k: doc[k] for k in ("schema", "rows", "plan") if k in doc}
+    jsonschema.validate(req, SCHEMA)
     v = SCHEMA["x-contract-version"]
-    print(f"{path}: valid SolveRequest (contract v{v})")
+    print(f"{path}: valid SolveRequest (contract v{v}, {len(req.get('rows', []))} rows)")
 
 
 def main() -> None:
