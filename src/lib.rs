@@ -38,6 +38,7 @@
 
 pub mod net;
 pub mod recon;
+pub mod strategy;
 
 pub use net::{ArcId, Network, NodeId, SolveStatus};
 pub use recon::{ExtId, Group, Model, Reconciler};
