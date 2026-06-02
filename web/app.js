@@ -1,7 +1,7 @@
-import { Florecon } from "./florecon.js";
+import { Florecon } from "./core/florecon.js";
 
 const TOL = 100; // group is "clean" if |net| <= 1.00 native unit
-const WASM = "../target/wasm32-unknown-unknown/release/florecon.wasm";
+const WASM = "./core/engine.wasm";
 const DATA = "./data.json";
 
 const DIMS = [

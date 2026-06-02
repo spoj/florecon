@@ -1,11 +1,11 @@
 // Node smoke test for the browser host ABI against real data.
 //   node web/smoke.mjs
 import { readFileSync } from "fs";
-import { Florecon } from "./florecon.js";
+import { Florecon } from "./core/florecon.js";
 
 const here = new URL(".", import.meta.url);
 const rel = (p) => new URL(p, here);
-const wasm = readFileSync(rel("../target/wasm32-unknown-unknown/release/florecon.wasm"));
+const wasm = readFileSync(rel("core/engine.wasm"));
 const { instance } = await WebAssembly.instantiate(wasm, {});
 const fe = new Florecon(instance);
 const data = JSON.parse(readFileSync(rel("data.json"), "utf8"));

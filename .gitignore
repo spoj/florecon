@@ -6,3 +6,4 @@ py/src/florecon/_engine.wasm
 py/dist/
 py/build/
 **/*.egg-info/
+web/core/engine.wasm

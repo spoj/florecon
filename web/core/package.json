@@ -1,0 +1,16 @@
+{
+  "name": "@florecon/core",
+  "version": "0.1.0",
+  "description": "Browser/Node host for the florecon reconciliation engine — a single WASM core driven over linear memory. Nothing created, nothing lost.",
+  "type": "module",
+  "main": "florecon.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": "./florecon.js",
+    "./engine.wasm": "./engine.wasm"
+  },
+  "files": ["florecon.js", "index.d.ts", "engine.wasm"],
+  "license": "MIT",
+  "repository": "github:florecon/florecon",
+  "keywords": ["reconciliation", "wasm", "finance", "min-cost-flow"]
+}
