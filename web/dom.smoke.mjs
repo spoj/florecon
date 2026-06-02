@@ -21,6 +21,11 @@ async function freshDom() {
   const html = readFileSync(new URL("index.html", here), "utf8");
   const dom = new JSDOM(html, { url: "http://localhost/web/", pretendToBeVisual: true });
   const { window } = dom;
+  // index.html links styles.css; jsdom won't fetch it, so inline it here so the
+  // document has its rules available.
+  const style = window.document.createElement("style");
+  style.textContent = readFileSync(new URL("styles.css", here), "utf8");
+  window.document.head.appendChild(style);
   Object.assign(global, {
     window, document: window.document, FileReader: window.FileReader,
     File: window.File, Event: window.Event, localStorage: window.localStorage,
@@ -39,6 +44,16 @@ async function freshDom() {
   return (id) => window.document.getElementById(id);
 }
 const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The `.setup` overlay is `position:fixed; display:flex`, which beats the UA
+// `[hidden]{display:none}` on specificity — so toggling the `hidden` attribute
+// would NOT hide it without an explicit override. jsdom does not reproduce that
+// cascade (it forces `[hidden]`->none regardless), so guard the fix statically.
+{
+  const css = readFileSync(new URL("styles.css", here), "utf8");
+  ok(/\[hidden\]\s*\{[^}]*display:\s*none\s*!important/.test(css),
+    "styles.css must force [hidden] { display: none !important } so overlays can hide");
+}
 
 // --- upload path ----------------------------------------------------------
 {

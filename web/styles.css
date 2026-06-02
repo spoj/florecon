@@ -18,6 +18,9 @@
 }
 
 * { box-sizing: border-box; }
+/* The `hidden` attribute must beat author `display` rules (e.g. .setup is a
+   flex overlay); without this it would stay visible when toggled hidden. */
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body {
   background: var(--bg);
