@@ -26,8 +26,7 @@ use crate::flow::{ExtId, Model};
 /// breaking change to those shapes.
 pub const CONTRACT_VERSION: u32 = 2;
 use crate::strategy::{
-    Item, ShardKey, Strategy, agg_net, exact_1to1, flow, flow_cached, partition_by, seq,
-    signal_group, windowed,
+    Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -343,27 +342,28 @@ impl Model for PlanModel {
 // Compiler: Plan -> Strategy<Row>
 // ---------------------------------------------------------------------------
 
-fn compile(
-    plan: &Plan,
-    schema: &Schema,
-    partition_cols: &[usize],
-    stateful: bool,
-) -> Result<Box<dyn Strategy<Row>>, ApiError> {
+fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<Row>>, ApiError> {
     Ok(match plan {
         Plan::Seq { steps } => {
             let mut compiled = Vec::with_capacity(steps.len());
             for s in steps {
-                compiled.push(compile(s, schema, partition_cols, stateful)?);
+                compiled.push(compile(s, schema)?);
             }
             seq(compiled)
         }
         Plan::Partition { by, inner } => {
             let k = schema.index(by)?;
-            // Accumulate this partition column so the warm flow leaf below can
-            // recover the full shard-key path from a row.
-            let mut cols = partition_cols.to_vec();
-            cols.push(k);
-            partition_by(move |r: &Row| r.int(k), compile(inner, schema, &cols, stateful)?)
+            // Validate the inner subtree once, eagerly, so a bad plan is an
+            // error here rather than a panic in the factory below.
+            compile(inner, schema)?;
+            // Each shard gets its OWN child subtree (and therefore its own warm
+            // flow `Matcher`), built on demand by this factory. Per-shard
+            // warm-start is then automatic — the flow leaf never learns it is
+            // sharded. Recompiling the same validated plan cannot fail.
+            let inner = (**inner).clone();
+            let schema = schema.clone();
+            let factory = move || compile(&inner, &schema).expect("inner plan already validated");
+            partition_by(move |r: &Row| r.int(k), factory)
         }
         Plan::Windowed {
             order,
@@ -371,11 +371,7 @@ fn compile(
             inner,
         } => {
             let o = schema.index(order)?;
-            windowed(
-                move |r: &Row| r.int(o),
-                *width,
-                compile(inner, schema, partition_cols, stateful)?,
-            )
+            windowed(move |r: &Row| r.int(o), *width, compile(inner, schema)?)
         }
         Plan::AggNet { key, amount, tol } => {
             let (k, a) = (schema.index(key)?, schema.index(amount)?);
@@ -423,17 +419,8 @@ fn compile(
                 window: *window,
                 cost: cost.clone(),
             };
-            if stateful {
-                // Warm leaf: the shard key is the tuple of accumulated
-                // partition-column values read off each row.
-                let cols = partition_cols.to_vec();
-                flow_cached(model, move |r: &Row| -> ShardKey {
-                    cols.iter().map(|&i| r.int(i)).collect()
-                })
-            } else {
-                // Cold one-shot leaf (Session path), unchanged behavior.
-                flow(model)
-            }
+            // Stateful warm leaf; one-shot callers (Session) just run it once.
+            flow(model)
         }
     })
 }
@@ -537,7 +524,7 @@ impl Session {
     /// Verifies conservation before returning.
     pub fn solve(&self, plan: &Plan) -> Result<Report, ApiError> {
         // Session is a stateless one-shot: compile the cold flow leaf.
-        let mut strategy = compile(plan, &self.schema, &[], false)?;
+        let mut strategy = compile(plan, &self.schema)?;
         // Materialize in id order for deterministic candidate generation.
         let bag: Vec<Item<Row>> = self
             .rows
@@ -1018,7 +1005,7 @@ impl Workspace {
     pub fn new(schema: Schema, plan: Plan) -> Result<Self, ApiError> {
         // The interactive workspace persists across solves (Recon stores the
         // strategy once), so compile the warm, shard-keyed flow leaf.
-        let strategy = compile(&plan, &schema, &[], true)?;
+        let strategy = compile(&plan, &schema)?;
         Ok(Workspace {
             schema,
             inner: Recon::new(strategy),

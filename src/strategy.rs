@@ -117,13 +117,17 @@ pub fn seq<E: 'static>(steps: Vec<Box<dyn Strategy<E>>>) -> Box<dyn Strategy<E>>
 
 struct PartitionBy<E, K, FK> {
     key: FK,
-    inner: Box<dyn Strategy<E>>,
-    _k: PhantomData<K>,
+    /// Builds a fresh child subtree the first time a shard key is seen.
+    factory: Box<dyn Fn() -> Box<dyn Strategy<E>>>,
+    /// One independent child per shard key. Each child owns its own state
+    /// (notably its own warm flow [`Matcher`]), so per-shard warm-start is
+    /// automatic and the flow leaf never needs to know it is sharded.
+    children: HashMap<K, Box<dyn Strategy<E>>>,
 }
 
 impl<E, K, FK> Strategy<E> for PartitionBy<E, K, FK>
 where
-    K: Hash + Eq,
+    K: Hash + Eq + Clone,
     FK: Fn(&E) -> K,
 {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
@@ -131,10 +135,21 @@ where
         for item in bag {
             shards.entry((self.key)(&item.data)).or_default().push(item);
         }
+        // Re-run existing children whose shard received no items this solve with
+        // an empty bag, so their warm state drops the departed rows instead of
+        // retaining stale members until the shard happens to reappear.
+        for k in self.children.keys() {
+            shards.entry(k.clone()).or_default();
+        }
+        // Split the borrows: `factory` builds new children, `children` is the
+        // map being mutated. Both fields, disjoint, so no clone of self.
+        let factory = &self.factory;
+        let children = &mut self.children;
         let mut groups = Vec::new();
         let mut residual = Vec::new();
-        for (_k, items) in shards {
-            let r = self.inner.run(items);
+        for (k, items) in shards {
+            let child = children.entry(k).or_insert_with(|| factory());
+            let r = child.run(items);
             groups.extend(r.groups);
             residual.extend(r.residual);
         }
@@ -142,18 +157,22 @@ where
     }
 }
 
-/// Fork/join: split the bag by a key, run `inner` on each shard independently,
-/// then merge. Embarrassingly parallel; this is how sharding (e.g. by bilateral
-/// pair or by currency) is expressed.
-pub fn partition_by<E: 'static, K, FK>(key: FK, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>>
+/// Fork/join: split the bag by a key and run an independent child subtree on
+/// each shard, then merge. `factory` builds a child the first time a shard key
+/// is seen; each child keeps its own (warm) state across solves. This is how
+/// sharding (e.g. by bilateral pair or by currency) is expressed — and what
+/// makes per-shard warm-start fall out for free, since each shard's flow leaf is
+/// a distinct `Matcher` that only ever sees that shard's rows.
+pub fn partition_by<E: 'static, K, FK, FF>(key: FK, factory: FF) -> Box<dyn Strategy<E>>
 where
-    K: Hash + Eq + 'static,
+    K: Hash + Eq + Clone + 'static,
     FK: Fn(&E) -> K + 'static,
+    FF: Fn() -> Box<dyn Strategy<E>> + 'static,
 {
     Box::new(PartitionBy {
         key,
-        inner,
-        _k: PhantomData,
+        factory: Box::new(factory),
+        children: HashMap::new(),
     })
 }
 
@@ -513,8 +532,20 @@ where
     })
 }
 
-struct Flow<M> {
+/// The global arbiter leaf, kept *warm*. It owns one min-cost-flow [`Matcher`]
+/// and the id set currently loaded into it (`present`). Each `run` applies only
+/// the membership delta — upsert new ids, remove departed ones — then re-solves,
+/// reusing the cached simplex basis, so a no-op recalc costs microseconds rather
+/// than a full cold solve. A *fresh* leaf (first run, or one rebuilt per solve
+/// by the batch [`Session`](crate::plan::Session) path) simply has an empty
+/// `present`, so its first solve *is* the cold solve — warm vs cold is decided
+/// purely by whether the caller keeps the compiled strategy alive. Sharding is
+/// the caller's job: [`partition_by`] gives each shard its own `Flow`, so this
+/// leaf only ever sees one shard's rows.
+struct Flow<M: Model> {
     model: M,
+    matcher: Matcher<M>,
+    present: BTreeSet<ExtId>,
 }
 
 impl<M> Strategy<M::Tx> for Flow<M>
@@ -524,32 +555,71 @@ where
 {
     fn run(&mut self, bag: Vec<Item<M::Tx>>) -> Resolution<M::Tx> {
         let timed = std::env::var_os("FLORECON_TIME").is_some();
-        let mut rec = Matcher::new(self.model.clone());
+        let want: BTreeSet<ExtId> = bag.iter().map(|i| i.id).collect();
+        // id -> payload references (no clones unless we actually upsert).
+        let data: HashMap<ExtId, &M::Tx> = bag.iter().map(|i| (i.id, &i.data)).collect();
+
+        // Diff want vs present. Upsert adds in a deterministic *scrambled* order
+        // (see `flow_upsert_rank`): a monotone id order is a pathological
+        // network-simplex pivot sequence, and scrambling also makes a cold first
+        // build agree bit-for-bit with a shard that was grown warm.
+        let mut adds: Vec<ExtId> = want.difference(&self.present).copied().collect();
+        adds.sort_by_key(|&id| flow_upsert_rank(id));
+        let drops: Vec<ExtId> = self.present.difference(&want).copied().collect();
+
         // Instant is only touched when profiling; wasm has no clock source.
         let tb = timed.then(std::time::Instant::now);
-        // Upsert in a deterministic *scrambled* order (a stable hash of the
-        // id), not ascending id. The order is a pure function of the id, so
-        // cold (here) and warm (`flow_cached`) agree and the result is
-        // reproducible across builds. We avoid sorting by raw id because a
-        // monotone insertion order is a pathological network-simplex pivot
-        // sequence (≈2x more pivots on the interco sample); scrambling spreads
-        // the augmenting paths and is robust across datasets.
-        let mut order: Vec<usize> = (0..bag.len()).collect();
-        order.sort_by_key(|&i| flow_upsert_rank(bag[i].id));
-        for &i in &order {
-            rec.upsert(bag[i].id, bag[i].data.clone());
+        for id in adds {
+            if let Some(tx) = data.get(&id) {
+                self.matcher.upsert(id, (*tx).clone());
+            }
+        }
+        for id in drops {
+            self.matcher.remove(id);
         }
         let build = tb.map(|t| t.elapsed().as_secs_f64() * 1000.0);
         let ts = timed.then(std::time::Instant::now);
-        let status = rec.solve();
+        let status = self.matcher.solve(); // warm when `present` was non-empty.
         if let (Some(build), Some(ts)) = (build, ts) {
             eprintln!(
-                "    flow: build {build:>6.1} ms ({} arcs), solve {:>6.1} ms",
-                rec.arc_count(), ts.elapsed().as_secs_f64() * 1000.0,
+                "    flow: delta {build:>6.1} ms ({} arcs), solve {:>6.1} ms",
+                self.matcher.arc_count(),
+                ts.elapsed().as_secs_f64() * 1000.0,
             );
         }
         debug_assert_eq!(status, SolveStatus::Optimal);
-        let groups = rec
+        self.present = want;
+
+        // Determinism guard: in debug builds (or when FLORECON_VERIFY_WARM is
+        // set) rebuild a fresh cold matcher on the same id set and assert the
+        // warm solution matches. The always-true invariant is the optimal
+        // *objective* (matched costs + unmatched penalties): a min-cost-flow
+        // optimum is unique in cost but can be degenerate in *which* equal-cost
+        // arcs carry flow, so the grouping is only guaranteed identical when the
+        // optimum is unique. This catches the real failure mode — a warm
+        // re-solve drifting to a different (or worse) objective — without
+        // false-positiving on benign tie re-grouping (see the
+        // `warm_flow_matches_cold_*` equivalence tests).
+        if cfg!(debug_assertions) || std::env::var_os("FLORECON_VERIFY_WARM").is_some() {
+            let mut cold = Matcher::new(self.model.clone());
+            let mut ids: Vec<ExtId> = data.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                if let Some(tx) = data.get(&id) {
+                    cold.upsert(id, (*tx).clone());
+                }
+            }
+            cold.solve();
+            let (warm_obj, cold_obj) = (self.matcher.objective(), cold.objective());
+            assert!(
+                (warm_obj - cold_obj).abs() < 1e-6,
+                "warm flow solve diverged from a fresh cold rebuild: \
+                 warm objective {warm_obj} != cold objective {cold_obj}"
+            );
+        }
+
+        let groups = self
+            .matcher
             .groups()
             .into_iter()
             .map(|g| Group {
@@ -558,7 +628,8 @@ where
                 net: g.net_base,
             })
             .collect();
-        let unmatched: std::collections::HashSet<ExtId> = rec.unmatched().into_iter().collect();
+        let unmatched: std::collections::HashSet<ExtId> =
+            self.matcher.unmatched().into_iter().collect();
         let residual = bag
             .into_iter()
             .filter(|i| unmatched.contains(&i.id))
@@ -570,22 +641,24 @@ where
 /// The global arbiter: hand the residual to the min-cost-flow engine, which
 /// resolves competing candidates into one consistent grouping. This is where
 /// *proposing* signals (reference + amount + date, via the `Model`) become a
-/// committed partition.
+/// committed partition. The returned leaf is *stateful* — it keeps its matcher
+/// warm across solves — but that is invisible to the caller: a one-shot solve
+/// just runs it once.
 pub fn flow<M>(model: M) -> Box<dyn Strategy<M::Tx>>
 where
     M: Model + Clone + 'static,
     M::Tx: Clone + 'static,
 {
-    Box::new(Flow { model })
+    Box::new(Flow {
+        matcher: Matcher::new(model.clone()),
+        model,
+        present: BTreeSet::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------
-// Warm-start flow leaf (stateful)
+// Flow determinism helper
 // ---------------------------------------------------------------------------
-
-/// The path of accumulated partition-key values identifying one flow shard
-/// (e.g. `(unit, ccy)`). The empty vec is the un-partitioned / global shard.
-pub type ShardKey = Vec<i64>;
 
 /// Deterministic, dataset-robust upsert rank for a flow node. The network
 /// simplex's pivot count depends on the order nodes/arcs are introduced; a
@@ -600,176 +673,6 @@ fn flow_upsert_rank(id: ExtId) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
-}
-
-/// One warm matcher kept alive for a single flow shard, plus the id set it
-/// currently holds. `present` lets a re-solve apply only the membership delta.
-struct WarmShard<M: Model> {
-    matcher: Matcher<M>,
-    present: BTreeSet<ExtId>,
-}
-
-/// Side table of warm matchers keyed by shard path, owned directly by the
-/// stateful [`flow_cached`] leaf (now that L2 nodes run with `&mut self`, no
-/// interior mutability is needed). It lives exactly as long as the compiled
-/// strategy tree — i.e. the lifetime of a `Recon` — so there is no
-/// cross-`Recon` persistence.
-struct FlowCache<M: Model> {
-    shards: HashMap<ShardKey, WarmShard<M>>,
-}
-
-struct FlowCached<M: Model, FK> {
-    cache: FlowCache<M>,
-    model: M,
-    key: FK,
-}
-
-impl<M, FK> Strategy<M::Tx> for FlowCached<M, FK>
-where
-    M: Model + Clone,
-    M::Tx: Clone,
-    FK: Fn(&M::Tx) -> ShardKey,
-{
-    fn run(&mut self, bag: Vec<Item<M::Tx>>) -> Resolution<M::Tx> {
-        // Split the field borrows up front: `key` reads rows, `cache` is mutated
-        // and `model` seeds new shards — all disjoint, so no RefCell is needed.
-        let FlowCached { cache, model, key } = self;
-        // Recover the shard key from the FIRST item: every row in a flow shard
-        // shares the same partition-key values by construction, and partition_by
-        // never produces an empty shard, so an empty bag here is the global
-        // (un-partitioned) case with the empty-vec key.
-        let shard_key: ShardKey = match bag.first() {
-            Some(item) => (key)(&item.data),
-            None => Vec::new(),
-        };
-        if bag.is_empty() {
-            return Resolution {
-                groups: Vec::new(),
-                residual: Vec::new(),
-            };
-        }
-        // Guard the cross-layer invariant this leaf depends on: `partition_by`
-        // (the layer above) must have routed a *homogeneous* shard here — every
-        // row sharing the same partition-key values. We recover the shard
-        // identity from `bag[0]` alone, so a heterogeneous bag would silently
-        // mis-key the warm cache and corrupt re-solves. Assert it can't.
-        debug_assert!(
-            bag.iter().all(|it| (key)(&it.data) == shard_key),
-            "flow_cached received a heterogeneous shard: all rows must share the \
-             same partition-key path (broken partition_by invariant)"
-        );
-
-        let timed = std::env::var_os("FLORECON_TIME").is_some();
-        let want: BTreeSet<ExtId> = bag.iter().map(|i| i.id).collect();
-        // id -> payload references (no clones unless we actually upsert).
-        let data: HashMap<ExtId, &M::Tx> = bag.iter().map(|i| (i.id, &i.data)).collect();
-
-        let shard = cache.shards.entry(shard_key).or_insert_with(|| WarmShard {
-            matcher: Matcher::new(model.clone()),
-            present: BTreeSet::new(),
-        });
-
-        // Diff want vs present: add what is new to the flow, drop what left.
-        // Upsert the adds in the same deterministic scrambled order the cold
-        // `flow` leaf uses (see `flow_upsert_rank`), so a first (cold) build of
-        // a shard agrees with the stateless cold solve and avoids the
-        // monotone-id pivot pathology.
-        let mut adds: Vec<ExtId> = want.difference(&shard.present).copied().collect();
-        adds.sort_by_key(|&id| flow_upsert_rank(id));
-        let drops: Vec<ExtId> = shard.present.difference(&want).copied().collect();
-        let tb = timed.then(std::time::Instant::now);
-        for id in adds {
-            if let Some(tx) = data.get(&id) {
-                shard.matcher.upsert(id, (*tx).clone());
-            }
-        }
-        for id in drops {
-            shard.matcher.remove(id);
-        }
-        let build = tb.map(|t| t.elapsed().as_secs_f64() * 1000.0);
-        let ts = timed.then(std::time::Instant::now);
-        let status = shard.matcher.solve(); // WARM: reuses the cached basis.
-        if let (Some(build), Some(ts)) = (build, ts) {
-            eprintln!(
-                "    flow_cached: delta {build:>6.1} ms ({} arcs), solve {:>6.1} ms",
-                shard.matcher.arc_count(),
-                ts.elapsed().as_secs_f64() * 1000.0,
-            );
-        }
-        debug_assert_eq!(status, SolveStatus::Optimal);
-        shard.present = want;
-
-        // Determinism guard: in debug builds (or when FLORECON_VERIFY_WARM is
-        // set) rebuild a fresh cold matcher on the same shard and assert the
-        // warm solution is identical to the cold one. The always-true invariant
-        // is the optimal *objective* (matched costs + unmatched penalties): a
-        // min-cost-flow optimum is unique in cost but can be degenerate in
-        // *which* equal-cost arcs carry flow, so the connected-component
-        // grouping is only guaranteed identical when the optimum is unique.
-        // This guard catches the real failure mode — a warm re-solve drifting to
-        // a different (or worse) objective — without false-positiving on benign
-        // tie re-grouping. When the optimum is unique the group sets match too
-        // (see the `warm_flow_matches_cold_*` equivalence tests).
-        if cfg!(debug_assertions) || std::env::var_os("FLORECON_VERIFY_WARM").is_some() {
-            let mut cold = Matcher::new(model.clone());
-            let mut ids: Vec<ExtId> = data.keys().copied().collect();
-            ids.sort_unstable();
-            for id in ids {
-                if let Some(tx) = data.get(&id) {
-                    cold.upsert(id, (*tx).clone());
-                }
-            }
-            cold.solve();
-            let (warm_obj, cold_obj) = (shard.matcher.objective(), cold.objective());
-            assert!(
-                (warm_obj - cold_obj).abs() < 1e-6,
-                "warm flow solve diverged from a fresh cold rebuild: \
-                 warm objective {warm_obj} != cold objective {cold_obj}"
-            );
-        }
-
-        let groups = shard
-            .matcher
-            .groups()
-            .into_iter()
-            .map(|g| Group {
-                members: g.members,
-                origin: "flow",
-                net: g.net_base,
-            })
-            .collect();
-        let unmatched: std::collections::HashSet<ExtId> =
-            shard.matcher.unmatched().into_iter().collect();
-        let residual = bag
-            .into_iter()
-            .filter(|i| unmatched.contains(&i.id))
-            .collect();
-        Resolution { groups, residual }
-    }
-}
-
-/// A stateful twin of [`flow`] that keeps one warm [`Matcher`] alive per shard
-/// (keyed by the accumulated partition-key path via `key`) across solves. On
-/// each `run` it applies only the membership delta (`upsert` new ids, `remove`
-/// departed ids) and warm-re-solves, so a no-op recalc costs microseconds
-/// instead of the full cold simplex. Emits the same `"flow"` groups + unmatched
-/// residual as the stateless [`flow`]. The warm state is owned directly by the
-/// leaf (plain `&mut self` fields, no interior mutability), so it persists for
-/// as long as the compiled strategy tree (the lifetime of a `Recon`) and is
-/// dropped with it.
-pub fn flow_cached<M, FK>(model: M, key: FK) -> Box<dyn Strategy<M::Tx>>
-where
-    M: Model + Clone + 'static,
-    M::Tx: Clone + 'static,
-    FK: Fn(&M::Tx) -> ShardKey + 'static,
-{
-    Box::new(FlowCached {
-        cache: FlowCache {
-            shards: HashMap::new(),
-        },
-        model,
-        key,
-    })
 }
 
 #[cfg(test)]
@@ -907,7 +810,7 @@ mod tests {
     fn seq_then_partition_compose() {
         let mut pipeline = partition_by(
             |a: &i64| a.signum().unsigned_abs(), // silly key just to exercise sharding
-            seq(vec![exact_1to1(|a: &i64| Some(a.unsigned_abs()), |a: &i64| *a)]),
+            || seq(vec![exact_1to1(|a: &i64| Some(a.unsigned_abs()), |a: &i64| *a)]),
         );
         let b = bag(&[(1, 4), (2, -4), (3, 4), (4, -4)]);
         let r = pipeline.run(b);
