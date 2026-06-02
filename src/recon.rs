@@ -39,13 +39,29 @@ pub trait Model {
 
     /// Cost of matching source `a` with sink `b`, or `None` to forbid the pair.
     fn cost(&self, a: &Self::Tx, b: &Self::Tx) -> Option<f64>;
+
+    /// Optional exact-join keys for candidate generation (e.g. hashed reference
+    /// tokens). Opposite-sign transactions that share any key become candidate
+    /// pairs, *in addition to* the `block_key` proximity window. This is how
+    /// non-ordinal signals (a reference that appears in the other book's
+    /// description) drive matching. Default: none.
+    fn match_keys(&self, _tx: &Self::Tx) -> Vec<u64> {
+        Vec::new()
+    }
 }
+
+/// Exact-join key buckets larger than this carry no discriminating signal
+/// (a reference shared by thousands of rows, or a ubiquitous round amount), so
+/// they are skipped during candidate generation to bound work.
+const MATCH_BUCKET_CAP: usize = 256;
 
 struct Entry<Tx> {
     node: NodeId,
     tx: Tx,
     key: i64,
     base: i64,
+    /// Exact-join keys this transaction is indexed under.
+    keys: Vec<u64>,
     /// Real arcs incident to this transaction, by the *other* endpoint's ExtId.
     arcs: Vec<(ExtId, crate::net::ArcId)>,
 }
@@ -57,6 +73,7 @@ struct EntrySer<Tx> {
     tx: Tx,
     key: i64,
     base: i64,
+    keys: Vec<u64>,
     arcs: Vec<(ExtId, crate::net::ArcId)>,
 }
 
@@ -70,6 +87,7 @@ pub struct ReconSnapshot<Tx> {
     net: crate::net::Snapshot,
     entries: Vec<(ExtId, EntrySer<Tx>)>,
     by_key: BTreeMap<i64, Vec<ExtId>>,
+    by_match_key: HashMap<u64, Vec<ExtId>>,
 }
 
 /// A reconciled group: a connected component of matched transactions.
@@ -89,6 +107,8 @@ pub struct Reconciler<M: Model> {
     entries: HashMap<ExtId, Entry<M::Tx>>,
     /// block_key -> set of ExtIds at that key (for windowed candidate lookup).
     by_key: BTreeMap<i64, Vec<ExtId>>,
+    /// exact-join key -> set of ExtIds carrying it (reference/amount bridges).
+    by_match_key: HashMap<u64, Vec<ExtId>>,
 }
 
 impl<M: Model> Reconciler<M> {
@@ -99,6 +119,7 @@ impl<M: Model> Reconciler<M> {
             net: Network::new(),
             entries: HashMap::new(),
             by_key: BTreeMap::new(),
+            by_match_key: HashMap::new(),
         }
     }
 
@@ -113,17 +134,22 @@ impl<M: Model> Reconciler<M> {
     pub fn upsert(&mut self, id: ExtId, tx: M::Tx) {
         let base = self.model.base_amount(&tx);
         let key = self.model.block_key(&tx);
+        let keys = self.model.match_keys(&tx);
 
         if self.entries.contains_key(&id) {
             // Drop the old candidate arcs and re-key; we will regenerate.
             self.detach_arcs(id);
-            let (old_node, old_key, old_base) = {
+            let (old_node, old_key, old_base, old_keys) = {
                 let e = &self.entries[&id];
-                (e.node, e.key, e.base)
+                (e.node, e.key, e.base, e.keys.clone())
             };
             if old_key != key {
                 self.unindex_key(old_key, id);
                 self.by_key.entry(key).or_default().push(id);
+            }
+            if old_keys != keys {
+                self.unindex_match_keys(id, &old_keys);
+                self.index_match_keys(id, &keys);
             }
             if old_base != base {
                 self.net.set_supply(old_node, base);
@@ -134,11 +160,13 @@ impl<M: Model> Reconciler<M> {
                 e.tx = tx;
                 e.key = key;
                 e.base = base;
+                e.keys = keys;
             }
             self.generate_arcs(id);
         } else {
             let node = self.net.add_node(base, self.model.penalty(&tx));
             self.by_key.entry(key).or_default().push(id);
+            self.index_match_keys(id, &keys);
             self.entries.insert(
                 id,
                 Entry {
@@ -146,6 +174,7 @@ impl<M: Model> Reconciler<M> {
                     tx,
                     key,
                     base,
+                    keys,
                     arcs: Vec::new(),
                 },
             );
@@ -157,6 +186,7 @@ impl<M: Model> Reconciler<M> {
     pub fn remove(&mut self, id: ExtId) {
         if let Some(e) = self.entries.remove(&id) {
             self.unindex_key(e.key, id);
+            self.unindex_match_keys(id, &e.keys);
             // Detach mirror references held by neighbors.
             for (other, _) in &e.arcs {
                 if let Some(oe) = self.entries.get_mut(other) {
@@ -240,26 +270,43 @@ impl<M: Model> Reconciler<M> {
 
     fn generate_arcs(&mut self, id: ExtId) {
         let window = self.model.window();
-        let (key, base, node) = {
+        let (key, base, node, keys) = {
             let e = &self.entries[&id];
-            (e.key, e.base, e.node)
+            (e.key, e.base, e.node, e.keys.clone())
         };
         if base == 0 {
             return;
         }
 
-        // Collect candidate partner ExtIds within the window and opposite sign.
-        let mut partners: Vec<ExtId> = Vec::new();
-        for (_k, ids) in self.by_key.range(key - window..=key + window) {
-            for &other in ids {
-                if other == id {
-                    continue;
+        // Collect candidate partners (opposite sign): the proximity window over
+        // block_key, plus everyone sharing an exact-join key. Dedup so the two
+        // sources can't create duplicate arcs.
+        let mut partners: std::collections::HashSet<ExtId> = std::collections::HashSet::new();
+        let consider = |this: &Self, other: ExtId, set: &mut std::collections::HashSet<ExtId>| {
+            if other == id {
+                return;
+            }
+            let ob = this.entries[&other].base;
+            if (base > 0) == (ob > 0) {
+                return; // same sign: not a source/sink pair
+            }
+            set.insert(other);
+        };
+        if window >= 0 {
+            for (_k, ids) in self.by_key.range(key - window..=key + window) {
+                for &other in ids {
+                    consider(self, other, &mut partners);
                 }
-                let ob = self.entries[&other].base;
-                if (base > 0) == (ob > 0) {
-                    continue; // same sign: not a source/sink pair
+            }
+        }
+        for k in &keys {
+            if let Some(ids) = self.by_match_key.get(k) {
+                if ids.len() > MATCH_BUCKET_CAP {
+                    continue; // non-discriminating bucket
                 }
-                partners.push(other);
+                for &other in ids {
+                    consider(self, other, &mut partners);
+                }
             }
         }
 
@@ -303,6 +350,23 @@ impl<M: Model> Reconciler<M> {
             }
         }
     }
+
+    fn index_match_keys(&mut self, id: ExtId, keys: &[u64]) {
+        for &k in keys {
+            self.by_match_key.entry(k).or_default().push(id);
+        }
+    }
+
+    fn unindex_match_keys(&mut self, id: ExtId, keys: &[u64]) {
+        for &k in keys {
+            if let Some(v) = self.by_match_key.get_mut(&k) {
+                v.retain(|x| *x != id);
+                if v.is_empty() {
+                    self.by_match_key.remove(&k);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -323,6 +387,7 @@ where
                         tx: e.tx.clone(),
                         key: e.key,
                         base: e.base,
+                        keys: e.keys.clone(),
                         arcs: e.arcs.clone(),
                     },
                 )
@@ -332,6 +397,7 @@ where
             net: self.net.snapshot(),
             entries,
             by_key: self.by_key.clone(),
+            by_match_key: self.by_match_key.clone(),
         }
     }
 }
@@ -353,6 +419,7 @@ impl<M: Model> Reconciler<M> {
                         tx: e.tx,
                         key: e.key,
                         base: e.base,
+                        keys: e.keys,
                         arcs: e.arcs,
                     },
                 )
@@ -363,6 +430,7 @@ impl<M: Model> Reconciler<M> {
             net: Network::restore(snap.net),
             entries,
             by_key: snap.by_key,
+            by_match_key: snap.by_match_key,
         }
     }
 }
