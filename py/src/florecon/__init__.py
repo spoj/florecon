@@ -11,10 +11,10 @@ native extension to compile.
         col("objsub", KEY), col("native", NUMBER), col("tokens", TOKENS),
     ])
     pln = P.partition("unit", P.partition("ccy", P.seq(
-        P.agg_net("objsub", "native", tol=100),
-        P.exact("native"),
-        P.signal("tokens", "native", tol=100, cap=256),
-        P.flow("native", day="day", tokens="tokens"),
+        P.agg_net("objsub", tol=100),
+        P.exact(),
+        P.signal("tokens", tol=100, cap=256),
+        P.flow("day", "tokens"),
     )))
 
     ws = Workspace(sch, pln)

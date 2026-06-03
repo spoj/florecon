@@ -117,7 +117,10 @@ struct Seq<E> {
 
 impl<E> Strategy<E> for Seq<E> {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        #[cfg(not(target_arch = "wasm32"))]
         let timed = std::env::var_os("FLORECON_TIME").is_some();
+        #[cfg(target_arch = "wasm32")]
+        let timed = false;
         let mut groups = Vec::new();
         let mut residual = bag;
         for (i, step) in self.steps.iter_mut().enumerate() {
@@ -723,7 +726,10 @@ where
     M::Tx: Clone,
 {
     fn run(&mut self, bag: Vec<Item<M::Tx>>) -> Resolution<M::Tx> {
+        #[cfg(not(target_arch = "wasm32"))]
         let timed = std::env::var_os("FLORECON_TIME").is_some();
+        #[cfg(target_arch = "wasm32")]
+        let timed = false;
         let want: BTreeSet<ExtId> = bag.iter().map(|i| i.id).collect();
         // id -> lot references (no clones unless we actually upsert). The
         // matcher conserves the lot's *current* amount, not a fresh amount

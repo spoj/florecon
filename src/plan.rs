@@ -1021,88 +1021,22 @@ impl Workspace {
     pub fn map(&self) -> &ColumnMap {
         &self.map
     }
+}
 
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
+impl std::ops::Deref for Workspace {
+    type Target = Recon<PhysicalRow>;
 
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// Insert or replace a row. Takes a business [`Row`] (bare cells) and lowers
-    /// it against the schema's per-column [`Kind`]s before storing. Lowering
-    /// arity-checks against the schema.
-    pub fn upsert(&mut self, id: ExtId, row: PhysicalRow) -> Result<(), ApiError> {
-        self.inner.upsert(id, row);
-        Ok(())
-    }
-
-    /// Remove a row from the workspace and from wherever it currently sits.
-    pub fn remove(&mut self, id: ExtId) {
-        self.inner.remove(id);
-    }
-
-    /// Recompute the unfrozen pool, preserving frozen groups.
-    pub fn solve(&mut self) -> Result<(), ApiError> {
-        self.inner.solve()
-    }
-
-    /// Lock a group so future solves leave it intact.
-    pub fn freeze(&mut self, group_id: u64) -> Result<(), ApiError> {
-        self.inner.freeze(group_id)
-    }
-
-    /// Freeze every clean (size >= 2, |net| <= tol) live group. Returns count.
-    pub fn freeze_clean(&mut self, tol: i64) -> usize {
-        self.inner.freeze_clean(tol)
-    }
-
-    /// Freeze the live singleton groups holding any of `ids` (accepted
-    /// unmatched exceptions) in one crossing.
-    pub fn freeze_singletons(&mut self, ids: &[ExtId]) {
-        self.inner.freeze_singletons(ids)
-    }
-
-    /// Unlock a frozen group; the next solve may reshape it.
-    pub fn unfreeze(&mut self, group_id: u64) -> Result<(), ApiError> {
-        self.inner.unfreeze(group_id)
-    }
-
-    /// Dissolve a group; each member returns to a live singleton.
-    pub fn breakup(&mut self, group_id: u64) -> Result<(), ApiError> {
-        self.inner.breakup(group_id)
-    }
-
-    /// Manually assert a frozen group over `ids` with a caller-supplied `net`.
-    pub fn group(&mut self, ids: &[ExtId], net: i64, origin: &str) -> Result<u64, ApiError> {
-        self.inner.group(ids, net, origin)
-    }
-
-    /// Manually assert a frozen group over exact allocation amounts.
-    pub fn group_allocations(
-        &mut self,
-        allocations: &[AllocationSpec],
-        origin: &str,
-    ) -> Result<u64, ApiError> {
-        self.inner.group_allocations(allocations, origin)
-    }
-
-    /// Remove specific row allocations from one live group.
-    pub fn remove_allocations(&mut self, group_id: u64, ids: &[ExtId]) -> Result<(), ApiError> {
-        self.inner.remove_allocations(group_id, ids)
-    }
-
-    /// Send `ids` back to live singletons, removing them from their live group.
-    pub fn ungroup(&mut self, ids: &[ExtId]) -> Result<(), ApiError> {
-        self.inner.ungroup(ids)
-    }
-
-    /// Snapshot the current allocation hypergraph.
-    pub fn report(&self) -> WorkspaceReport {
-        self.inner.report()
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
+
+impl std::ops::DerefMut for Workspace {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
