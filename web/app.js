@@ -19,6 +19,12 @@ const state = {
   report: null,
   lines: [],            // joined display + group attrs
   groupsById: new Map(),
+  // Frontend-only, session-local group numbers. The engine deliberately
+  // re-mints live group_id values on each solve; these maps keep the visible
+  // # stable when the same allocation set reappears after Recalc.
+  groupLabelBySig: new Map(),
+  groupLabelByGid: new Map(),
+  nextGroupLabel: 1,
   filters: new Map(),   // dim -> Set(values)
   selectedGids: new Set(),
   selectedLines: new Set(), // line ids selected in the detail pane
@@ -49,6 +55,40 @@ function datasetHash(data) {
   return (data.pair || "ds").replace(/[^\w]+/g, "_") + "." + h.toString(36);
 }
 
+function resetGroupDisplayLabels() {
+  state.groupLabelBySig = new Map();
+  state.groupLabelByGid = new Map();
+  state.nextGroupLabel = 1;
+}
+
+// Stable identity of a report group for display purposes: the sorted allocation
+// incidences that make up the group. Include amount because split lots can put
+// the same row id in more than one allocation group.
+function groupSignatures(rep) {
+  const byGid = new Map();
+  for (const a of rep.allocations || []) {
+    if (!byGid.has(a.group_id)) byGid.set(a.group_id, []);
+    byGid.get(a.group_id).push({ id: a.id, amount: a.amount });
+  }
+  const out = new Map();
+  for (const [gid, allocs] of byGid) {
+    allocs.sort((a, b) => a.id - b.id || a.amount - b.amount);
+    out.set(gid, allocs.map((a) => `${a.id}:${a.amount}`).join("|"));
+  }
+  return out;
+}
+
+function assignGroupLabel(gid, sig) {
+  let label = state.groupLabelByGid.get(gid);
+  if (label == null && sig) label = state.groupLabelBySig.get(sig);
+  if (label == null) label = state.nextGroupLabel++;
+  state.groupLabelByGid.set(gid, label);
+  if (sig) state.groupLabelBySig.set(sig, label);
+  return label;
+}
+
+const groupNo = (g) => g ? (g.display_id ?? g.group_id) : "?";
+
 function setStatus(msg, err = false) {
   const el = $("status");
   el.textContent = msg;
@@ -66,7 +106,7 @@ function configureFromFields() {
   // The engine conserves its plan `amount` column, which may differ from the
   // displayed value (e.g. native vs usd). Datasets name it explicitly; default
   // to the legacy `native` so the bundled demo keeps working.
-  state.netKey = state.data.netKey || "native";
+  state.netKey = (typeof state.data.plan?.primary === "string" ? state.data.plan.primary : null) || state.data.netKey || "native";
 
   // System slicers (engine-derived) lead; underlying-data dims follow.
   const sys = [
@@ -125,9 +165,9 @@ function configureFromFields() {
     { key: "status", label: "st", sortVal: (l) => l.status, hl: (l) => l.status,
       render: (l) =>
         `<span class="badge b-${l.status}" title="${l.status}">${SHORT[l.status] || "?"}</span>` },
-    { key: "grp", label: "grp", sortVal: (l) => l.gid, hl: (l) => String(l.gid),
+    { key: "grp", label: "grp", sortVal: (l) => l.display_gid ?? l.gid, hl: (l) => String(l.display_gid ?? l.gid),
       render: (l) => l.gid >= 0
-        ? `<span class="gref" data-gid="${l.gid}" title="focus group ${l.gid}">#${l.gid}</span>`
+        ? `<span class="gref" data-gid="${l.gid}" title="focus group #${l.display_gid ?? l.gid}">#${l.display_gid ?? l.gid}</span>`
         : `<span class="dim">\u2014</span>` },
     { key: "tags", label: "tags", sortVal: (l) => state.tags.tagsOf(l.id).size, hl: () => "",
       render: (l) => {
@@ -150,6 +190,7 @@ async function startApp(data) {
   // Tags persist under a key derived from a dataset hash (no dataset identity
   // exists in the wire today — derive one from the pair + the sorted row ids).
   state.tags = new TagStore(datasetHash(state.data));
+  resetGroupDisplayLabels();
   configureFromFields();
 
   setStatus(`init: ${state.data.rows.length} rows…`);
@@ -193,17 +234,41 @@ function rebuild() {
   const gidOf = new Map();
   for (const [id, gid] of primaryAssignments(rep)) gidOf.set(id, gid);
 
+  // Remember selected group signatures so a no-op Recalc keeps focus even
+  // though live engine group_id values were intentionally re-minted.
+  const selectedSigs = new Set([...state.selectedGids]
+    .map((gid) => state.groupsById.get(gid)?.signature)
+    .filter(Boolean));
+
+  const sigByGid = groupSignatures(rep);
   state.groupsById = new Map();
+  const gidsBySig = new Map();
   for (const g of rep.groups) {
-    state.groupsById.set(g.group_id, {
+    const signature = sigByGid.get(g.group_id) || `gid:${g.group_id}`;
+    const display_id = assignGroupLabel(g.group_id, signature);
+    const view = {
       // The wire carries only `status`; derive the local `frozen` convenience
       // boolean here so the rest of the UI can stay terse.
-      ...g, frozen: g.status === "frozen", members: [], value: 0, clean: Math.abs(g.net) <= TOL,
-    });
+      ...g,
+      engine_id: g.group_id,
+      display_id,
+      signature,
+      frozen: g.status === "frozen", members: [], value: 0, clean: Math.abs(g.net) <= TOL,
+    };
+    state.groupsById.set(g.group_id, view);
+    gidsBySig.set(signature, g.group_id);
   }
-  // drop selections that no longer exist after a recalc/breakup
-  for (const gid of [...state.selectedGids])
-    if (!state.groupsById.has(gid)) state.selectedGids.delete(gid);
+  // Drop selections that no longer exist after a recalc/breakup, but preserve
+  // them by signature when Recalc only changed the engine's ephemeral ids.
+  const nextSel = new Set();
+  for (const gid of state.selectedGids) {
+    if (state.groupsById.has(gid)) nextSel.add(gid);
+  }
+  for (const sig of selectedSigs) {
+    const gid = gidsBySig.get(sig);
+    if (gid != null) nextSel.add(gid);
+  }
+  state.selectedGids = nextSel;
 
   const vk = state.valueKey;
   state.lines = state.data.display.map((d) => {
@@ -216,6 +281,7 @@ function rebuild() {
     return {
       ...d,
       gid,
+      display_gid: g ? g.display_id : -1,
       month: (d.date || "").slice(0, 7),
       origin: g ? g.origin : "unmatched",
       // Render-time status from (status × arity): live match / frozen match /
@@ -341,9 +407,9 @@ function renderGroups(fl) {
 
   const { key, dir } = state.sort;
   rows.sort((a, b) => {
-    const av = key === "status" ? (a.frozen ? 1 : 0) : a[key];
-    const bv = key === "status" ? (b.frozen ? 1 : 0) : b[key];
-    return av > bv ? dir : av < bv ? -dir : a.group_id - b.group_id;
+    const av = key === "status" ? (a.frozen ? 1 : 0) : key === "group_id" ? a.display_id : a[key];
+    const bv = key === "status" ? (b.frozen ? 1 : 0) : key === "group_id" ? b.display_id : b[key];
+    return av > bv ? dir : av < bv ? -dir : a.display_id - b.display_id;
   });
 
   const CAP = 600;
@@ -352,9 +418,9 @@ function renderGroups(fl) {
     const sel = state.selectedGids.has(g.group_id) ? " sel" : "";
     const st = g.frozen ? "frozen" : "live";
     const netCls = g.clean ? "" : "dirty";
-    return `<tr class="${sel}" data-gid="${g.group_id}">
+    return `<tr class="${sel}" data-gid="${g.group_id}" title="engine group_id ${g.group_id}">
       <td><span class="badge b-${st}" title="${st}">${SHORT[st] || "?"}</span></td>
-      <td>${g.group_id}</td>
+      <td>${g.display_id}</td>
       <td><span class="badge o-${g.origin}">${g.origin}</span></td>
       <td class="num">${g.size}</td>
       <td class="num">${fmt0(g.value)}</td>
@@ -408,7 +474,7 @@ function renderDetail(fl) {
     const byId = new Map(state.lines.map((l) => [l.id, l]));
     lines = [...ids].map((id) => byId.get(id)).filter(Boolean);
     head.innerHTML = sel.length === 1
-      ? `Group ${sel[0].group_id} · <span class="badge o-${sel[0].origin}">${sel[0].origin}</span>`
+      ? `Group #${groupNo(sel[0])} · <span class="badge o-${sel[0].origin}">${sel[0].origin}</span>`
       : `${sel.length} groups · union`;
     scope = "selected groups (full)";
   } else {
@@ -714,6 +780,7 @@ function wireUi() {
 
 // re-init the workspace from scratch (Reset)
 function boot2() {
+  resetGroupDisplayLabels();
   const init = state.fe.dispatch({
     op: "init", schema: state.data.schema, plan: state.data.plan, rows: state.data.rows,
   });

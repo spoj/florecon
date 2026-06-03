@@ -30,10 +30,10 @@ COLS = CORE + OPTIONAL + FIELDS
 
 def plan():
     leg = {"op": "seq", "steps": [
-        {"op": "agg_net", "key": "objsub", "amount": "native", "tol": 100},
-        {"op": "exact", "amount": "native"},
-        {"op": "signal", "signals": "tokens", "amount": "native", "tol": 100, "cap": 256},
-        {"op": "flow", "amount": "native", "day": "day",
+        {"op": "agg_net", "key": "objsub", "tol": 100},
+        {"op": "exact"},
+        {"op": "signal", "signals": "tokens", "tol": 100, "cap": 256},
+        {"op": "flow", "day": "day",
          "tokens": "tokens", "penalty": 1000.0, "window": -1},
     ]}
     return {"op": "partition", "by": "unit",
@@ -151,7 +151,7 @@ def main():
             break
 
     out = {"pair": " / ".join(sorted(pair)), "schema": {"cols": schema, "token_drop": ["OFFSETENTRY"]},
-           "plan": plan(), "fields": fields_spec(), "rows": rows, "display": display}
+           "plan": {"primary": "native", "root": plan()}, "fields": fields_spec(), "rows": rows, "display": display}
     import os
     os.makedirs("web", exist_ok=True)
     with open(OUT, "w") as f:

@@ -66,10 +66,10 @@ def ingest(path, pair=None, maxrows=None):
 
 def plan():
     leg = {"op": "seq", "steps": [
-        {"op": "agg_net", "key": "objsub", "amount": "native", "tol": 100},
-        {"op": "exact", "amount": "native"},
-        {"op": "signal", "signals": "tokens", "amount": "native", "tol": 100, "cap": 256},
-        {"op": "flow", "amount": "native", "day": "day",
+        {"op": "agg_net", "key": "objsub", "tol": 100},
+        {"op": "exact"},
+        {"op": "signal", "signals": "tokens", "tol": 100, "cap": 256},
+        {"op": "flow", "day": "day",
          "tokens": "tokens", "penalty": 1000.0, "window": -1},
     ]}
     return {"op": "partition", "by": "unit",
@@ -99,7 +99,7 @@ def main():
     print(f"ingested {len(rows)} rows in {time.time()-t0:.2f}s")
 
     fe = Florecon(WASM)
-    req = {"schema": {"cols": schema, "token_drop": ["OFFSETENTRY"]}, "rows": rows, "plan": plan()}
+    req = {"schema": {"cols": schema, "token_drop": ["OFFSETENTRY"]}, "rows": rows, "plan": {"primary": "native", "root": plan()}}
     t1 = time.time()
     env = fe.solve(req)
     dt = time.time() - t1

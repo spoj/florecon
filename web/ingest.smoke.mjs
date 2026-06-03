@@ -50,7 +50,7 @@ const data = buildDataset({ header: H, rows: parsed.rows, mapping });
 ok(data.rows.length === 5, "5 rows built");
 ok(data.netKey === "amount", "netKey");
 ok(data.schema.cols.map((c) => c.name).join(",") === "p0,p1,gkey,date,amount,tokens", "schema order");
-ok(data.plan.op === "partition" && data.plan.by === "p0", "outer partition");
+ok(data.plan.root.op === "partition" && data.plan.root.by === "p0", "outer partition");
 // cells positional: [p0,p1,gkey,date,amount,tokens]
 ok(data.rows[0][1][4] === 10000, "amount cents in cell");
 ok(typeof data.rows[0][1][0] === "string", "key cell is string");

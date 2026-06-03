@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the allocation-native Report. Contract version 7 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
-  "x-contract-version": 7,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the allocation-native Report. Contract version 8 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
+  "x-contract-version": 8,
   "$defs": {
     "Cell": {
       "description": "A bare input cell: a number or a string. How it lowers is decided by its column's Kind in the Schema, not by the cell, so there is no per-cell tag. A Number column takes the integer as-is; a Key column lowers a string via FNV-1a (a numeric cell is an already-lowered key); a Tokens column lowers a free-text string to a reference-token set. The lowered engine form is internal and never on the wire. See src/lower.rs.",
@@ -135,281 +135,21 @@
       "additionalProperties": false
     },
     "Plan": {
-      "description": "A reconciliation pipeline as data. Tagged union on `op`; every leaf references columns by name.",
-      "oneOf": [
-        {
-          "title": "seq",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "seq"
-            },
-            "steps": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/Plan"
-              }
-            }
-          },
-          "required": [
-            "op",
-            "steps"
-          ],
-          "additionalProperties": false
+      "description": "A reconciliation plan with one primary report/conservation numeraire and a strategy root.",
+      "type": "object",
+      "properties": {
+        "primary": {
+          "$ref": "#/$defs/ScalarRef"
         },
-        {
-          "title": "partition",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "partition"
-            },
-            "by": {
-              "$ref": "#/$defs/ScalarRef"
-            },
-            "inner": {
-              "$ref": "#/$defs/Plan"
-            }
-          },
-          "required": [
-            "op",
-            "by",
-            "inner"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "branch",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "branch"
-            },
-            "pred": {
-              "$ref": "#/$defs/BoolRef"
-            },
-            "and_then": {
-              "$ref": "#/$defs/Plan"
-            },
-            "or_else": {
-              "$ref": "#/$defs/Plan"
-            }
-          },
-          "required": [
-            "op",
-            "pred",
-            "and_then",
-            "or_else"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "windowed",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "windowed"
-            },
-            "order": {
-              "$ref": "#/$defs/ScalarRef"
-            },
-            "width": {
-              "type": "integer"
-            },
-            "inner": {
-              "$ref": "#/$defs/Plan"
-            }
-          },
-          "required": [
-            "op",
-            "order",
-            "width",
-            "inner"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "lots",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "lots"
-            },
-            "amount": {
-              "$ref": "#/$defs/ScalarRef"
-            },
-            "inner": {
-              "$ref": "#/$defs/Plan"
-            }
-          },
-          "required": [
-            "op",
-            "amount",
-            "inner"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "soak_small",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "soak_small"
-            },
-            "max_bps": {
-              "type": ["integer", "null"]
-            },
-            "max_abs": {
-              "type": ["integer", "null"]
-            },
-            "origin": {
-              "type": "string"
-            },
-            "by": {
-              "anyOf": [
-                { "$ref": "#/$defs/ScalarRef" },
-                { "type": "null" }
-              ]
-            }
-          },
-          "required": [
-            "op",
-            "origin"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "soak_all",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "soak_all"
-            },
-            "origin": {
-              "type": "string"
-            },
-            "by": {
-              "anyOf": [
-                { "$ref": "#/$defs/ScalarRef" },
-                { "type": "null" }
-              ]
-            }
-          },
-          "required": [
-            "op",
-            "origin"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "agg_net",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "agg_net"
-            },
-            "key": {
-              "$ref": "#/$defs/ScalarRef"
-            },
-            "amount": {
-              "$ref": "#/$defs/ScalarRef"
-            },
-            "tol": {
-              "type": "integer"
-            }
-          },
-          "required": [
-            "op",
-            "key",
-            "amount",
-            "tol"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "exact",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "exact"
-            },
-            "amount": {
-              "$ref": "#/$defs/ScalarRef"
-            }
-          },
-          "required": [
-            "op",
-            "amount"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "signal",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "signal"
-            },
-            "signals": {
-              "type": "string"
-            },
-            "amount": {
-              "$ref": "#/$defs/ScalarRef"
-            },
-            "tol": {
-              "type": "integer"
-            },
-            "cap": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          "required": [
-            "op",
-            "signals",
-            "amount",
-            "tol",
-            "cap"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "title": "flow",
-          "type": "object",
-          "properties": {
-            "op": {
-              "const": "flow"
-            },
-            "amount": {
-              "$ref": "#/$defs/ScalarRef"
-            },
-            "day": {
-              "$ref": "#/$defs/ScalarRef"
-            },
-            "tokens": {
-              "type": "string"
-            },
-            "penalty": {
-              "type": "number"
-            },
-            "window": {
-              "type": "integer"
-            },
-            "cost": {
-              "$ref": "#/$defs/CostSpec"
-            }
-          },
-          "required": [
-            "op",
-            "amount",
-            "day",
-            "tokens",
-            "penalty",
-            "window"
-          ],
-          "additionalProperties": false
+        "root": {
+          "$ref": "#/$defs/PlanNode"
         }
-      ]
+      },
+      "required": [
+        "primary",
+        "root"
+      ],
+      "additionalProperties": false
     },
     "SolveRequest": {
       "description": "A self-contained batch solve: the JSON passed to the wasm `solve` export.",
@@ -756,7 +496,9 @@
         },
         "allocations": {
           "type": "array",
-          "items": { "$ref": "#/$defs/AllocationOut" }
+          "items": {
+            "$ref": "#/$defs/AllocationOut"
+          }
         }
       },
       "required": [
@@ -768,20 +510,37 @@
     "AllocationOut": {
       "type": "object",
       "properties": {
-        "id": { "type": "integer" },
-        "group_id": { "type": "integer" },
-        "amount": { "type": "integer" }
+        "id": {
+          "type": "integer"
+        },
+        "group_id": {
+          "type": "integer"
+        },
+        "amount": {
+          "type": "integer"
+        }
       },
-      "required": ["id", "group_id", "amount"],
+      "required": [
+        "id",
+        "group_id",
+        "amount"
+      ],
       "additionalProperties": false
     },
     "AllocationSpec": {
       "type": "object",
       "properties": {
-        "id": { "type": "integer" },
-        "amount": { "type": "integer" }
+        "id": {
+          "type": "integer"
+        },
+        "amount": {
+          "type": "integer"
+        }
       },
-      "required": ["id", "amount"],
+      "required": [
+        "id",
+        "amount"
+      ],
       "additionalProperties": false
     },
     "Envelope": {
@@ -1128,6 +887,281 @@
         },
         {
           "$ref": "#/$defs/BoolExpr"
+        }
+      ]
+    },
+    "PlanNode": {
+      "description": "A reconciliation strategy tree. Tagged union on `op`; primitives operate on the current allocation amount.",
+      "oneOf": [
+        {
+          "title": "seq",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "seq"
+            },
+            "steps": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/PlanNode"
+              }
+            }
+          },
+          "required": [
+            "op",
+            "steps"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "partition",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "partition"
+            },
+            "by": {
+              "$ref": "#/$defs/ScalarRef"
+            },
+            "inner": {
+              "$ref": "#/$defs/PlanNode"
+            }
+          },
+          "required": [
+            "op",
+            "by",
+            "inner"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "branch",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "branch"
+            },
+            "pred": {
+              "$ref": "#/$defs/BoolRef"
+            },
+            "and_then": {
+              "$ref": "#/$defs/PlanNode"
+            },
+            "or_else": {
+              "$ref": "#/$defs/PlanNode"
+            }
+          },
+          "required": [
+            "op",
+            "pred",
+            "and_then",
+            "or_else"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "windowed",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "windowed"
+            },
+            "order": {
+              "$ref": "#/$defs/ScalarRef"
+            },
+            "width": {
+              "type": "integer"
+            },
+            "inner": {
+              "$ref": "#/$defs/PlanNode"
+            }
+          },
+          "required": [
+            "op",
+            "order",
+            "width",
+            "inner"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "pivot",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "pivot"
+            },
+            "amount": {
+              "$ref": "#/$defs/ScalarRef"
+            },
+            "inner": {
+              "$ref": "#/$defs/PlanNode"
+            }
+          },
+          "required": [
+            "op",
+            "amount",
+            "inner"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "soak_small",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "soak_small"
+            },
+            "max_bps": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_abs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "origin": {
+              "type": "string"
+            },
+            "by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ScalarRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "origin"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "soak_all",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "soak_all"
+            },
+            "origin": {
+              "type": "string"
+            },
+            "by": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ScalarRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "origin"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "agg_net",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "agg_net"
+            },
+            "key": {
+              "$ref": "#/$defs/ScalarRef"
+            },
+            "tol": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "op",
+            "key",
+            "tol"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "exact",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "exact"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "signal",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "signal"
+            },
+            "signals": {
+              "type": "string"
+            },
+            "tol": {
+              "type": "integer"
+            },
+            "cap": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "op",
+            "signals",
+            "tol",
+            "cap"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "flow",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "flow"
+            },
+            "day": {
+              "$ref": "#/$defs/ScalarRef"
+            },
+            "tokens": {
+              "type": "string"
+            },
+            "penalty": {
+              "type": "number"
+            },
+            "window": {
+              "type": "integer"
+            },
+            "cost": {
+              "$ref": "#/$defs/CostSpec"
+            }
+          },
+          "required": [
+            "op",
+            "day",
+            "tokens",
+            "penalty",
+            "window"
+          ],
+          "additionalProperties": false
         }
       ]
     }

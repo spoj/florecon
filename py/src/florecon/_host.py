@@ -7,7 +7,7 @@ import json
 import wasmtime
 
 # Must equal the engine's abi_version() export (plan::CONTRACT_VERSION).
-CONTRACT_VERSION = 7
+CONTRACT_VERSION = 8
 
 
 class ContractMismatch(RuntimeError):

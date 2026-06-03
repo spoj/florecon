@@ -25,11 +25,9 @@ def windowed(order: str, width: int, inner: dict) -> dict:
     return {"op": "windowed", "order": order, "width": width, "inner": inner}
 
 
-def lots(amount: str, inner: dict) -> dict:
-    """Enter lot mode: initialize each row's original/current residual amount
-    from `amount`, then thread shrinking residuals through `inner`. Put this
-    inside `partition(...)` when residuals must stay inside a hard scope."""
-    return {"op": "lots", "amount": amount, "inner": inner}
+def pivot(amount: str, inner: dict) -> dict:
+    """Temporarily match inner in another numeraire."""
+    return {"op": "pivot", "amount": amount, "inner": inner}
 
 
 def soak_small(origin: str, max_bps: int = None, max_abs: int = None, by: str = None) -> dict:
@@ -54,41 +52,24 @@ def soak_all(origin: str = "unmatched", by: str = None) -> dict:
     return node
 
 
-def agg_net(key: str, amount: str, tol: int = 0) -> dict:
+def agg_net(key: str, tol: int = 0) -> dict:
     """Accept an aggregation bucket (`key`) that nets to zero within `tol`."""
-    return {"op": "agg_net", "key": key, "amount": amount, "tol": tol}
+    return {"op": "agg_net", "key": key, "tol": tol}
 
 
-def exact(amount: str) -> dict:
-    """Pair opposite-sign rows of equal magnitude on `amount`."""
-    return {"op": "exact", "amount": amount}
+def exact() -> dict:
+    """Pair opposite-sign rows of equal magnitude on current amount."""
+    return {"op": "exact"}
 
 
-def signal(signals: str, amount: str, tol: int = 0, cap: int = 256) -> dict:
+def signal(signals: str, tol: int = 0, cap: int = 256) -> dict:
     """Group rows sharing an out-of-band token signal that net to zero."""
-    return {"op": "signal", "signals": signals, "amount": amount, "tol": tol, "cap": cap}
+    return {"op": "signal", "signals": signals, "tol": tol, "cap": cap}
 
 
-def flow(
-    amount,
-    day,
-    tokens: str,
-    penalty: float = 1000.0,
-    window: int = -1,
-    cost: dict = None,
-) -> dict:
-    """The min-cost-flow arbiter over the residual. `amount` is the conserved
-    numeraire and the exact-amount signal; `cost` defaults to the
-    reference-bridge > exact-amount cascade. Pass `cost=cost_spec(...)` to
-    override."""
-    node = {
-        "op": "flow",
-        "amount": amount,
-        "day": day,
-        "tokens": tokens,
-        "penalty": penalty,
-        "window": window,
-    }
+def flow(day, tokens: str, penalty: float = 1000.0, window: int = -1, cost: dict = None) -> dict:
+    """The min-cost-flow arbiter over the residual."""
+    node = {"op": "flow", "day": day, "tokens": tokens, "penalty": penalty, "window": window}
     if cost is not None:
         node["cost"] = cost
     return node

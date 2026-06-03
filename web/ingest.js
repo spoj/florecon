@@ -108,13 +108,13 @@ export function buildDataset({ header, rows, mapping }) {
   // Plan: only the steps whose columns exist. Cheap/strict leaves first, the
   // expensive min-cost flow last (and only when it has signals + time to use).
   const steps = [];
-  if (mapping.gkey != null) steps.push({ op: "agg_net", key: "gkey", amount: "amount", tol });
-  steps.push({ op: "exact", amount: "amount" });
+  if (mapping.gkey != null) steps.push({ op: "agg_net", key: "gkey", tol });
+  steps.push({ op: "exact" });
   if (tokCis.length)
-    steps.push({ op: "signal", signals: "tokens", amount: "amount", tol, cap: 256 });
+    steps.push({ op: "signal", signals: "tokens", tol, cap: 256 });
   if (tokCis.length && mapping.date != null)
     steps.push({
-      op: "flow", amount: "amount", day: "date",
+      op: "flow", day: "date",
       tokens: "tokens", penalty: 1000.0, window: -1,
     });
   let plan = { op: "seq", steps };
@@ -155,6 +155,6 @@ export function buildDataset({ header, rows, mapping }) {
 
   return {
     pair: mapping.name || "uploaded",
-    schema, plan, fields, rows: outRows, display, netKey: "amount",
+    schema, plan: {primary: "amount", root: plan}, fields, rows: outRows, display, netKey: "amount",
   };
 }

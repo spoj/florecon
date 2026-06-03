@@ -83,6 +83,27 @@ const tick = (ms) => new Promise((r) => setTimeout(r, ms));
   ok($("setup-err").textContent === "", "no error: " + $("setup-err").textContent);
   ok($("setup").hidden && !$("main").hidden, "transitioned to workbench");
   ok(/solved in/.test($("status").textContent), "solved: " + $("status").textContent);
+
+  const groupRows = () => [...document.querySelectorAll("#groups-body tr")].map((tr) => ({
+    cls: tr.className,
+    gid: tr.dataset.gid,
+    no: tr.children[1]?.textContent.trim(),
+    origin: tr.children[2]?.textContent.trim(),
+    size: tr.children[3]?.textContent.trim(),
+    net: tr.children[5]?.textContent.trim(),
+  }));
+  const before = groupRows();
+  ok(before.length >= 2, "upload rendered matched groups");
+  document.querySelector("#groups-body tr").dispatchEvent(new window.Event("click", { bubbles: true }));
+  const selectedNo = groupRows().find((r) => /sel/.test(r.cls))?.no;
+  $("recalc").dispatchEvent(new window.Event("click"));
+  await tick(100);
+  const after = groupRows();
+  ok(JSON.stringify(after.map((r) => [r.no, r.origin, r.size, r.net])) === JSON.stringify(before.map((r) => [r.no, r.origin, r.size, r.net])),
+    "visible group numbers stable across no-op Recalc");
+  ok(after.find((r) => /sel/.test(r.cls))?.no === selectedNo,
+    "selected group focus survives no-op Recalc by stable signature");
+
   console.log("  upload   : " + $("status").textContent.trim());
 }
 

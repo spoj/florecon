@@ -1,17 +1,16 @@
 use crate::error::ApiError;
 use crate::expr::{BoolEval, ScalarEval, bool_ref, scalar_ref};
 use crate::flow::Model;
-use crate::plan::{Cond, CostSpec, Plan};
+use crate::plan::{Cond, CostSpec, Plan, PlanNode};
 use crate::row::LoweredRow;
 use crate::schema::Schema;
 use crate::strategy::{
-    SoakMode, Strategy, agg_net, branch, exact_1to1, flow, lots, partition_by, seq, signal_group,
-    soak_all, soak_small, windowed,
+    SoakMode, Strategy, agg_net, branch, exact_1to1_any, flow, partition_by, pivot, seq,
+    signal_group, soak_all, soak_small, windowed,
 };
 
 #[derive(Clone)]
 struct PlanModel {
-    amount: ScalarEval,
     day: ScalarEval,
     tokens: usize,
     penalty: f64,
@@ -22,8 +21,12 @@ struct PlanModel {
 impl Model for PlanModel {
     type Tx = LoweredRow;
 
-    fn base_amount(&self, tx: &LoweredRow) -> i64 {
-        self.amount.eval(tx)
+    // Strategy flow wraps rows in FlowTx and supplies the current Item.amount as
+    // the matcher's base amount. This fallback exists only to satisfy the lower
+    // flow::Model trait for direct Matcher-style calls and is not used by plan
+    // execution.
+    fn base_amount(&self, _tx: &LoweredRow) -> i64 {
+        0
     }
     fn penalty(&self, _tx: &LoweredRow) -> f64 {
         self.penalty
@@ -34,9 +37,6 @@ impl Model for PlanModel {
     fn window(&self) -> i64 {
         self.window
     }
-    fn match_keys(&self, tx: &LoweredRow) -> Vec<u64> {
-        self.match_keys_lot(tx, self.base_amount(tx))
-    }
     fn match_keys_lot(&self, tx: &LoweredRow, amount: i64) -> Vec<u64> {
         let mut keys = tx.tokens(self.tokens);
         if amount != 0 {
@@ -45,7 +45,7 @@ impl Model for PlanModel {
         keys
     }
     fn cost(&self, a: &LoweredRow, b: &LoweredRow) -> Option<f64> {
-        self.cost_lot(a, self.base_amount(a), b, self.base_amount(b))
+        self.cost_lot(a, 0, b, 0)
     }
     fn cost_lot(
         &self,
@@ -79,28 +79,43 @@ impl Model for PlanModel {
     }
 }
 
-/// Compile the serializable plan tree into the closure-based strategy algebra.
-pub(crate) fn compile(
-    plan: &Plan,
+pub(crate) struct CompiledPlan {
+    pub primary: ScalarEval,
+    pub strategy: Box<dyn Strategy<LoweredRow>>,
+}
+
+/// Compile the serializable plan into a primary amount evaluator plus the
+/// closure-based strategy algebra. The strategy assumes all Items are already
+/// initialized in that primary numeraire.
+pub(crate) fn compile(plan: &Plan, schema: &Schema) -> Result<CompiledPlan, ApiError> {
+    Ok(CompiledPlan {
+        primary: scalar_ref(&plan.primary, schema)?,
+        strategy: compile_node(&plan.root, schema)?,
+    })
+}
+
+fn compile_node(
+    plan: &PlanNode,
     schema: &Schema,
 ) -> Result<Box<dyn Strategy<LoweredRow>>, ApiError> {
     Ok(match plan {
-        Plan::Seq { steps } => {
+        PlanNode::Seq { steps } => {
             let mut compiled = Vec::with_capacity(steps.len());
             for s in steps {
-                compiled.push(compile(s, schema)?);
+                compiled.push(compile_node(s, schema)?);
             }
             seq(compiled)
         }
-        Plan::Partition { by, inner } => {
+        PlanNode::Partition { by, inner } => {
             let k = scalar_ref(by, schema)?;
-            compile(inner, schema)?;
+            compile_node(inner, schema)?;
             let inner = (**inner).clone();
             let schema = schema.clone();
-            let factory = move || compile(&inner, &schema).expect("inner plan already validated");
+            let factory =
+                move || compile_node(&inner, &schema).expect("inner plan already validated");
             partition_by(move |r: &LoweredRow| k.eval(r), factory)
         }
-        Plan::Branch {
+        PlanNode::Branch {
             pred,
             and_then,
             or_else,
@@ -108,11 +123,11 @@ pub(crate) fn compile(
             let p: BoolEval = bool_ref(pred, schema)?;
             branch(
                 move |r: &LoweredRow| p.eval(r),
-                compile(and_then, schema)?,
-                compile(or_else, schema)?,
+                compile_node(and_then, schema)?,
+                compile_node(or_else, schema)?,
             )
         }
-        Plan::Windowed {
+        PlanNode::Windowed {
             order,
             width,
             inner,
@@ -121,47 +136,26 @@ pub(crate) fn compile(
             windowed(
                 move |r: &LoweredRow| o.eval(r),
                 *width,
-                compile(inner, schema)?,
+                compile_node(inner, schema)?,
             )
         }
-        Plan::Lots { amount, inner } => {
+        PlanNode::Pivot { amount, inner } => {
             let a = scalar_ref(amount, schema)?;
-            lots(move |r: &LoweredRow| a.eval(r), compile(inner, schema)?)
-        }
-        Plan::AggNet { key, amount, tol } => {
-            let (k, a) = (scalar_ref(key, schema)?, scalar_ref(amount, schema)?);
-            agg_net(
-                move |r: &LoweredRow| k.eval(r) as u64,
+            pivot(
                 move |r: &LoweredRow| a.eval(r),
-                *tol,
+                compile_node(inner, schema)?,
             )
         }
-        Plan::Exact { amount } => {
-            let a = scalar_ref(amount, schema)?;
-            let ak = a.clone();
-            exact_1to1(
-                move |r: &LoweredRow| {
-                    let v = ak.eval(r);
-                    if v != 0 { Some(v.unsigned_abs()) } else { None }
-                },
-                move |r: &LoweredRow| a.eval(r),
-            )
+        PlanNode::AggNet { key, tol } => {
+            let k = scalar_ref(key, schema)?;
+            agg_net(move |r: &LoweredRow| k.eval(r) as u64, *tol)
         }
-        Plan::Signal {
-            signals,
-            amount,
-            tol,
-            cap,
-        } => {
-            let (s, a) = (schema.index(signals)?, scalar_ref(amount, schema)?);
-            signal_group(
-                move |r: &LoweredRow| r.tokens(s),
-                move |r: &LoweredRow| a.eval(r),
-                *tol,
-                *cap,
-            )
+        PlanNode::Exact {} => exact_1to1_any(),
+        PlanNode::Signal { signals, tol, cap } => {
+            let s = schema.index(signals)?;
+            signal_group(move |r: &LoweredRow| r.tokens(s), *tol, *cap)
         }
-        Plan::SoakSmall {
+        PlanNode::SoakSmall {
             max_bps,
             max_abs,
             origin,
@@ -186,7 +180,7 @@ pub(crate) fn compile(
                 )
             }
         }
-        Plan::SoakAll { origin, by } => {
+        PlanNode::SoakAll { origin, by } => {
             if let Some(by) = by {
                 let k = scalar_ref(by, schema)?;
                 soak_all(
@@ -202,8 +196,7 @@ pub(crate) fn compile(
                 )
             }
         }
-        Plan::Flow {
-            amount,
+        PlanNode::Flow {
             day,
             tokens,
             penalty,
@@ -211,7 +204,6 @@ pub(crate) fn compile(
             cost,
         } => {
             let model = PlanModel {
-                amount: scalar_ref(amount, schema)?,
                 day: scalar_ref(day, schema)?,
                 tokens: schema.index(tokens)?,
                 penalty: *penalty,

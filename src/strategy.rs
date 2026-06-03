@@ -32,67 +32,37 @@
 
 use crate::engine::SolveStatus;
 use crate::flow::{Allocation, ExtId, Matcher, Model};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 use std::marker::PhantomData;
 
-/// One lot in the bag: a caller-owned row/lot id, its original signed line
-/// amount, its currently available signed amount, and payload. A row-partition
-/// workload may start with [`Item::row`] (no canonical lot amount yet); a
-/// lot-aware subtree starts with [`Item::lot`] and may split a lot by emitting a
-/// consumed allocation to a group and a remainder lot to residual.
+/// One allocation lot in the bag: a caller-owned row/lot id, its original
+/// signed amount in the currently active numeraire, its currently available
+/// signed residual amount in that same numeraire, and payload. Strategies never
+/// choose a money column themselves; the plan/workspace boundary initializes
+/// the primary amount, and [`pivot`] is the only combinator that temporarily
+/// switches the active numeraire for a subtree.
 ///
-/// `original` is stable within a lot pipeline and `amount` is the shrinking
-/// residual. This lets later strategies classify leftovers by materiality, e.g.
-/// "soak this residual if it is under 2% of the original line".
+/// `original` is stable within the active numeraire and `amount` is the
+/// shrinking residual. This lets later strategies classify leftovers by
+/// materiality, e.g. "soak this residual if it is under 2% of the original
+/// line".
+#[derive(Clone)]
 pub struct Item<E> {
     pub id: ExtId,
     pub original: i64,
     pub amount: i64,
-    /// True when `original`/`amount` are the canonical lot amount for this item.
-    /// Legacy row-partition callers may leave this false and let leaves compute
-    /// their amount from `data` via the usual amount closures.
-    pub lot: bool,
     pub data: E,
 }
 
 impl<E> Item<E> {
-    pub fn row(id: ExtId, data: E) -> Self {
-        Item {
-            id,
-            original: 0,
-            amount: 0,
-            lot: false,
-            data,
-        }
-    }
-
-    pub fn lot(id: ExtId, amount: i64, data: E) -> Self {
+    pub fn new(id: ExtId, amount: i64, data: E) -> Self {
         Item {
             id,
             original: amount,
             amount,
-            lot: true,
             data,
         }
-    }
-
-    fn effective_amount<FA>(&self, amount: &FA) -> i64
-    where
-        FA: Fn(&E) -> i64,
-    {
-        if self.lot {
-            self.amount
-        } else {
-            amount(&self.data)
-        }
-    }
-
-    fn stamp_amount<FA>(&mut self, amount: &FA)
-    where
-        FA: Fn(&E) -> i64,
-    {
-        self.amount = self.effective_amount(amount);
     }
 }
 
@@ -368,22 +338,19 @@ where
 // Primitives
 // ---------------------------------------------------------------------------
 
-struct ExactOneToOne<E, FK, FA> {
+struct ExactOneToOne<E, FK> {
     key: FK,
-    amount: FA,
     _e: PhantomData<E>,
 }
 
-impl<E, FK, FA> Strategy<E> for ExactOneToOne<E, FK, FA>
+impl<E, FK> Strategy<E> for ExactOneToOne<E, FK>
 where
     FK: Fn(&E) -> Option<u64>,
-    FA: Fn(&E) -> i64,
 {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut buckets: HashMap<u64, Vec<Item<E>>> = HashMap::new();
         let mut residual = Vec::new();
-        for mut item in bag {
-            item.stamp_amount(&self.amount);
+        for item in bag {
             match (self.key)(&item.data) {
                 Some(k) if item.amount != 0 => buckets.entry(k).or_default().push(item),
                 _ => residual.push(item),
@@ -442,34 +409,33 @@ where
 /// Pull opposite-sign pairs of equal magnitude sharing a key (e.g. native
 /// currency + amount). The cheapest, highest-precision matcher; clears clean
 /// 1-to-1s before anything expensive runs. `key` returns `None` to opt out.
-pub fn exact_1to1<E: 'static, FK, FA>(key: FK, amount: FA) -> Box<dyn Strategy<E>>
+pub fn exact_1to1<E: 'static, FK>(key: FK) -> Box<dyn Strategy<E>>
 where
     FK: Fn(&E) -> Option<u64> + 'static,
-    FA: Fn(&E) -> i64 + 'static,
 {
     Box::new(ExactOneToOne {
         key,
-        amount,
         _e: PhantomData,
     })
 }
 
-struct AggNet<E, FK, FA> {
+pub fn exact_1to1_any<E: 'static>() -> Box<dyn Strategy<E>> {
+    exact_1to1(|_e: &E| Some(0))
+}
+
+struct AggNet<E, FK> {
     key: FK,
-    amount: FA,
     tol: i64,
     _e: PhantomData<E>,
 }
 
-impl<E, FK, FA> Strategy<E> for AggNet<E, FK, FA>
+impl<E, FK> Strategy<E> for AggNet<E, FK>
 where
     FK: Fn(&E) -> u64,
-    FA: Fn(&E) -> i64,
 {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut buckets: HashMap<u64, Vec<Item<E>>> = HashMap::new();
-        for mut item in bag {
-            item.stamp_amount(&self.amount);
+        for item in bag {
             buckets
                 .entry((self.key)(&item.data))
                 .or_default()
@@ -506,30 +472,26 @@ where
 /// Accept a whole aggregation bucket (e.g. an `objsub`, or a balance-sheet-level
 /// set) when it nets to zero within `tol`. The macro net-to-zero pre-filter:
 /// confirmation, not optimization.
-pub fn agg_net<E: 'static, FK, FA>(key: FK, amount: FA, tol: i64) -> Box<dyn Strategy<E>>
+pub fn agg_net<E: 'static, FK>(key: FK, tol: i64) -> Box<dyn Strategy<E>>
 where
     FK: Fn(&E) -> u64 + 'static,
-    FA: Fn(&E) -> i64 + 'static,
 {
     Box::new(AggNet {
         key,
-        amount,
         tol,
         _e: PhantomData,
     })
 }
 
-struct RunningZero<E, FO, FA> {
+struct RunningZero<E, FO> {
     order: FO,
-    amount: FA,
     tol: i64,
     _e: PhantomData<E>,
 }
 
-impl<E, FO, FA> Strategy<E> for RunningZero<E, FO, FA>
+impl<E, FO> Strategy<E> for RunningZero<E, FO>
 where
     FO: Fn(&E) -> i64,
-    FA: Fn(&E) -> i64,
 {
     fn run(&mut self, mut bag: Vec<Item<E>>) -> Resolution<E> {
         // Order the bag (finance bags are a timeline), then walk the running
@@ -540,8 +502,7 @@ where
         let mut groups = Vec::new();
         let mut seg: Vec<Item<E>> = Vec::new();
         let mut acc: i64 = 0;
-        for mut item in bag {
-            item.stamp_amount(&self.amount);
+        for item in bag {
             acc += item.amount;
             seg.push(item);
             if acc.abs() <= self.tol && seg.len() >= 2 {
@@ -573,40 +534,29 @@ where
 /// up to its date is exactly the one that brings the running balance back to
 /// zero. Intermediate zero-crossings give the finest segmentation consistent
 /// with the timeline; the never-cleared tail is left as residual.
-pub fn running_zero<E: 'static, FO, FA>(order: FO, amount: FA, tol: i64) -> Box<dyn Strategy<E>>
+pub fn running_zero<E: 'static, FO>(order: FO, tol: i64) -> Box<dyn Strategy<E>>
 where
     FO: Fn(&E) -> i64 + 'static,
-    FA: Fn(&E) -> i64 + 'static,
 {
     Box::new(RunningZero {
         order,
-        amount,
         tol,
         _e: PhantomData,
     })
 }
 
-struct SignalGroup<E, FS, FA> {
+struct SignalGroup<E, FS> {
     signals: FS,
-    amount: FA,
     tol: i64,
     cap: usize,
     _e: PhantomData<E>,
 }
 
-impl<E, FS, FA> Strategy<E> for SignalGroup<E, FS, FA>
+impl<E, FS> Strategy<E> for SignalGroup<E, FS>
 where
     FS: Fn(&E) -> Vec<u64>,
-    FA: Fn(&E) -> i64,
 {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
-        let bag: Vec<Item<E>> = bag
-            .into_iter()
-            .map(|mut i| {
-                i.stamp_amount(&self.amount);
-                i
-            })
-            .collect();
         let n = bag.len();
         let amt: Vec<i64> = bag.iter().map(|i| i.amount).collect();
         let sigs: Vec<Vec<u64>> = bag.iter().map(|i| (self.signals)(&i.data)).collect();
@@ -663,19 +613,12 @@ where
 /// books) and pull buckets that net to zero within `tol`. High precision: a
 /// token *names* the group; netting only validates it. Greedy on most-specific
 /// buckets first; ambiguous/over-large buckets (`> cap`) are left for [`flow`].
-pub fn signal_group<E: 'static, FS, FA>(
-    signals: FS,
-    amount: FA,
-    tol: i64,
-    cap: usize,
-) -> Box<dyn Strategy<E>>
+pub fn signal_group<E: 'static, FS>(signals: FS, tol: i64, cap: usize) -> Box<dyn Strategy<E>>
 where
     FS: Fn(&E) -> Vec<u64> + 'static,
-    FA: Fn(&E) -> i64 + 'static,
 {
     Box::new(SignalGroup {
         signals,
-        amount,
         tol,
         cap,
         _e: PhantomData,
@@ -748,11 +691,7 @@ where
     M: Model,
 {
     fn flow_amount(&self, item: &Item<M::Tx>) -> i64 {
-        if item.lot {
-            item.amount
-        } else {
-            self.model.base_amount(&item.data)
-        }
+        item.amount
     }
 
     fn flow_tx(&self, item: &Item<M::Tx>) -> FlowTx<M::Tx>
@@ -766,10 +705,11 @@ where
     }
 
     fn flow_sig(&self, item: &Item<M::Tx>) -> FlowSig {
-        let mut keys = self.model.match_keys(&item.data);
+        let amount = self.flow_amount(item);
+        let mut keys = self.model.match_keys_lot(&item.data, amount);
         keys.sort_unstable();
         FlowSig {
-            amount: self.flow_amount(item),
+            amount,
             penalty_bits: self.model.penalty(&item.data).to_bits(),
             key: self.model.block_key(&item.data),
             keys,
@@ -853,11 +793,7 @@ where
                         id,
                         FlowTx {
                             tx: item.data.clone(),
-                            amount: if item.lot {
-                                item.amount
-                            } else {
-                                self.model.base_amount(&item.data)
-                            },
+                            amount: item.amount,
                         },
                     );
                 }
@@ -920,43 +856,142 @@ where
     })
 }
 
-/// Establish a canonical lot amount for a subtree. `inner` sees lots whose
-/// `original` and current `amount` are initialized from `amount(&data)`, and any
-/// residual it returns keeps flowing outward with the same `original` value.
-/// This is the adapter that lets the upper plan layer opt into allocation
-/// semantics while legacy row-grouping plans continue to use amount closures on
-/// the leaves.
-struct Lots<E, FA> {
+#[derive(Clone)]
+struct PivotMeta<E> {
+    outer: Item<E>,
+    alt_original: i64,
+}
+
+struct Pivot<E, FA> {
     amount: FA,
     inner: Box<dyn Strategy<E>>,
 }
 
-impl<E, FA> Strategy<E> for Lots<E, FA>
+fn prorate(total: i64, part: i64, denom: i64) -> i64 {
+    if denom == 0 || total == 0 || part == 0 {
+        return 0;
+    }
+    let num = part as i128 * total as i128;
+    let den = denom as i128;
+    (num / den) as i64
+}
+
+impl<E, FA> Strategy<E> for Pivot<E, FA>
 where
+    E: Clone,
     FA: Fn(&E) -> i64,
 {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
-        let bag = bag
+        let mut meta: BTreeMap<ExtId, PivotMeta<E>> = BTreeMap::new();
+        let inner_bag: Vec<Item<E>> = bag
             .into_iter()
-            .map(|mut item| {
-                if !item.lot {
-                    let a = (self.amount)(&item.data);
-                    item.original = a;
-                    item.amount = a;
-                    item.lot = true;
+            .map(|outer| {
+                let alt_original = (self.amount)(&outer.data);
+                let alt_amount = prorate(alt_original, outer.amount, outer.original);
+                let id = outer.id;
+                let data = outer.data.clone();
+                meta.insert(
+                    id,
+                    PivotMeta {
+                        outer,
+                        alt_original,
+                    },
+                );
+                Item {
+                    id,
+                    original: alt_original,
+                    amount: alt_amount,
+                    data,
                 }
-                item
             })
             .collect();
-        self.inner.run(bag)
+        let res = self.inner.run(inner_bag);
+
+        // Collect pivot-numeraire output parts per id in deterministic output
+        // order: group members first, then residuals. Convert all parts for an
+        // id together so their outer amounts sum exactly to the input outer
+        // residual, with any integer rounding remainder assigned to the last
+        // part for that id.
+        let mut parts: BTreeMap<ExtId, Vec<(usize, Option<usize>, i64)>> = BTreeMap::new();
+        for (gi, g) in res.groups.iter().enumerate() {
+            for (mi, a) in g.members.iter().enumerate() {
+                parts
+                    .entry(a.id)
+                    .or_default()
+                    .push((gi, Some(mi), a.amount));
+            }
+        }
+        for (ri, item) in res.residual.iter().enumerate() {
+            parts
+                .entry(item.id)
+                .or_default()
+                .push((ri, None, item.amount));
+        }
+
+        let mut group_amounts: Vec<Vec<i64>> = res
+            .groups
+            .iter()
+            .map(|g| vec![0; g.members.len()])
+            .collect();
+        let mut residual_amounts: Vec<i64> = vec![0; res.residual.len()];
+        for (id, ps) in parts {
+            let Some(m) = meta.get(&id) else { continue };
+            let mut converted = Vec::with_capacity(ps.len());
+            let mut sum = 0i64;
+            for (_, _, amt) in &ps {
+                let v = prorate(m.outer.amount, *amt, m.alt_original);
+                converted.push(v);
+                sum += v;
+            }
+            if let Some(last) = converted.last_mut() {
+                *last += m.outer.amount - sum;
+            }
+            for ((idx, mi, _), v) in ps.into_iter().zip(converted) {
+                if let Some(mi) = mi {
+                    group_amounts[idx][mi] = v;
+                } else {
+                    residual_amounts[idx] = v;
+                }
+            }
+        }
+
+        let groups = res
+            .groups
+            .into_iter()
+            .enumerate()
+            .map(|(gi, mut g)| {
+                for (mi, a) in g.members.iter_mut().enumerate() {
+                    a.amount = group_amounts[gi][mi];
+                }
+                g.net = g.members.iter().map(|a| a.amount).sum();
+                g
+            })
+            .collect();
+        let residual = res
+            .residual
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ri, mut i)| {
+                let m = meta.remove(&i.id)?;
+                i.original = m.outer.original;
+                i.amount = residual_amounts[ri];
+                (i.amount != 0).then_some(i)
+            })
+            .collect();
+        Resolution { groups, residual }
     }
 }
 
-pub fn lots<E: 'static, FA>(amount: FA, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>>
+/// Temporarily switch the active numeraire for `inner`, then translate every
+/// produced allocation and residual back to the caller's numeraire.
+pub fn pivot<E: Clone + 'static, FA>(
+    amount: FA,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>>
 where
     FA: Fn(&E) -> i64 + 'static,
 {
-    Box::new(Lots { amount, inner })
+    Box::new(Pivot { amount, inner })
 }
 
 #[derive(Clone, Copy)]
@@ -1159,42 +1194,38 @@ mod tests {
     use super::*;
 
     fn bag(items: &[(ExtId, i64)]) -> Vec<Item<i64>> {
-        items.iter().map(|&(id, a)| Item::lot(id, a, a)).collect()
+        items.iter().map(|&(id, a)| Item::new(id, a, a)).collect()
     }
     fn ids(g: &Group) -> Vec<ExtId> {
         let mut m = g.member_ids();
         m.sort();
         m
     }
-    fn conserves(input: usize, r: &Resolution<i64>) {
+    fn conserves<E>(input: usize, r: &Resolution<E>) {
         let g: usize = r.groups.iter().map(|g| g.members.len()).sum();
         assert_eq!(g + r.residual.len(), input, "conservation violated");
     }
 
     #[test]
     fn exact_pairs_and_leaves_residual() {
-        // amounts: +5, -5, +5, +3 ; key by |amount| so signs pair within magnitude
         let b = bag(&[(1, 5), (2, -5), (3, 5), (4, 3)]);
-        let mut s = exact_1to1(|a: &i64| Some(a.unsigned_abs()), |a: &i64| *a);
+        let mut s = exact_1to1_any();
         let r = s.run(b);
         conserves(4, &r);
-        assert_eq!(r.groups.len(), 1); // one +5/-5 pair (id 2 pairs with a +5)
+        assert_eq!(r.groups.len(), 1);
         assert!(r.groups[0].member_ids().contains(&2));
-        // one +5 left unpaired plus the +3 -> 2 residual
         assert_eq!(r.residual.len(), 2);
     }
 
     #[test]
     fn agg_accepts_netting_bucket() {
         let b = bag(&[(1, 100), (2, -60), (3, -40), (4, 7)]);
-        // all in one bucket; nets to 7 -> with tol 0 it should NOT accept
-        let mut s = agg_net(|_a: &i64| 0u64, |a: &i64| *a, 0);
+        let mut s = agg_net(|_a: &i64| 0u64, 0);
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 0);
-        // with tol 10 it accepts the whole bucket
         let b = bag(&[(1, 100), (2, -60), (3, -40), (4, 7)]);
-        let mut s = agg_net(|_a: &i64| 0u64, |a: &i64| *a, 10);
+        let mut s = agg_net(|_a: &i64| 0u64, 10);
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 1);
@@ -1203,14 +1234,8 @@ mod tests {
 
     #[test]
     fn signal_groups_net_and_cascade() {
-        // ids 1,2 share token 10 and net; id 3 alone; pipeline then leaves 3.
         let b = bag(&[(1, 50), (2, -50), (3, 9)]);
-        let mut s = signal_group(
-            |a: &i64| if *a == 9 { vec![] } else { vec![10] },
-            |a: &i64| *a,
-            0,
-            16,
-        );
+        let mut s = signal_group(|a: &i64| if *a == 9 { vec![] } else { vec![10] }, 0, 16);
         let r = s.run(b);
         conserves(3, &r);
         assert_eq!(r.groups.len(), 1);
@@ -1223,8 +1248,8 @@ mod tests {
         let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
         let mut s = branch(
             |a: &i64| a.unsigned_abs() == 5,
-            agg_net(|_a: &i64| 1u64, |a: &i64| *a, 0),
-            agg_net(|_a: &i64| 2u64, |a: &i64| *a, 0),
+            agg_net(|_a: &i64| 1u64, 0),
+            agg_net(|_a: &i64| 2u64, 0),
         );
         let r = s.run(b);
         conserves(4, &r);
@@ -1234,13 +1259,8 @@ mod tests {
 
     #[test]
     fn windowed_blocks_far_matches() {
-        // +5@1 and -5@100: global exact_1to1 would pair them; windowed (w=3)
-        // must not -- they are too far apart in the ordering.
-        let b = vec![Item::lot(1, 5, (1i64, 5i64)), Item::lot(2, -5, (100, -5))];
-        let inner = exact_1to1(
-            |d: &(i64, i64)| Some(d.1.unsigned_abs()),
-            |d: &(i64, i64)| d.1,
-        );
+        let b = vec![Item::new(1, 5, (1i64, 5i64)), Item::new(2, -5, (100, -5))];
+        let inner = exact_1to1_any();
         let r = {
             let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner);
             w.run(b)
@@ -1251,13 +1271,8 @@ mod tests {
 
     #[test]
     fn windowed_finds_near_match_across_band_boundary() {
-        // +5@4 and -5@7 fall in different bands (w=3) but within one window of
-        // each other; the carry/look-ahead must still pair them.
-        let b = vec![Item::lot(1, 5, (4i64, 5i64)), Item::lot(2, -5, (7, -5))];
-        let inner = exact_1to1(
-            |d: &(i64, i64)| Some(d.1.unsigned_abs()),
-            |d: &(i64, i64)| d.1,
-        );
+        let b = vec![Item::new(1, 5, (4i64, 5i64)), Item::new(2, -5, (7, -5))];
+        let inner = exact_1to1_any();
         let r = {
             let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner);
             w.run(b)
@@ -1268,18 +1283,16 @@ mod tests {
 
     #[test]
     fn running_zero_segments_at_balance_clears() {
-        // timeline: +100, -100 | +50, -30, -20  -> two clearing segments
         let b = vec![
-            Item::lot(1, 100, (1i64, 100i64)),
-            Item::lot(2, -100, (2, -100)),
-            Item::lot(3, 50, (3, 50)),
-            Item::lot(4, -30, (4, -30)),
-            Item::lot(5, -20, (5, -20)),
+            Item::new(1, 100, (1i64, 100i64)),
+            Item::new(2, -100, (2, -100)),
+            Item::new(3, 50, (3, 50)),
+            Item::new(4, -30, (4, -30)),
+            Item::new(5, -20, (5, -20)),
         ];
-        let mut s = running_zero(|d: &(i64, i64)| d.0, |d: &(i64, i64)| d.1, 0);
+        let mut s = running_zero(|d: &(i64, i64)| d.0, 0);
         let r = s.run(b);
-        let g: usize = r.groups.iter().map(|g| g.members.len()).sum();
-        assert_eq!(g + r.residual.len(), 5);
+        conserves(5, &r);
         assert_eq!(r.groups.len(), 2);
         assert_eq!(r.groups[0].member_ids(), vec![1, 2]);
         assert_eq!(r.groups[1].member_ids(), vec![3, 4, 5]);
@@ -1288,11 +1301,11 @@ mod tests {
     #[test]
     fn running_zero_leaves_uncleared_tail() {
         let b = vec![
-            Item::lot(1, 100, (1i64, 100i64)),
-            Item::lot(2, -100, (2, -100)),
-            Item::lot(3, 7, (3, 7)), // never clears
+            Item::new(1, 100, (1i64, 100i64)),
+            Item::new(2, -100, (2, -100)),
+            Item::new(3, 7, (3, 7)),
         ];
-        let mut s = running_zero(|d: &(i64, i64)| d.0, |d: &(i64, i64)| d.1, 0);
+        let mut s = running_zero(|d: &(i64, i64)| d.0, 0);
         let r = s.run(b);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.residual.len(), 1);
@@ -1302,17 +1315,31 @@ mod tests {
     #[test]
     fn seq_then_partition_compose() {
         let mut pipeline = partition_by(
-            |a: &i64| a.signum().unsigned_abs(), // silly key just to exercise sharding
-            || {
-                seq(vec![exact_1to1(
-                    |a: &i64| Some(a.unsigned_abs()),
-                    |a: &i64| *a,
-                )])
-            },
+            |a: &i64| a.signum().unsigned_abs(),
+            || seq(vec![exact_1to1_any()]),
         );
         let b = bag(&[(1, 4), (2, -4), (3, 4), (4, -4)]);
         let r = pipeline.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 2);
+    }
+
+    #[test]
+    fn pivot_converts_back_to_outer_amount() {
+        let b = vec![Item::new(1, 110, (100i64,)), Item::new(2, -110, (-100i64,))];
+        let mut s = pivot(|d: &(i64,)| d.0, exact_1to1_any());
+        let r = s.run(b);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].net, 0);
+        assert_eq!(
+            r.groups[0].members,
+            vec![
+                Allocation { id: 1, amount: 110 },
+                Allocation {
+                    id: 2,
+                    amount: -110
+                }
+            ]
+        );
     }
 }

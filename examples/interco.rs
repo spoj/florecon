@@ -187,7 +187,7 @@ fn main() {
         let snative = (amt.abs() * 100.0).round() as i64 * sign;
         let id = items.len() as u64;
         usd_by_id.push(usd_cents);
-        items.push(Item::lot(
+        items.push(Item::new(
             id,
             snative,
             Tx {
@@ -212,22 +212,13 @@ fn main() {
                 |t: &Tx| t.ccy,
                 || {
                     seq(vec![
-                        agg_net(|t: &Tx| t.objsub, |t: &Tx| t.snative, TOL),
+                        agg_net(|t: &Tx| t.objsub, TOL),
                         // Exact amount is high-precision regardless of date gap, so
                         // it runs unwindowed; `windowed` is reserved for weak
                         // signals (amount-only fallbacks) where a far match is
                         // likely spurious.
-                        exact_1to1(
-                            |t: &Tx| {
-                                if t.snative != 0 {
-                                    Some(t.snative.unsigned_abs())
-                                } else {
-                                    None
-                                }
-                            },
-                            |t: &Tx| t.snative,
-                        ),
-                        signal_group(|t: &Tx| t.tokens.clone(), |t: &Tx| t.snative, TOL, CAP),
+                        exact_1to1(|_t: &Tx| Some(0)),
+                        signal_group(|t: &Tx| t.tokens.clone(), TOL, CAP),
                         flow(Interco { penalty: 1000.0 }),
                     ])
                 },
