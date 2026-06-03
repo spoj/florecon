@@ -12,12 +12,32 @@ export interface Group {
   status: Status;
 }
 
-export interface Report {
-  /** One assignment per input row. Unmatched rows are live singleton groups with
-   * origin "unmatched"; there is no separate residual bucket. */
-  assignments: [number, number][];
-  groups: Group[];
+export interface AllocationOut {
+  id: number;
+  group_id: number;
+  amount: number;
 }
+
+export interface AllocationSpec {
+  id: number;
+  amount: number;
+}
+
+export interface Report {
+  groups: Group[];
+  /** Allocation-native output: the same id may appear more than once when a row
+   * is partly matched and partly left as a residual/variance lot. */
+  allocations: AllocationOut[];
+}
+
+export interface Component {
+  rows: number[];
+  groups: number[];
+}
+
+export function strictAssignments(report: Report): [number, number][];
+export function primaryAssignments(report: Report, policy?: "largest_abs" | "prefer_clean" | "first_group"): [number, number][];
+export function connectedComponents(report: Report): Component[];
 
 export interface Envelope {
   ok: boolean;
@@ -83,6 +103,9 @@ export type Plan =
   | { op: "partition"; by: ScalarRef; inner: Plan }
   | { op: "branch"; pred: BoolRef; and_then: Plan; or_else: Plan }
   | { op: "windowed"; order: ScalarRef; width: number; inner: Plan }
+  | { op: "lots"; amount: ScalarRef; inner: Plan }
+  | { op: "soak_small"; max_bps?: number | null; max_abs?: number | null; origin: string; by?: ScalarRef | null }
+  | { op: "soak_all"; origin: string; by?: ScalarRef | null }
   | { op: "agg_net"; key: ScalarRef; amount: ScalarRef; tol: number }
   | { op: "exact"; amount: ScalarRef }
   | { op: "signal"; signals: string; amount: ScalarRef; tol: number; cap: number }
@@ -105,6 +128,8 @@ export type Cmd =
   | { op: "unfreeze"; group_id: number }
   | { op: "breakup"; group_id: number }
   | { op: "group"; ids: number[]; net?: number; origin?: string }
+  | { op: "group_allocations"; allocations: AllocationSpec[]; origin?: string }
+  | { op: "remove_allocations"; group_id: number; ids: number[] }
   | { op: "ungroup"; ids: number[] }
   | { op: "report" };
 

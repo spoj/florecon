@@ -16,7 +16,7 @@ import pyarrow.parquet as pq
 # Use the one canonical host — the wheel package under py/src — rather than a
 # second copy. Pinned ahead of any installed build so dev edits are live.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "py" / "src"))
-from florecon import Florecon, KEY, NUMBER, TOKENS, col, key
+from florecon import Florecon, KEY, NUMBER, TOKENS, col, key, strict_assignments
 
 WASM = "target/wasm32-unknown-unknown/release/florecon.wasm"
 FIELDS = ["reference", "reference2", "description", "name_remark_explanation", "invoice_no"]
@@ -109,7 +109,7 @@ def main():
 
     total = len(rows)
     total_value = sum(abs(v) for v in usd_by_id)
-    gid_of = {id: gid for id, gid in rep["assignments"]}
+    gid_of = {id: gid for id, gid in strict_assignments(rep)}
     groups_by_id = {g["group_id"]: g for g in rep["groups"]}
     residual_ids = {id for id, gid in gid_of.items() if groups_by_id[gid]["origin"] == "unmatched" and groups_by_id[gid]["size"] == 1}
     matched_ids = set(gid_of) - residual_ids

@@ -25,6 +25,35 @@ def windowed(order: str, width: int, inner: dict) -> dict:
     return {"op": "windowed", "order": order, "width": width, "inner": inner}
 
 
+def lots(amount: str, inner: dict) -> dict:
+    """Enter lot mode: initialize each row's original/current residual amount
+    from `amount`, then thread shrinking residuals through `inner`. Put this
+    inside `partition(...)` when residuals must stay inside a hard scope."""
+    return {"op": "lots", "amount": amount, "inner": inner}
+
+
+def soak_small(origin: str, max_bps: int = None, max_abs: int = None, by: str = None) -> dict:
+    """Consume residual lots that are small versus their original line amount
+    and/or an absolute threshold. If `by` is supplied, bucket by that class;
+    otherwise emit singleton variance groups."""
+    node = {"op": "soak_small", "origin": origin}
+    if max_bps is not None:
+        node["max_bps"] = int(max_bps)
+    if max_abs is not None:
+        node["max_abs"] = int(max_abs)
+    if by is not None:
+        node["by"] = by
+    return node
+
+
+def soak_all(origin: str = "unmatched", by: str = None) -> dict:
+    """Consume all remaining residual lots into singleton or bucketed groups."""
+    node = {"op": "soak_all", "origin": origin}
+    if by is not None:
+        node["by"] = by
+    return node
+
+
 def agg_net(key: str, amount: str, tol: int = 0) -> dict:
     """Accept an aggregation bucket (`key`) that nets to zero within `tol`."""
     return {"op": "agg_net", "key": key, "amount": amount, "tol": tol}

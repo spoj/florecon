@@ -7,7 +7,7 @@ import json
 import wasmtime
 
 # Must equal the engine's abi_version() export (plan::CONTRACT_VERSION).
-CONTRACT_VERSION = 5
+CONTRACT_VERSION = 7
 
 
 class ContractMismatch(RuntimeError):
@@ -62,10 +62,10 @@ class Florecon:
         return self._call(self._dispatch, command)
 
 
-def _ok(env: dict) -> dict:
+def _ok(env: dict, key: str = "report") -> dict:
     if not env.get("ok"):
         raise RuntimeError(env.get("error", "unknown engine error"))
-    return env.get("report", {})
+    return env.get(key, {})
 
 
 class Workspace:
@@ -122,17 +122,31 @@ class Workspace:
         return _ok(self.last)
 
     def group(self, ids, net: int = 0, origin: str = "manual") -> dict:
-        """Manually assert a frozen group over `ids` (analyst override). `net` is
-        the conserved-amount sum the host computes; rows are pulled out of any
-        live group (a live singleton or a proposed match), never a frozen one."""
+        """Manually assert a frozen group over all live allocation mass for `ids`.
+        `net` is used only when no allocation amounts are known yet."""
         self.last = self.fe.dispatch(
             {"op": "group", "ids": list(ids), "net": int(net), "origin": origin}
         )
         return _ok(self.last)
 
+    def group_allocations(self, allocations, origin: str = "manual") -> dict:
+        """Manually assert a frozen group over exact allocation amounts.
+        `allocations` is an iterable of {"id": ..., "amount": ...}."""
+        self.last = self.fe.dispatch(
+            {"op": "group_allocations", "allocations": list(allocations), "origin": origin}
+        )
+        return _ok(self.last)
+
+    def remove_allocations(self, group_id: int, ids) -> dict:
+        """Remove specific row allocations from one live group."""
+        self.last = self.fe.dispatch(
+            {"op": "remove_allocations", "group_id": group_id, "ids": list(ids)}
+        )
+        return _ok(self.last)
+
     def ungroup(self, ids) -> dict:
-        """Send `ids` back to live singletons, removing them from their live
-        group (the unified model has no separate residual set)."""
+        """Send `ids` back to live singleton allocation groups, removing them
+        from their live allocation groups."""
         self.last = self.fe.dispatch({"op": "ungroup", "ids": list(ids)})
         return _ok(self.last)
 

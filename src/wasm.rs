@@ -88,7 +88,7 @@ fn run(bytes: &[u8]) -> Vec<u8> {
 
 use crate::flow::ExtId;
 use crate::lower::Row;
-use crate::plan::{Plan, Workspace};
+use crate::plan::{AllocationSpec, Plan, Workspace};
 use crate::schema::Schema;
 
 thread_local! {
@@ -132,6 +132,14 @@ enum Cmd {
         #[serde(default)]
         origin: Option<String>,
     },
+    /// Manually assert a frozen group over exact live allocation amounts.
+    GroupAllocations {
+        allocations: Vec<AllocationSpec>,
+        #[serde(default)]
+        origin: Option<String>,
+    },
+    /// Remove specific row allocations from one live group.
+    RemoveAllocations { group_id: u64, ids: Vec<ExtId> },
     /// Send `ids` back to live singletons, removing them from their live group.
     Ungroup { ids: Vec<ExtId> },
     /// Return the current state without recomputing.
@@ -227,6 +235,13 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> Envelope {
         Cmd::Group { ids, net, origin } => ws
             .group(&ids, net, origin.as_deref().unwrap_or("manual"))
             .map(|_| ()),
+        Cmd::GroupAllocations {
+            allocations,
+            origin,
+        } => ws
+            .group_allocations(&allocations, origin.as_deref().unwrap_or("manual"))
+            .map(|_| ()),
+        Cmd::RemoveAllocations { group_id, ids } => ws.remove_allocations(group_id, &ids),
         Cmd::Ungroup { ids } => ws.ungroup(&ids),
         Cmd::Report => Ok(()),
     };

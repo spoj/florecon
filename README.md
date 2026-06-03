@@ -6,15 +6,17 @@
 combinator algebra over a min-cost-flow core**. Cheap deterministic rules
 (exact match, aggregate netting, reference-token bridges) cascade ahead of a
 network-simplex arbiter that resolves the ambiguous remainder. Every stage
-preserves mass: an input row lands in exactly **one group**, always — an
-unmatched row is simply a group of one.
+preserves signed amount: reported `allocations` are the source of truth, and a
+row/lot may contribute to more than one group when partial matching is enabled.
 
-The mental model is a **conserved pile you adjudicate, not a search you run**.
-The system is always one partition of every row into groups — there is no
-"outside" and no separate residual bucket. The machine *proposes* (a confidence
-cascade from exact matches down to flow), and you *adjudicate*: **freeze** what
-you trust, **break up** what you don't, **recalc** to retry. Frozen groups are a
-signed-off reconciliation; the live singletons are your exception queue.
+The mental model is a **conserved allocation hypergraph you adjudicate, not a
+search you run**. Groups are hyperedges; allocation rows say which business row
+contributes what signed amount to each group. The machine *proposes* (a
+confidence cascade from exact matches down to flow), and you *adjudicate*:
+**freeze** what you trust, **break up** what you don't, **recalc** to retry.
+Frozen groups are signed-off allocation edges. Row-level groupings are explicit
+client projections (strict assignment, connected components, primary group, or
+your own), not core engine truth.
 
 ## One core, every skin
 
@@ -40,7 +42,7 @@ Four layers, each a thin lowering of the one above:
 | Engine | `engine` | Network-simplex transportation solver. Stable node/arc handles, warm-started re-solves with incremental potentials, snapshot/restore. Domain-agnostic, no FX, no Arrow. |
 | Flow | `flow` | The incremental min-cost-flow matcher: describe a domain once via the `Model` trait, then `upsert` / `remove` / `solve`. Generates candidate arcs (sorted, deterministic), reads back netted groups. The engine behind the `flow` leaf. |
 | Algebra | `strategy` | `Strategy: Bag -> (Groups, residual)`, conserving by construction. Primitives `exact_1to1`, `agg_net`, `signal_group`, `running_zero`, `flow`; combinators `seq`, `partition_by`, `windowed`. |
-| Plan | `plan` | Serializable `Plan` (the strategy tree as data, pricing included via `CostSpec`), one generic stateful facade `Recon<E>` (with `Workspace` its `Row` specialization), relational `Report`. Conservation enforced at the boundary. |
+| Plan | `plan` | Serializable `Plan` (the strategy tree as data, pricing included via `CostSpec`), one generic stateful facade `Recon<E>` (with `Workspace` its `Row` specialization), allocation-native `Report`. Conservation enforced at the boundary. |
 
 The `wasm` feature compiles the `plan` API into a single C-ABI module (`alloc` /
 `dealloc` / `solve` / `dispatch` over linear memory, no wasm-bindgen) that any
@@ -52,9 +54,10 @@ wasmtime wheel.
 The same words name the same things in the crate, the wheel, the UI, and the
 code: `Plan`, `Workspace`, `Group`, and the verbs `freeze` / `breakup` /
 `recalc`. A `Plan` is the strategy as data; a `Workspace` is the conserved pile
-you adjudicate; a `Group` is a reconciliation with a `net`. "Residual" survives
-only as a human word for the exception queue — the *live singleton groups* — not
-as a separate data structure.
+you adjudicate; a `Group` is a reconciliation hyperedge with a `net`; an
+`Allocation` is the signed incidence from a row/lot into a group. "Residual"
+survives only as a human word for unmatched/variance allocation groups, not as a
+separate engine data structure.
 
 ## Design notes
 
@@ -64,16 +67,20 @@ stay true as the code moves. (Implementation walk-throughs are deliberately
 
 - **Conservation is the correctness property.** It is structural, not a runtime
   check you can forget: the combinators conserve by construction, and the
-  boundary verifies the partition before returning. A bad plan becomes a bad
-  *proposal* (a row left as a singleton), never a broken ledger.
-- **Everything is a group; `live | frozen` is the only recalc axis.** A
-  workspace is one partition of every id into groups — there is no separate
-  residual set. `Status` is the sole recalc axis and **only an operator flips
-  it**: `live` is the machine's current opinion (re-pooled on every recalc),
-  `frozen` is your decision (inviolable). Matched vs unmatched is *arity*, not
-  status — a live singleton is an unmatched row, a frozen singleton an accepted
-  exception. Live-singleton ids are **ephemeral** (re-minted each solve); only
-  frozen group ids are stable, so never reference a live id across a solve.
+  boundary materializes every residual lot as an allocation before returning. A
+  bad plan becomes a bad *proposal* (mass left in unmatched/variance groups),
+  never a broken ledger.
+- **The report is an allocation hypergraph.** `Report { groups, allocations }`
+  is the core wire shape. There is deliberately no canonical row assignment in
+  the report because split lots make that lossy: clients choose a projection
+  (`strict_assignments`, connected components, primary group, or custom).
+- **Everything reportable is a group; `live | frozen` is the only recalc axis.**
+  There is no separate residual bucket. `Status` is the sole recalc axis and
+  **only an operator flips it**: `live` is the machine's current opinion
+  (re-pooled on every recalc), `frozen` is your decision (inviolable). Matched
+  vs unmatched is a client projection over group origin/arity/net, not a third
+  status. Live group ids are **ephemeral** (re-minted each solve); only frozen
+  group ids are stable, so never reference a live group id across a solve.
 - **Review/attention is a second axis, never a third status.** Staging and tags
   are a host-owned, many-to-many overlay keyed by the **stable row id**,
   orthogonal to the engine partition and never crossing into the conservation
@@ -95,6 +102,17 @@ stay true as the code moves. (Implementation walk-throughs are deliberately
   `CostSpec` (ordered confidence tiers; first satisfied tier wins, no tier means
   forbidden). The default reproduces the reference-bridge > exact-amount
   cascade; the whole strategy, pricing included, is one JSON `Plan`.
+- **Lot capability is explicit and scoped.** A `lots(amount, inner)` plan node
+  turns a row into a lot with two amounts: the original line value and the
+  current residual left after upstream allocations. `seq` forwards residual lots
+  to the next step; `partition` is the hard reach boundary, so put
+  `lots(seq(...))` inside the partition whose residuals must not escape. The
+  report shape is unchanged: allocations always expose the maximum information,
+  and simple clients project them back to groups when appropriate.
+- **Residual classifiers are strategies.** `soak_small` consumes residual lots
+  whose current amount is immaterial versus the original line amount (basis
+  points and/or absolute minor units), optionally bucketed by a variance class;
+  `soak_all` materializes whatever remains into unmatched/writeoff buckets.
 - **Predicates and derived columns belong upstream.** The DSL expresses the
   *structure* of reconciliation (group / net / shard / cascade / window); which
   rows and what keys are a data-prep concern, computed before the table is
@@ -178,8 +196,8 @@ node web/smoke.mjs                # headless check of the browser host ABI
 
 The browser host (`@florecon/core`) is the exact analog of the Python host:
 allocate, write a JSON command, call `dispatch`, read the JSON report. The
-workbench owns only display records and filter state; the engine owns the rows
-and the conserved partition.
+workbench owns only display records, filter state, and its chosen projection;
+the engine owns the rows and the conserved allocation hypergraph.
 
 ## The contract
 

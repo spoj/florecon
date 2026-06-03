@@ -1,4 +1,4 @@
-import { Florecon } from "./core/florecon.js";
+import { Florecon, primaryAssignments } from "./core/florecon.js";
 import { TagStore } from "./core/tagstore.js";
 
 const TOL = 100; // group is "clean" if |net| <= 1.00 value unit
@@ -191,7 +191,7 @@ function command(cmd) {
 function rebuild() {
   const rep = state.report;
   const gidOf = new Map();
-  for (const [id, gid] of rep.assignments) gidOf.set(id, gid);
+  for (const [id, gid] of primaryAssignments(rep)) gidOf.set(id, gid);
 
   state.groupsById = new Map();
   for (const g of rep.groups) {
@@ -207,8 +207,8 @@ function rebuild() {
 
   const vk = state.valueKey;
   state.lines = state.data.display.map((d) => {
-    // Every id now lands in exactly one group (no separate residual set); an
-    // unmatched row is a live singleton group (origin "unmatched").
+    // The workbench chooses a primary-group projection over the allocation
+    // hypergraph for its row table. Raw allocations remain available on report.
     const gid = gidOf.has(d.id) ? gidOf.get(d.id) : -1;
     const g = state.groupsById.get(gid);
     if (g) { g.members.push(d.id); g.value += Math.abs(Number(d[vk] || 0)); }

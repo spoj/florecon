@@ -1,7 +1,7 @@
 // Node smoke test for the CSV upload -> ingest -> solve path.
 //   node web/ingest.smoke.mjs
 import { readFileSync } from "fs";
-import { Florecon } from "./core/florecon.js";
+import { Florecon, strictAssignments } from "./core/florecon.js";
 import { parseCsv, buildDataset, toCents, toEpochDay } from "./ingest.js";
 
 const here = new URL(".", import.meta.url);
@@ -63,8 +63,9 @@ r = fe.dispatch({ op: "solve" });
 ok(r.ok, "solve: " + r.error);
 const rep = r.report;
 
-// conservation: every row lands in exactly one group
-ok(rep.assignments.length === data.rows.length, "conserve " + rep.assignments.length + "/" + data.rows.length);
+// This strict fixture should project to one group per row.
+const asn = strictAssignments(rep);
+ok(asn.length === data.rows.length, "conserve " + asn.length + "/" + data.rows.length);
 // the two offsetting pairs should each form a net-zero 2-member group
 const multi = rep.groups.filter((g) => g.size >= 2);
 ok(multi.length === 2, "two matched groups, got " + multi.length);

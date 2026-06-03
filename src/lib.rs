@@ -69,6 +69,6 @@ pub use engine::{ArcId, Network, NodeId, SolveStatus};
 pub use error::ApiError;
 pub use flow::{ExtId, Group, Matcher, Model};
 pub use lower::{Cell, Kind, Row, TokenCfg};
-pub use report::{GroupOut, Report, Status};
+pub use report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use row::{LoweredCell, LoweredRow};
 pub use schema::{Column, Schema};

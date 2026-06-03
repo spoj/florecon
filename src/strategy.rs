@@ -36,14 +36,64 @@ use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 use std::marker::PhantomData;
 
-/// One lot in the bag: a caller-owned row/lot id plus its currently available
-/// signed amount and payload. A row-partition workload starts with one lot per
-/// row; a fractional strategy may split a lot by emitting a consumed allocation
-/// to a group and a remainder lot to residual.
+/// One lot in the bag: a caller-owned row/lot id, its original signed line
+/// amount, its currently available signed amount, and payload. A row-partition
+/// workload may start with [`Item::row`] (no canonical lot amount yet); a
+/// lot-aware subtree starts with [`Item::lot`] and may split a lot by emitting a
+/// consumed allocation to a group and a remainder lot to residual.
+///
+/// `original` is stable within a lot pipeline and `amount` is the shrinking
+/// residual. This lets later strategies classify leftovers by materiality, e.g.
+/// "soak this residual if it is under 2% of the original line".
 pub struct Item<E> {
     pub id: ExtId,
+    pub original: i64,
     pub amount: i64,
+    /// True when `original`/`amount` are the canonical lot amount for this item.
+    /// Legacy row-partition callers may leave this false and let leaves compute
+    /// their amount from `data` via the usual amount closures.
+    pub lot: bool,
     pub data: E,
+}
+
+impl<E> Item<E> {
+    pub fn row(id: ExtId, data: E) -> Self {
+        Item {
+            id,
+            original: 0,
+            amount: 0,
+            lot: false,
+            data,
+        }
+    }
+
+    pub fn lot(id: ExtId, amount: i64, data: E) -> Self {
+        Item {
+            id,
+            original: amount,
+            amount,
+            lot: true,
+            data,
+        }
+    }
+
+    fn effective_amount<FA>(&self, amount: &FA) -> i64
+    where
+        FA: Fn(&E) -> i64,
+    {
+        if self.lot {
+            self.amount
+        } else {
+            amount(&self.data)
+        }
+    }
+
+    fn stamp_amount<FA>(&mut self, amount: &FA)
+    where
+        FA: Fn(&E) -> i64,
+    {
+        self.amount = self.effective_amount(amount);
+    }
 }
 
 /// A resolved group of matched lot allocations.
@@ -51,7 +101,7 @@ pub struct Item<E> {
 pub struct Group {
     pub members: Vec<Allocation>,
     /// Which primitive produced it.
-    pub origin: &'static str,
+    pub origin: String,
     /// Residual in the canonical numeraire; zero means it nets out.
     pub net: i64,
 }
@@ -332,11 +382,10 @@ where
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut buckets: HashMap<u64, Vec<Item<E>>> = HashMap::new();
         let mut residual = Vec::new();
-        for item in bag {
+        for mut item in bag {
+            item.stamp_amount(&self.amount);
             match (self.key)(&item.data) {
-                Some(k) if (self.amount)(&item.data) != 0 => {
-                    buckets.entry(k).or_default().push(item)
-                }
+                Some(k) if item.amount != 0 => buckets.entry(k).or_default().push(item),
                 _ => residual.push(item),
             }
         }
@@ -347,7 +396,7 @@ where
             type Signed<E> = (Vec<Item<E>>, Vec<Item<E>>);
             let mut by_mag: HashMap<i64, Signed<E>> = HashMap::new();
             for item in items {
-                let a = (self.amount)(&item.data);
+                let a = item.amount;
                 let slot = by_mag.entry(a.abs()).or_default();
                 if a > 0 {
                     slot.0.push(item);
@@ -371,14 +420,14 @@ where
                         members: vec![
                             Allocation {
                                 id: p.id,
-                                amount: (self.amount)(&p.data),
+                                amount: p.amount,
                             },
                             Allocation {
                                 id: n.id,
-                                amount: (self.amount)(&n.data),
+                                amount: n.amount,
                             },
                         ],
-                        origin: "exact_1to1",
+                        origin: "exact_1to1".to_string(),
                         net: 0,
                     });
                 }
@@ -419,7 +468,8 @@ where
 {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut buckets: HashMap<u64, Vec<Item<E>>> = HashMap::new();
-        for item in bag {
+        for mut item in bag {
+            item.stamp_amount(&self.amount);
             buckets
                 .entry((self.key)(&item.data))
                 .or_default()
@@ -428,9 +478,9 @@ where
         let mut groups = Vec::new();
         let mut residual = Vec::new();
         for (_k, items) in buckets {
-            let sum: i64 = items.iter().map(|i| (self.amount)(&i.data)).sum();
+            let sum: i64 = items.iter().map(|i| i.amount).sum();
             let signs = items.iter().fold((false, false), |(p, n), i| {
-                let a = (self.amount)(&i.data);
+                let a = i.amount;
                 (p || a > 0, n || a < 0)
             });
             if items.len() >= 2 && sum.abs() <= self.tol && signs.0 && signs.1 {
@@ -439,10 +489,10 @@ where
                         .iter()
                         .map(|i| Allocation {
                             id: i.id,
-                            amount: (self.amount)(&i.data),
+                            amount: i.amount,
                         })
                         .collect(),
-                    origin: "agg_net",
+                    origin: "agg_net".to_string(),
                     net: sum,
                 });
             } else {
@@ -490,8 +540,9 @@ where
         let mut groups = Vec::new();
         let mut seg: Vec<Item<E>> = Vec::new();
         let mut acc: i64 = 0;
-        for item in bag {
-            acc += (self.amount)(&item.data);
+        for mut item in bag {
+            item.stamp_amount(&self.amount);
+            acc += item.amount;
             seg.push(item);
             if acc.abs() <= self.tol && seg.len() >= 2 {
                 groups.push(Group {
@@ -499,10 +550,10 @@ where
                         .iter()
                         .map(|i| Allocation {
                             id: i.id,
-                            amount: (self.amount)(&i.data),
+                            amount: i.amount,
                         })
                         .collect(),
-                    origin: "running_zero",
+                    origin: "running_zero".to_string(),
                     net: acc,
                 });
                 seg.clear();
@@ -549,8 +600,15 @@ where
     FA: Fn(&E) -> i64,
 {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let bag: Vec<Item<E>> = bag
+            .into_iter()
+            .map(|mut i| {
+                i.stamp_amount(&self.amount);
+                i
+            })
+            .collect();
         let n = bag.len();
-        let amt: Vec<i64> = bag.iter().map(|i| (self.amount)(&i.data)).collect();
+        let amt: Vec<i64> = bag.iter().map(|i| i.amount).collect();
         let sigs: Vec<Vec<u64>> = bag.iter().map(|i| (self.signals)(&i.data)).collect();
         // signal -> member indices
         let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -586,7 +644,7 @@ where
                             amount: amt[i],
                         })
                         .collect(),
-                    origin: "signal_group",
+                    origin: "signal_group".to_string(),
                     net: sum,
                 });
             }
@@ -634,10 +692,89 @@ where
 /// purely by whether the caller keeps the compiled strategy alive. Sharding is
 /// the caller's job: [`partition_by`] gives each shard its own `Flow`, so this
 /// leaf only ever sees one shard's rows.
+#[derive(Clone)]
+struct FlowTx<Tx> {
+    tx: Tx,
+    amount: i64,
+}
+
+#[derive(Clone)]
+struct FlowLotModel<M> {
+    inner: M,
+}
+
+impl<M> Model for FlowLotModel<M>
+where
+    M: Model,
+{
+    type Tx = FlowTx<M::Tx>;
+
+    fn base_amount(&self, tx: &Self::Tx) -> i64 {
+        tx.amount
+    }
+    fn penalty(&self, tx: &Self::Tx) -> f64 {
+        self.inner.penalty(&tx.tx)
+    }
+    fn block_key(&self, tx: &Self::Tx) -> i64 {
+        self.inner.block_key(&tx.tx)
+    }
+    fn window(&self) -> i64 {
+        self.inner.window()
+    }
+    fn cost(&self, a: &Self::Tx, b: &Self::Tx) -> Option<f64> {
+        self.inner.cost_lot(&a.tx, a.amount, &b.tx, b.amount)
+    }
+    fn match_keys(&self, tx: &Self::Tx) -> Vec<u64> {
+        self.inner.match_keys_lot(&tx.tx, tx.amount)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FlowSig {
+    amount: i64,
+    penalty_bits: u64,
+    key: i64,
+    keys: Vec<u64>,
+}
+
 struct Flow<M: Model> {
     model: M,
-    matcher: Matcher<M>,
-    present: BTreeSet<ExtId>,
+    matcher: Matcher<FlowLotModel<M>>,
+    loaded: HashMap<ExtId, FlowSig>,
+}
+
+impl<M> Flow<M>
+where
+    M: Model,
+{
+    fn flow_amount(&self, item: &Item<M::Tx>) -> i64 {
+        if item.lot {
+            item.amount
+        } else {
+            self.model.base_amount(&item.data)
+        }
+    }
+
+    fn flow_tx(&self, item: &Item<M::Tx>) -> FlowTx<M::Tx>
+    where
+        M::Tx: Clone,
+    {
+        FlowTx {
+            tx: item.data.clone(),
+            amount: self.flow_amount(item),
+        }
+    }
+
+    fn flow_sig(&self, item: &Item<M::Tx>) -> FlowSig {
+        let mut keys = self.model.match_keys(&item.data);
+        keys.sort_unstable();
+        FlowSig {
+            amount: self.flow_amount(item),
+            penalty_bits: self.model.penalty(&item.data).to_bits(),
+            key: self.model.block_key(&item.data),
+            keys,
+        }
+    }
 }
 
 impl<M> Strategy<M::Tx> for Flow<M>
@@ -648,22 +785,34 @@ where
     fn run(&mut self, bag: Vec<Item<M::Tx>>) -> Resolution<M::Tx> {
         let timed = std::env::var_os("FLORECON_TIME").is_some();
         let want: BTreeSet<ExtId> = bag.iter().map(|i| i.id).collect();
-        // id -> payload references (no clones unless we actually upsert).
-        let data: HashMap<ExtId, &M::Tx> = bag.iter().map(|i| (i.id, &i.data)).collect();
+        // id -> lot references (no clones unless we actually upsert). The
+        // matcher conserves the lot's *current* amount, not a fresh amount
+        // recomputed from original row data, so partial residuals compose
+        // through `seq`.
+        let data: HashMap<ExtId, &Item<M::Tx>> = bag.iter().map(|i| (i.id, i)).collect();
+        let sigs: HashMap<ExtId, FlowSig> = bag.iter().map(|i| (i.id, self.flow_sig(i))).collect();
 
-        // Diff want vs present. Upsert adds in a deterministic *scrambled* order
-        // (see `flow_upsert_rank`): a monotone id order is a pathological
-        // network-simplex pivot sequence, and scrambling also makes a cold first
-        // build agree bit-for-bit with a shard that was grown warm.
-        let mut adds: Vec<ExtId> = want.difference(&self.present).copied().collect();
-        adds.sort_by_key(|&id| flow_upsert_rank(id));
-        let drops: Vec<ExtId> = self.present.difference(&want).copied().collect();
+        // Diff want vs loaded. Upsert both new ids and same-id rows whose
+        // current lot amount or candidate-generation signature changed; this is
+        // what keeps warm lot recalc correct when an upstream step changes the
+        // residual amount of an id that remains present.
+        let mut upserts: Vec<ExtId> = sigs
+            .iter()
+            .filter_map(|(&id, sig)| (self.loaded.get(&id) != Some(sig)).then_some(id))
+            .collect();
+        upserts.sort_by_key(|&id| flow_upsert_rank(id));
+        let drops: Vec<ExtId> = self
+            .loaded
+            .keys()
+            .copied()
+            .filter(|id| !want.contains(id))
+            .collect();
 
         // Instant is only touched when profiling; wasm has no clock source.
         let tb = timed.then(std::time::Instant::now);
-        for id in adds {
-            if let Some(tx) = data.get(&id) {
-                self.matcher.upsert(id, (*tx).clone());
+        for id in upserts {
+            if let Some(item) = data.get(&id) {
+                self.matcher.upsert(id, self.flow_tx(item));
             }
         }
         for id in drops {
@@ -680,7 +829,7 @@ where
             );
         }
         debug_assert_eq!(status, SolveStatus::Optimal);
-        self.present = want;
+        self.loaded = sigs;
 
         // Determinism guard: in debug builds (or when FLORECON_VERIFY_WARM is
         // set) rebuild a fresh cold matcher on the same id set and assert the
@@ -693,12 +842,24 @@ where
         // false-positiving on benign tie re-grouping (see the
         // `warm_flow_matches_cold_*` equivalence tests).
         if cfg!(debug_assertions) || std::env::var_os("FLORECON_VERIFY_WARM").is_some() {
-            let mut cold = Matcher::new(self.model.clone());
+            let mut cold = Matcher::new(FlowLotModel {
+                inner: self.model.clone(),
+            });
             let mut ids: Vec<ExtId> = data.keys().copied().collect();
             ids.sort_unstable();
             for id in ids {
-                if let Some(tx) = data.get(&id) {
-                    cold.upsert(id, (*tx).clone());
+                if let Some(item) = data.get(&id) {
+                    cold.upsert(
+                        id,
+                        FlowTx {
+                            tx: item.data.clone(),
+                            amount: if item.lot {
+                                item.amount
+                            } else {
+                                self.model.base_amount(&item.data)
+                            },
+                        },
+                    );
                 }
             }
             cold.solve();
@@ -716,7 +877,7 @@ where
             .into_iter()
             .map(|g| Group {
                 members: g.members,
-                origin: "flow",
+                origin: "flow".to_string(),
                 net: g.net_base,
             })
             .collect();
@@ -751,9 +912,226 @@ where
     M::Tx: Clone + 'static,
 {
     Box::new(Flow {
-        matcher: Matcher::new(model.clone()),
+        matcher: Matcher::new(FlowLotModel {
+            inner: model.clone(),
+        }),
         model,
-        present: BTreeSet::new(),
+        loaded: HashMap::new(),
+    })
+}
+
+/// Establish a canonical lot amount for a subtree. `inner` sees lots whose
+/// `original` and current `amount` are initialized from `amount(&data)`, and any
+/// residual it returns keeps flowing outward with the same `original` value.
+/// This is the adapter that lets the upper plan layer opt into allocation
+/// semantics while legacy row-grouping plans continue to use amount closures on
+/// the leaves.
+struct Lots<E, FA> {
+    amount: FA,
+    inner: Box<dyn Strategy<E>>,
+}
+
+impl<E, FA> Strategy<E> for Lots<E, FA>
+where
+    FA: Fn(&E) -> i64,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let bag = bag
+            .into_iter()
+            .map(|mut item| {
+                if !item.lot {
+                    let a = (self.amount)(&item.data);
+                    item.original = a;
+                    item.amount = a;
+                    item.lot = true;
+                }
+                item
+            })
+            .collect();
+        self.inner.run(bag)
+    }
+}
+
+pub fn lots<E: 'static, FA>(amount: FA, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>>
+where
+    FA: Fn(&E) -> i64 + 'static,
+{
+    Box::new(Lots { amount, inner })
+}
+
+#[derive(Clone, Copy)]
+pub enum SoakMode {
+    Singleton,
+    Bucket,
+}
+
+struct SoakSmall<E, FK> {
+    max_bps: Option<i64>,
+    max_abs: Option<i64>,
+    key: FK,
+    mode: SoakMode,
+    origin: String,
+    _e: PhantomData<E>,
+}
+
+impl<E, K, FK> Strategy<E> for SoakSmall<E, FK>
+where
+    K: Hash + Eq + Clone + ToString,
+    FK: Fn(&Item<E>) -> K,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let mut groups = Vec::new();
+        let mut residual = Vec::new();
+        let mut buckets: HashMap<K, Vec<Item<E>>> = HashMap::new();
+        for item in bag {
+            if is_small_residual(&item, self.max_bps, self.max_abs) {
+                match self.mode {
+                    SoakMode::Singleton => groups.push(Group {
+                        members: vec![Allocation {
+                            id: item.id,
+                            amount: item.amount,
+                        }],
+                        origin: self.origin.clone(),
+                        net: item.amount,
+                    }),
+                    SoakMode::Bucket => buckets.entry((self.key)(&item)).or_default().push(item),
+                }
+            } else {
+                residual.push(item);
+            }
+        }
+        for (k, items) in buckets {
+            let net: i64 = items.iter().map(|i| i.amount).sum();
+            groups.push(Group {
+                members: items
+                    .iter()
+                    .map(|i| Allocation {
+                        id: i.id,
+                        amount: i.amount,
+                    })
+                    .collect(),
+                origin: format!("{}:{}", self.origin, k.to_string()),
+                net,
+            });
+        }
+        Resolution { groups, residual }
+    }
+}
+
+fn is_small_residual<E>(item: &Item<E>, max_bps: Option<i64>, max_abs: Option<i64>) -> bool {
+    if item.amount == 0 {
+        return false;
+    }
+    if let Some(max_abs) = max_abs
+        && item.amount.abs() <= max_abs.abs()
+    {
+        return true;
+    }
+    if let Some(max_bps) = max_bps
+        && item.original != 0
+    {
+        // Avoid overflow on large line values by comparing after promoting to
+        // i128. `max_bps` is basis points, so 200 means 2%.
+        let lhs = item.amount.abs() as i128 * 10_000;
+        let rhs = item.original.abs() as i128 * max_bps.max(0) as i128;
+        return lhs <= rhs;
+    }
+    false
+}
+
+/// Consume residual lots whose current amount is immaterial versus their
+/// original line amount and/or an absolute threshold. Singleton mode produces
+/// one variance group per residual; bucket mode groups small residuals by `key`.
+pub fn soak_small<E: 'static, K, FK>(
+    max_bps: Option<i64>,
+    max_abs: Option<i64>,
+    mode: SoakMode,
+    origin: impl Into<String>,
+    key: FK,
+) -> Box<dyn Strategy<E>>
+where
+    K: Hash + Eq + Clone + ToString + 'static,
+    FK: Fn(&Item<E>) -> K + 'static,
+{
+    Box::new(SoakSmall {
+        max_bps,
+        max_abs,
+        key,
+        mode,
+        origin: origin.into(),
+        _e: PhantomData,
+    })
+}
+
+struct SoakAll<E, FK> {
+    key: FK,
+    mode: SoakMode,
+    origin: String,
+    _e: PhantomData<E>,
+}
+
+impl<E, K, FK> Strategy<E> for SoakAll<E, FK>
+where
+    K: Hash + Eq + Clone + ToString,
+    FK: Fn(&Item<E>) -> K,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let mut groups = Vec::new();
+        let mut buckets: HashMap<K, Vec<Item<E>>> = HashMap::new();
+        for item in bag {
+            if item.amount == 0 {
+                continue;
+            }
+            match self.mode {
+                SoakMode::Singleton => groups.push(Group {
+                    members: vec![Allocation {
+                        id: item.id,
+                        amount: item.amount,
+                    }],
+                    origin: self.origin.clone(),
+                    net: item.amount,
+                }),
+                SoakMode::Bucket => buckets.entry((self.key)(&item)).or_default().push(item),
+            }
+        }
+        for (k, items) in buckets {
+            let net: i64 = items.iter().map(|i| i.amount).sum();
+            groups.push(Group {
+                members: items
+                    .iter()
+                    .map(|i| Allocation {
+                        id: i.id,
+                        amount: i.amount,
+                    })
+                    .collect(),
+                origin: format!("{}:{}", self.origin, k.to_string()),
+                net,
+            });
+        }
+        Resolution {
+            groups,
+            residual: Vec::new(),
+        }
+    }
+}
+
+/// Consume every remaining non-zero residual lot into singleton or bucketed
+/// groups. This is a terminal classifier, not a matcher: non-zero group nets are
+/// expected and represent unmatched/variance/writeoff classes.
+pub fn soak_all<E: 'static, K, FK>(
+    mode: SoakMode,
+    origin: impl Into<String>,
+    key: FK,
+) -> Box<dyn Strategy<E>>
+where
+    K: Hash + Eq + Clone + ToString + 'static,
+    FK: Fn(&Item<E>) -> K + 'static,
+{
+    Box::new(SoakAll {
+        key,
+        mode,
+        origin: origin.into(),
+        _e: PhantomData,
     })
 }
 
@@ -781,14 +1159,7 @@ mod tests {
     use super::*;
 
     fn bag(items: &[(ExtId, i64)]) -> Vec<Item<i64>> {
-        items
-            .iter()
-            .map(|&(id, a)| Item {
-                id,
-                amount: a,
-                data: a,
-            })
-            .collect()
+        items.iter().map(|&(id, a)| Item::lot(id, a, a)).collect()
     }
     fn ids(g: &Group) -> Vec<ExtId> {
         let mut m = g.member_ids();
@@ -865,18 +1236,7 @@ mod tests {
     fn windowed_blocks_far_matches() {
         // +5@1 and -5@100: global exact_1to1 would pair them; windowed (w=3)
         // must not -- they are too far apart in the ordering.
-        let b = vec![
-            Item {
-                id: 1,
-                amount: 5,
-                data: (1i64, 5i64),
-            },
-            Item {
-                id: 2,
-                amount: -5,
-                data: (100, -5),
-            },
-        ];
+        let b = vec![Item::lot(1, 5, (1i64, 5i64)), Item::lot(2, -5, (100, -5))];
         let inner = exact_1to1(
             |d: &(i64, i64)| Some(d.1.unsigned_abs()),
             |d: &(i64, i64)| d.1,
@@ -893,18 +1253,7 @@ mod tests {
     fn windowed_finds_near_match_across_band_boundary() {
         // +5@4 and -5@7 fall in different bands (w=3) but within one window of
         // each other; the carry/look-ahead must still pair them.
-        let b = vec![
-            Item {
-                id: 1,
-                amount: 5,
-                data: (4i64, 5i64),
-            },
-            Item {
-                id: 2,
-                amount: -5,
-                data: (7, -5),
-            },
-        ];
+        let b = vec![Item::lot(1, 5, (4i64, 5i64)), Item::lot(2, -5, (7, -5))];
         let inner = exact_1to1(
             |d: &(i64, i64)| Some(d.1.unsigned_abs()),
             |d: &(i64, i64)| d.1,
@@ -921,31 +1270,11 @@ mod tests {
     fn running_zero_segments_at_balance_clears() {
         // timeline: +100, -100 | +50, -30, -20  -> two clearing segments
         let b = vec![
-            Item {
-                id: 1,
-                amount: 100,
-                data: (1i64, 100i64),
-            },
-            Item {
-                id: 2,
-                amount: -100,
-                data: (2, -100),
-            },
-            Item {
-                id: 3,
-                amount: 50,
-                data: (3, 50),
-            },
-            Item {
-                id: 4,
-                amount: -30,
-                data: (4, -30),
-            },
-            Item {
-                id: 5,
-                amount: -20,
-                data: (5, -20),
-            },
+            Item::lot(1, 100, (1i64, 100i64)),
+            Item::lot(2, -100, (2, -100)),
+            Item::lot(3, 50, (3, 50)),
+            Item::lot(4, -30, (4, -30)),
+            Item::lot(5, -20, (5, -20)),
         ];
         let mut s = running_zero(|d: &(i64, i64)| d.0, |d: &(i64, i64)| d.1, 0);
         let r = s.run(b);
@@ -959,21 +1288,9 @@ mod tests {
     #[test]
     fn running_zero_leaves_uncleared_tail() {
         let b = vec![
-            Item {
-                id: 1,
-                amount: 100,
-                data: (1i64, 100i64),
-            },
-            Item {
-                id: 2,
-                amount: -100,
-                data: (2, -100),
-            },
-            Item {
-                id: 3,
-                amount: 7,
-                data: (3, 7),
-            }, // never clears
+            Item::lot(1, 100, (1i64, 100i64)),
+            Item::lot(2, -100, (2, -100)),
+            Item::lot(3, 7, (3, 7)), // never clears
         ];
         let mut s = running_zero(|d: &(i64, i64)| d.0, |d: &(i64, i64)| d.1, 0);
         let r = s.run(b);

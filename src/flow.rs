@@ -42,6 +42,14 @@ pub trait Model {
     /// Cost of matching source `a` with sink `b`, or `None` to forbid the pair.
     fn cost(&self, a: &Self::Tx, b: &Self::Tx) -> Option<f64>;
 
+    /// Cost hook for lot wrappers that conserve a current residual amount
+    /// different from the row's original base amount. Domain models that price
+    /// amount-dependent conditions can override this; the default preserves the
+    /// legacy whole-row behavior.
+    fn cost_lot(&self, a: &Self::Tx, _a_amount: i64, b: &Self::Tx, _b_amount: i64) -> Option<f64> {
+        self.cost(a, b)
+    }
+
     /// Optional exact-join keys for candidate generation (e.g. hashed reference
     /// tokens). Opposite-sign transactions that share any key become candidate
     /// pairs, *in addition to* the `block_key` proximity window. This is how
@@ -49,6 +57,12 @@ pub trait Model {
     /// description) drive matching. Default: none.
     fn match_keys(&self, _tx: &Self::Tx) -> Vec<u64> {
         Vec::new()
+    }
+
+    /// Exact-join keys for a lot whose current residual amount differs from the
+    /// original row amount. Defaults to [`Model::match_keys`].
+    fn match_keys_lot(&self, tx: &Self::Tx, _amount: i64) -> Vec<u64> {
+        self.match_keys(tx)
     }
 }
 

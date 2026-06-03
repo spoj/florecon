@@ -28,6 +28,7 @@ native extension to compile.
 from ._host import CONTRACT_VERSION, ContractMismatch, Florecon, Workspace
 from .data import KEY, NUMBER, TOKENS, col, key, schema
 from . import plan
+from .projections import connected_components, strict_assignments
 
 __all__ = [
     "Florecon",
@@ -41,5 +42,7 @@ __all__ = [
     "TOKENS",
     "CONTRACT_VERSION",
     "ContractMismatch",
+    "strict_assignments",
+    "connected_components",
 ]
 __version__ = "0.1.0"

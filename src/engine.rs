@@ -1099,7 +1099,11 @@ impl Network {
         // arc to hit a bound (or the entering arc's own width => bound flip).
         let limit = |inc: bool, a: &Arc| -> i64 {
             if inc {
-                if a.upper == INF { INF } else { a.upper - a.flow }
+                if a.upper == INF {
+                    INF
+                } else {
+                    a.upper - a.flow
+                }
             } else {
                 a.flow - a.lower
             }
@@ -1109,7 +1113,11 @@ impl Network {
         // Start with the entering arc's own bound-flip width.
         let mut best_theta = {
             let a = &self.arcs[entering as usize];
-            if a.upper == INF { INF } else { a.upper - a.lower }
+            if a.upper == INF {
+                INF
+            } else {
+                a.upper - a.lower
+            }
         };
         let mut leaving = NONE; // NONE => bound flip on the entering arc
         let mut leaving_inc = false;
@@ -1151,15 +1159,21 @@ impl Network {
         if leaving == NONE {
             // Bound flip: the entering arc moves to its opposite bound; the
             // basis (tree/potentials) is unchanged.
-            self.arcs[entering as usize].state =
-                if dir > 0 { ArcState::AtUpper } else { ArcState::AtLower };
+            self.arcs[entering as usize].state = if dir > 0 {
+                ArcState::AtUpper
+            } else {
+                ArcState::AtLower
+            };
             return true;
         }
 
         // Real pivot: leaving arc rests at the bound it hit; entering joins the
         // basis.
-        self.arcs[leaving as usize].state =
-            if leaving_inc { ArcState::AtUpper } else { ArcState::AtLower };
+        self.arcs[leaving as usize].state = if leaving_inc {
+            ArcState::AtUpper
+        } else {
+            ArcState::AtLower
+        };
         self.arcs[entering as usize].state = ArcState::Basic;
 
         // Incremental structure + potential update. The detached subtree is the
@@ -1267,12 +1281,21 @@ impl Network {
     /// leaving arc, pick the eligible one with the smallest |reduced cost| (so
     /// dual feasibility is preserved). `child` must already be subtree-marked.
     /// Returns `(entering, rc, dir)`.
-    fn find_entering_dual(&mut self, leaving: u32, child: usize, beta: i64) -> Option<(u32, f64, i64)> {
+    fn find_entering_dual(
+        &mut self,
+        leaving: u32,
+        child: usize,
+        beta: i64,
+    ) -> Option<(u32, f64, i64)> {
         let s = self.mark_subtree(child);
         // Orientation of the leaving arc across the cut (R -> S is +1).
         let cross_l = {
             let a = &self.arcs[leaving as usize];
-            if self.stamp[a.to as usize] == s { 1i64 } else { -1i64 }
+            if self.stamp[a.to as usize] == s {
+                1i64
+            } else {
+                -1i64
+            }
         };
         let target = -beta * cross_l;
 
@@ -1387,7 +1410,16 @@ impl Network {
                 return SolveStatus::Optimal;
             };
             self.dbg.subtree_nodes += self.subtree_buf.len() as u64;
-            self.dual_pivot(entering, rc, dir, DualLeave { arc: leaving, beta, theta: viol });
+            self.dual_pivot(
+                entering,
+                rc,
+                dir,
+                DualLeave {
+                    arc: leaving,
+                    beta,
+                    theta: viol,
+                },
+            );
 
             since_refactor += 1;
             if since_refactor >= REFACTOR_INTERVAL {
@@ -1418,7 +1450,11 @@ impl Network {
                         entering,
                         rc,
                         dir,
-                        DualLeave { arc: s as u32, beta: 1, theta: 0 },
+                        DualLeave {
+                            arc: s as u32,
+                            beta: 1,
+                            theta: 0,
+                        },
                     );
                 } else {
                     self.needs_rebuild = true;
@@ -1440,10 +1476,7 @@ mod tests {
     use super::*;
 
     fn matched_pairs(net: &Network) -> Vec<(u32, u32, i64)> {
-        let mut v: Vec<_> = net
-            .matches()
-            .map(|(a, b, f)| (a.slot, b.slot, f))
-            .collect();
+        let mut v: Vec<_> = net.matches().map(|(a, b, f)| (a.slot, b.slot, f)).collect();
         v.sort();
         v
     }
@@ -1613,10 +1646,16 @@ mod tests {
         }
 
         for round in 0..25 {
-            let costs: Vec<Vec<f64>> =
-                (0..k).map(|_| (0..k).map(|_| 1.0 + (rng() % 40) as f64).collect()).collect();
-            let caps: Vec<Vec<i64>> =
-                (0..k).map(|_| (0..k).map(|_| (rng() % (supply as u64 + 1)) as i64).collect()).collect();
+            let costs: Vec<Vec<f64>> = (0..k)
+                .map(|_| (0..k).map(|_| 1.0 + (rng() % 40) as f64).collect())
+                .collect();
+            let caps: Vec<Vec<i64>> = (0..k)
+                .map(|_| {
+                    (0..k)
+                        .map(|_| (rng() % (supply as u64 + 1)) as i64)
+                        .collect()
+                })
+                .collect();
             for r in 0..k {
                 for c in 0..k {
                     warm.set_cost(warc[r][c], costs[r][c]);
@@ -1656,104 +1695,104 @@ mod tests {
             *seed ^= *seed << 17;
             *seed
         }
-      for trial in 0..12u64 {
-        let mut seed = 0xfeed_dead_beef_cafe ^ trial.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let mut rng = || xorshift(&mut seed);
-        let k = 4 + (trial as usize % 4); // 4..7
-        let pen = 500.0;
+        for trial in 0..12u64 {
+            let mut seed = 0xfeed_dead_beef_cafe ^ trial.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut rng = || xorshift(&mut seed);
+            let k = 4 + (trial as usize % 4); // 4..7
+            let pen = 500.0;
 
-        // Shadow state.
-        let mut sup = vec![0i64; 2 * k]; // 0..k sources (+), k..2k sinks (-)
-        for i in 0..k {
-            sup[i] = 5 + (rng() % 10) as i64;
-            sup[k + i] = -(5 + (rng() % 10) as i64);
-        }
-        let mut cost = vec![vec![0.0f64; k]; k];
-        let mut present = vec![vec![false; k]; k];
-        for r in 0..k {
-            for c in 0..k {
-                cost[r][c] = 1.0 + (rng() % 30) as f64;
-                present[r][c] = rng() % 3 != 0;
+            // Shadow state.
+            let mut sup = vec![0i64; 2 * k]; // 0..k sources (+), k..2k sinks (-)
+            for i in 0..k {
+                sup[i] = 5 + (rng() % 10) as i64;
+                sup[k + i] = -(5 + (rng() % 10) as i64);
             }
-        }
-
-        // Warm network mirroring the shadow.
-        let mut warm = Network::new();
-        let wsrc: Vec<NodeId> = (0..k).map(|i| warm.add_node(sup[i], pen)).collect();
-        let wsnk: Vec<NodeId> = (0..k).map(|i| warm.add_node(sup[k + i], pen)).collect();
-        let mut waid = vec![vec![None::<ArcId>; k]; k];
-        for r in 0..k {
-            for c in 0..k {
-                if present[r][c] {
-                    waid[r][c] = warm.add_arc(wsrc[r], wsnk[c], cost[r][c]);
+            let mut cost = vec![vec![0.0f64; k]; k];
+            let mut present = vec![vec![false; k]; k];
+            for r in 0..k {
+                for c in 0..k {
+                    cost[r][c] = 1.0 + (rng() % 30) as f64;
+                    present[r][c] = rng() % 3 != 0;
                 }
             }
-        }
-        warm.solve();
 
-        let build_cold = |sup: &[i64], cost: &[Vec<f64>], present: &[Vec<bool>]| {
-            let mut cold = Network::new();
-            let s: Vec<NodeId> = (0..k).map(|i| cold.add_node(sup[i], pen)).collect();
-            let t: Vec<NodeId> = (0..k).map(|i| cold.add_node(sup[k + i], pen)).collect();
+            // Warm network mirroring the shadow.
+            let mut warm = Network::new();
+            let wsrc: Vec<NodeId> = (0..k).map(|i| warm.add_node(sup[i], pen)).collect();
+            let wsnk: Vec<NodeId> = (0..k).map(|i| warm.add_node(sup[k + i], pen)).collect();
+            let mut waid = vec![vec![None::<ArcId>; k]; k];
             for r in 0..k {
                 for c in 0..k {
                     if present[r][c] {
-                        cold.add_arc(s[r], t[c], cost[r][c]);
-                    }
-                }
-            }
-            cold.solve();
-            cold.total_cost()
-        };
-
-        for round in 0..200 {
-            match rng() % 4 {
-                0 => {
-                    // Supply edit (keep sign so sources stay sources).
-                    let i = (rng() % (2 * k) as u64) as usize;
-                    let mag = 5 + (rng() % 10) as i64;
-                    sup[i] = if i < k { mag } else { -mag };
-                    let node = if i < k { wsrc[i] } else { wsnk[i - k] };
-                    warm.set_supply(node, sup[i]);
-                }
-                1 => {
-                    // Cost change on a present arc.
-                    let r = (rng() % k as u64) as usize;
-                    let c = (rng() % k as u64) as usize;
-                    if present[r][c] {
-                        cost[r][c] = 1.0 + (rng() % 30) as f64;
-                        warm.set_cost(waid[r][c].unwrap(), cost[r][c]);
-                    }
-                }
-                2 => {
-                    // Remove a present arc.
-                    let r = (rng() % k as u64) as usize;
-                    let c = (rng() % k as u64) as usize;
-                    if present[r][c] {
-                        present[r][c] = false;
-                        warm.remove_arc(waid[r][c].take().unwrap());
-                    }
-                }
-                _ => {
-                    // Add a missing arc.
-                    let r = (rng() % k as u64) as usize;
-                    let c = (rng() % k as u64) as usize;
-                    if !present[r][c] {
-                        present[r][c] = true;
-                        cost[r][c] = 1.0 + (rng() % 30) as f64;
                         waid[r][c] = warm.add_arc(wsrc[r], wsnk[c], cost[r][c]);
                     }
                 }
             }
             warm.solve();
-            let warm_cost = warm.total_cost();
-            let cold_cost = build_cold(&sup, &cost, &present);
-            assert!(
-                (warm_cost - cold_cost).abs() < 1e-6,
-                "trial {trial} round {round}: warm {warm_cost} != cold {cold_cost}"
-            );
+
+            let build_cold = |sup: &[i64], cost: &[Vec<f64>], present: &[Vec<bool>]| {
+                let mut cold = Network::new();
+                let s: Vec<NodeId> = (0..k).map(|i| cold.add_node(sup[i], pen)).collect();
+                let t: Vec<NodeId> = (0..k).map(|i| cold.add_node(sup[k + i], pen)).collect();
+                for r in 0..k {
+                    for c in 0..k {
+                        if present[r][c] {
+                            cold.add_arc(s[r], t[c], cost[r][c]);
+                        }
+                    }
+                }
+                cold.solve();
+                cold.total_cost()
+            };
+
+            for round in 0..200 {
+                match rng() % 4 {
+                    0 => {
+                        // Supply edit (keep sign so sources stay sources).
+                        let i = (rng() % (2 * k) as u64) as usize;
+                        let mag = 5 + (rng() % 10) as i64;
+                        sup[i] = if i < k { mag } else { -mag };
+                        let node = if i < k { wsrc[i] } else { wsnk[i - k] };
+                        warm.set_supply(node, sup[i]);
+                    }
+                    1 => {
+                        // Cost change on a present arc.
+                        let r = (rng() % k as u64) as usize;
+                        let c = (rng() % k as u64) as usize;
+                        if present[r][c] {
+                            cost[r][c] = 1.0 + (rng() % 30) as f64;
+                            warm.set_cost(waid[r][c].unwrap(), cost[r][c]);
+                        }
+                    }
+                    2 => {
+                        // Remove a present arc.
+                        let r = (rng() % k as u64) as usize;
+                        let c = (rng() % k as u64) as usize;
+                        if present[r][c] {
+                            present[r][c] = false;
+                            warm.remove_arc(waid[r][c].take().unwrap());
+                        }
+                    }
+                    _ => {
+                        // Add a missing arc.
+                        let r = (rng() % k as u64) as usize;
+                        let c = (rng() % k as u64) as usize;
+                        if !present[r][c] {
+                            present[r][c] = true;
+                            cost[r][c] = 1.0 + (rng() % 30) as f64;
+                            waid[r][c] = warm.add_arc(wsrc[r], wsnk[c], cost[r][c]);
+                        }
+                    }
+                }
+                warm.solve();
+                let warm_cost = warm.total_cost();
+                let cold_cost = build_cold(&sup, &cost, &present);
+                assert!(
+                    (warm_cost - cold_cost).abs() < 1e-6,
+                    "trial {trial} round {round}: warm {warm_cost} != cold {cold_cost}"
+                );
+            }
         }
-      }
     }
 
     #[test]
@@ -1792,8 +1831,9 @@ mod tests {
 
         for _ in 0..40 {
             let k = 2 + (rng() % 4) as usize; // 2..=5 per side
-            let costs: Vec<Vec<f64>> =
-                (0..k).map(|_| (0..k).map(|_| 1.0 + (rng() % 50) as f64).collect()).collect();
+            let costs: Vec<Vec<f64>> = (0..k)
+                .map(|_| (0..k).map(|_| 1.0 + (rng() % 50) as f64).collect())
+                .collect();
 
             let mut net = Network::new();
             let sources: Vec<NodeId> = (0..k).map(|_| net.add_node(1, 1e6)).collect();
@@ -1807,7 +1847,13 @@ mod tests {
             net.solve();
             let obj: f64 = (0..k)
                 .flat_map(|r| (0..k).map(move |cc| (r, cc)))
-                .map(|(r, cc)| if net.flow(arc_of[r][cc]) > 0 { costs[r][cc] } else { 0.0 })
+                .map(|(r, cc)| {
+                    if net.flow(arc_of[r][cc]) > 0 {
+                        costs[r][cc]
+                    } else {
+                        0.0
+                    }
+                })
                 .sum();
             let opt = brute(&costs, k);
             assert!((obj - opt).abs() < 1e-6, "obj {obj} != opt {opt} (k={k})");
@@ -1839,8 +1885,9 @@ mod tests {
         }
 
         for round in 0..30 {
-            let costs: Vec<Vec<f64>> =
-                (0..k).map(|_| (0..k).map(|_| 1.0 + (rng() % 90) as f64).collect()).collect();
+            let costs: Vec<Vec<f64>> = (0..k)
+                .map(|_| (0..k).map(|_| 1.0 + (rng() % 90) as f64).collect())
+                .collect();
             for r in 0..k {
                 for c in 0..k {
                     warm.set_cost(warc[r][c], costs[r][c]);
@@ -1849,7 +1896,13 @@ mod tests {
             warm.solve();
             let warm_obj: f64 = (0..k)
                 .flat_map(|r| (0..k).map(move |c| (r, c)))
-                .map(|(r, c)| if warm.flow(warc[r][c]) > 0 { costs[r][c] } else { 0.0 })
+                .map(|(r, c)| {
+                    if warm.flow(warc[r][c]) > 0 {
+                        costs[r][c]
+                    } else {
+                        0.0
+                    }
+                })
                 .sum();
 
             // cold equivalent
@@ -1865,7 +1918,13 @@ mod tests {
             cold.solve();
             let cold_obj: f64 = (0..k)
                 .flat_map(|r| (0..k).map(move |c| (r, c)))
-                .map(|(r, c)| if cold.flow(carc[r][c]) > 0 { costs[r][c] } else { 0.0 })
+                .map(|(r, c)| {
+                    if cold.flow(carc[r][c]) > 0 {
+                        costs[r][c]
+                    } else {
+                        0.0
+                    }
+                })
                 .sum();
 
             assert!(

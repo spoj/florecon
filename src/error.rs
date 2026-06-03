@@ -23,6 +23,18 @@ pub enum ApiError {
     FrozenMember(ExtId),
     /// A manual group needs at least two distinct members.
     DegenerateGroup,
+    /// A requested allocation amount is not available in the live (unfrozen)
+    /// pool for that row id.
+    InsufficientLiveAmount {
+        id: ExtId,
+        requested: i64,
+        available: i64,
+    },
+    /// A group does not contain a live allocation for the requested row id.
+    UnknownAllocation {
+        group_id: u64,
+        id: ExtId,
+    },
     /// A bare cell did not match its column kind (e.g. a string in a `Number`
     /// column). `col` is the column index; `want` the expected scalar.
     BadCell {
@@ -48,6 +60,17 @@ impl std::fmt::Display for ApiError {
                 write!(f, "row {id} is in a frozen group; unfreeze it first")
             }
             ApiError::DegenerateGroup => write!(f, "a manual group needs at least two rows"),
+            ApiError::InsufficientLiveAmount {
+                id,
+                requested,
+                available,
+            } => write!(
+                f,
+                "row {id}: requested live amount {requested}, only {available} available"
+            ),
+            ApiError::UnknownAllocation { group_id, id } => {
+                write!(f, "group {group_id} has no live allocation for row {id}")
+            }
             ApiError::BadCell { col, want } => write!(f, "column {col}: expected a {want}"),
         }
     }

@@ -22,6 +22,10 @@ serde = ["dep:serde", "dep:serde_json"]
 # The WASM consumption surface (C-ABI exports over linear memory).
 wasm = ["serde"]
 
+[[example]]
+name = "timeit"
+required-features = ["serde"]
+
 [dev-dependencies]
 csv = "1.3"
 parquet = "51.0"

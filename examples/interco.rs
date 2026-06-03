@@ -187,10 +187,10 @@ fn main() {
         let snative = (amt.abs() * 100.0).round() as i64 * sign;
         let id = items.len() as u64;
         usd_by_id.push(usd_cents);
-        items.push(Item {
+        items.push(Item::lot(
             id,
-            amount: snative,
-            data: Tx {
+            snative,
+            Tx {
                 unit: fnv1a(&format!("{}|{}", pair[0], pair[1])),
                 ccy: fnv1a(ccy_s),
                 objsub: fnv1a(&objsub),
@@ -198,7 +198,7 @@ fn main() {
                 gl_day: gl,
                 tokens: tokens(&[&refr, &ref2, &desc, &remark, &inv]),
             },
-        });
+        ));
     }
     eprintln!("read {} rows in {:.2?}", items.len(), t0.elapsed());
 
@@ -242,12 +242,12 @@ fn main() {
     let solve_time = t1.elapsed();
 
     // Tally.
-    let mut by_origin: HashMap<&'static str, (usize, usize)> = HashMap::new(); // origin -> (groups, rows)
+    let mut by_origin: HashMap<String, (usize, usize)> = HashMap::new(); // origin -> (groups, rows)
     let mut matched_rows = 0usize;
     let mut matched_value = 0i64;
     let mut clean = 0usize;
     for g in &res.groups {
-        let e = by_origin.entry(g.origin).or_default();
+        let e = by_origin.entry(g.origin.clone()).or_default();
         e.0 += 1;
         e.1 += g.members.len();
         matched_rows += g.members.len();

@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the Report. Contract version 5 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
-  "x-contract-version": 5,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the allocation-native Report. Contract version 7 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
+  "x-contract-version": 7,
   "$defs": {
     "Cell": {
       "description": "A bare input cell: a number or a string. How it lowers is decided by its column's Kind in the Schema, not by the cell, so there is no per-cell tag. A Number column takes the integer as-is; a Key column lowers a string via FNV-1a (a numeric cell is an already-lowered key); a Tokens column lowers a free-text string to a reference-token set. The lowered engine form is internal and never on the wire. See src/lower.rs.",
@@ -225,6 +225,79 @@
             "order",
             "width",
             "inner"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "lots",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "lots"
+            },
+            "amount": {
+              "$ref": "#/$defs/ScalarRef"
+            },
+            "inner": {
+              "$ref": "#/$defs/Plan"
+            }
+          },
+          "required": [
+            "op",
+            "amount",
+            "inner"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "soak_small",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "soak_small"
+            },
+            "max_bps": {
+              "type": ["integer", "null"]
+            },
+            "max_abs": {
+              "type": ["integer", "null"]
+            },
+            "origin": {
+              "type": "string"
+            },
+            "by": {
+              "anyOf": [
+                { "$ref": "#/$defs/ScalarRef" },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "origin"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "soak_all",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "soak_all"
+            },
+            "origin": {
+              "type": "string"
+            },
+            "by": {
+              "anyOf": [
+                { "$ref": "#/$defs/ScalarRef" },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "origin"
           ],
           "additionalProperties": false
         },
@@ -560,6 +633,53 @@
           "type": "object",
           "properties": {
             "op": {
+              "const": "group_allocations"
+            },
+            "allocations": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/AllocationSpec"
+              }
+            },
+            "origin": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "allocations"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "remove_allocations"
+            },
+            "group_id": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "required": [
+            "op",
+            "group_id",
+            "ids"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
               "const": "ungroup"
             },
             "ids": {
@@ -625,37 +745,43 @@
       "additionalProperties": false
     },
     "Report": {
-      "description": "The relational partition result. Every input id appears in exactly one group; unmatched rows are live singleton groups.",
+      "description": "The allocation-native reconciliation result. Groups plus allocation incidences are the single source of truth; row-level groupings are explicit client projections.",
       "type": "object",
       "properties": {
-        "assignments": {
-          "type": "array",
-          "items": {
-            "type": "array",
-            "prefixItems": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "integer"
-              }
-            ],
-            "items": false,
-            "minItems": 2,
-            "maxItems": 2
-          }
-        },
         "groups": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/GroupOut"
           }
+        },
+        "allocations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AllocationOut" }
         }
       },
       "required": [
-        "assignments",
-        "groups"
+        "groups",
+        "allocations"
       ],
+      "additionalProperties": false
+    },
+    "AllocationOut": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "group_id": { "type": "integer" },
+        "amount": { "type": "integer" }
+      },
+      "required": ["id", "group_id", "amount"],
+      "additionalProperties": false
+    },
+    "AllocationSpec": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "integer" },
+        "amount": { "type": "integer" }
+      },
+      "required": ["id", "amount"],
       "additionalProperties": false
     },
     "Envelope": {

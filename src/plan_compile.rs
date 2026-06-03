@@ -5,7 +5,8 @@ use crate::plan::{Cond, CostSpec, Plan};
 use crate::row::LoweredRow;
 use crate::schema::Schema;
 use crate::strategy::{
-    Strategy, agg_net, branch, exact_1to1, flow, partition_by, seq, signal_group, windowed,
+    SoakMode, Strategy, agg_net, branch, exact_1to1, flow, lots, partition_by, seq, signal_group,
+    soak_all, soak_small, windowed,
 };
 
 #[derive(Clone)]
@@ -34,22 +35,30 @@ impl Model for PlanModel {
         self.window
     }
     fn match_keys(&self, tx: &LoweredRow) -> Vec<u64> {
+        self.match_keys_lot(tx, self.base_amount(tx))
+    }
+    fn match_keys_lot(&self, tx: &LoweredRow, amount: i64) -> Vec<u64> {
         let mut keys = tx.tokens(self.tokens);
-        let n = self.amount.eval(tx);
-        if n != 0 {
-            keys.push(n.unsigned_abs());
+        if amount != 0 {
+            keys.push(amount.unsigned_abs());
         }
         keys
     }
     fn cost(&self, a: &LoweredRow, b: &LoweredRow) -> Option<f64> {
+        self.cost_lot(a, self.base_amount(a), b, self.base_amount(b))
+    }
+    fn cost_lot(
+        &self,
+        a: &LoweredRow,
+        a_amount: i64,
+        b: &LoweredRow,
+        b_amount: i64,
+    ) -> Option<f64> {
         let token_shared = {
             let bt = b.tokens(self.tokens);
             a.tokens(self.tokens).iter().any(|t| bt.contains(t))
         };
-        let amount_equal = {
-            let (na, nb) = (self.amount.eval(a), self.amount.eval(b));
-            na != 0 && na.abs() == nb.abs()
-        };
+        let amount_equal = a_amount != 0 && a_amount.abs() == b_amount.abs();
         let dd = (self.day.eval(a) - self.day.eval(b)).abs();
         for tier in &self.cost.tiers {
             let holds = tier.when.iter().all(|c| match c {
@@ -115,6 +124,10 @@ pub(crate) fn compile(
                 compile(inner, schema)?,
             )
         }
+        Plan::Lots { amount, inner } => {
+            let a = scalar_ref(amount, schema)?;
+            lots(move |r: &LoweredRow| a.eval(r), compile(inner, schema)?)
+        }
         Plan::AggNet { key, amount, tol } => {
             let (k, a) = (scalar_ref(key, schema)?, scalar_ref(amount, schema)?);
             agg_net(
@@ -147,6 +160,47 @@ pub(crate) fn compile(
                 *tol,
                 *cap,
             )
+        }
+        Plan::SoakSmall {
+            max_bps,
+            max_abs,
+            origin,
+            by,
+        } => {
+            if let Some(by) = by {
+                let k = scalar_ref(by, schema)?;
+                soak_small(
+                    *max_bps,
+                    *max_abs,
+                    SoakMode::Bucket,
+                    origin.clone(),
+                    move |i: &crate::strategy::Item<LoweredRow>| k.eval(&i.data),
+                )
+            } else {
+                soak_small(
+                    *max_bps,
+                    *max_abs,
+                    SoakMode::Singleton,
+                    origin.clone(),
+                    |_i: &crate::strategy::Item<LoweredRow>| 0i64,
+                )
+            }
+        }
+        Plan::SoakAll { origin, by } => {
+            if let Some(by) = by {
+                let k = scalar_ref(by, schema)?;
+                soak_all(
+                    SoakMode::Bucket,
+                    origin.clone(),
+                    move |i: &crate::strategy::Item<LoweredRow>| k.eval(&i.data),
+                )
+            } else {
+                soak_all(
+                    SoakMode::Singleton,
+                    origin.clone(),
+                    |_i: &crate::strategy::Item<LoweredRow>| 0i64,
+                )
+            }
         }
         Plan::Flow {
             amount,
