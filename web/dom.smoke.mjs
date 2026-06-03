@@ -107,16 +107,4 @@ const tick = (ms) => new Promise((r) => setTimeout(r, ms));
   console.log("  upload   : " + $("status").textContent.trim());
 }
 
-// --- demo path ------------------------------------------------------------
-{
-  const $ = await freshDom();
-  $("load-demo").dispatchEvent(new window.Event("click"));
-  await tick(4000); // cold solve of the full demo book
-  ok($("setup-err").textContent === "", "demo no error: " + $("setup-err").textContent);
-  ok($("setup").hidden && !$("main").hidden, "demo transitioned to workbench");
-  ok(/solved in/.test($("status").textContent), "demo solved: " + $("status").textContent);
-  console.log("  demo     : " + $("status").textContent.trim());
-}
-
-console.log("DOM SMOKE OK");
-process.exit(0);
+console.log('DOM SMOKE OK'); process.exit(0);

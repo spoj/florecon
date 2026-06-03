@@ -52,14 +52,16 @@
 
 pub mod engine;
 pub mod error;
-pub mod expr;
+pub mod arrow;
+
 pub mod flow;
-pub mod lower;
+
 pub mod plan;
 mod plan_compile;
 pub mod report;
 pub mod row;
-pub mod schema;
+pub mod token;
+
 pub mod strategy;
 
 #[cfg(feature = "wasm")]
@@ -68,7 +70,7 @@ pub mod wasm;
 pub use engine::{ArcId, Network, NodeId, SolveStatus};
 pub use error::ApiError;
 pub use flow::{ExtId, Group, Matcher, Model};
-pub use lower::{Cell, Kind, Row, TokenCfg};
+
 pub use report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
-pub use row::{LoweredCell, LoweredRow};
-pub use schema::{Column, Schema};
+pub use row::{PhysicalRow, ColumnMap};
+

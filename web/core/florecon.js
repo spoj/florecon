@@ -112,16 +112,24 @@ export class Florecon {
       );
     }
     this.engineVersion = v;
-  }
-
-  _call(fn, payload) {
+  }  _call(fn, payload, arrowBytes = null) {
     const data = this.enc.encode(JSON.stringify(payload));
     const n = data.length;
     const ptr = this.ex.alloc(n);
-    // Re-read buffer after alloc: growth may have detached the old one.
     new Uint8Array(this.mem.buffer, ptr, n).set(data);
-    const packed = fn(ptr, n); // BigInt: (len << 32) | ptr
+
+    let arrowN = 0, arrowPtr = 0;
+    if (arrowBytes && arrowBytes.length > 0) {
+      arrowN = arrowBytes.length;
+      arrowPtr = this.ex.alloc(arrowN);
+      new Uint8Array(this.mem.buffer, arrowPtr, arrowN).set(arrowBytes);
+    }
+
+    const packed = fn(ptr, n, arrowPtr, arrowN);
+
     this.ex.dealloc(ptr, n);
+    if (arrowN > 0) this.ex.dealloc(arrowPtr, arrowN);
+
     const outPtr = Number(packed & 0xffffffffn);
     const outLen = Number((packed >> 32n) & 0xffffffffn);
     const out = new Uint8Array(this.mem.buffer, outPtr, outLen).slice();
@@ -130,12 +138,12 @@ export class Florecon {
   }
 
   // Stateful interactive command (init/upsert/remove/solve/freeze/...).
-  dispatch(cmd) {
-    return this._call(this.ex.dispatch, cmd);
+  dispatch(cmd, arrowBytes = null) {
+    return this._call(this.ex.dispatch, cmd, arrowBytes);
   }
 
   // Stateless batch solve.
-  solve(req) {
-    return this._call(this.ex.solve, req);
+  solve(req, arrowBytes = null) {
+    return this._call(this.ex.solve, req, arrowBytes);
   }
 }

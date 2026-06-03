@@ -193,10 +193,10 @@ async function startApp(data) {
   resetGroupDisplayLabels();
   configureFromFields();
 
-  setStatus(`init: ${state.data.rows.length} rows…`);
+  setStatus(`init: ${state.data.display.length} rows…`);
   const init = state.fe.dispatch({
-    op: "init", schema: state.data.schema, plan: state.data.plan, rows: state.data.rows,
-  });
+    op: "init", map: state.data.map, plan: state.data.plan
+  }, state.data.arrowBytes);
   if (!init.ok) return setStatus("init error: " + init.error, true);
   solve();
   wireUi();
@@ -782,8 +782,8 @@ function wireUi() {
 function boot2() {
   resetGroupDisplayLabels();
   const init = state.fe.dispatch({
-    op: "init", schema: state.data.schema, plan: state.data.plan, rows: state.data.rows,
-  });
+    op: "init", map: state.data.map, plan: state.data.plan
+  }, state.data.arrowBytes);
   if (!init.ok) return setStatus("init error: " + init.error, true);
   solve();
 }

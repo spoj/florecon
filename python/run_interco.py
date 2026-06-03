@@ -1,80 +1,105 @@
-"""Bind real intercompany parquet to the florecon WASM engine via wasmtime.
-
-Replicates examples/interco.rs ingestion in Python, ships one JSON SolveRequest
-into WASM, and reports the same metrics from the returned Report. State and all
-computation live in WASM; Python only generates the plan + rows and reads back
-the partition.
-
-  python python/run_interco.py [parquet] [--pair COMPANY ICP] [--max N]
-"""
-
+"""Bind real intercompany parquet to the florecon WASM engine via wasmtime."""
 import pathlib
 import sys
 import time
+import pyarrow as pa
 import pyarrow.parquet as pq
+import json
 
-# Use the one canonical host — the wheel package under py/src — rather than a
-# second copy. Pinned ahead of any installed build so dev edits are live.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "py" / "src"))
-from florecon import Florecon, KEY, NUMBER, TOKENS, col, key, strict_assignments
+from florecon import Florecon, strict_assignments
 
 WASM = "target/wasm32-unknown-unknown/release/florecon.wasm"
 FIELDS = ["reference", "reference2", "description", "name_remark_explanation", "invoice_no"]
 COLS = ["company", "icp", "objsub", "indicative_usd_amt", "gl_date", "base_currency",
         "trx_currency", "trx_amt", "fc_amt", "is_offset"] + FIELDS
 
+def fnv1a(text):
+    hash_val = 0xcbf29ce484222325
+    for b in text.encode('utf-8'):
+        hash_val ^= b
+        hash_val = (hash_val * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return hash_val
 
 def ingest(path, pair=None, maxrows=None):
     t = pq.read_table(path, columns=COLS)
     cols = {n: t.column(n).to_pylist() for n in COLS}
     n = t.num_rows
-    schema = [
-        col("unit", KEY), col("ccy", KEY), col("day", NUMBER),
-        col("objsub", KEY), col("native", NUMBER), col("tokens", TOKENS),
-    ]
-    rows, usd_by_id = [], []
+
+    ids, units, ccys, days, objsubs, natives, tokens_list = [], [], [], [], [], [], []
+    usd_by_id = []
+
     for i in range(n):
-        if cols["is_offset"][i]:
-            continue
+        if cols["is_offset"][i]: continue
         co, icp = cols["company"][i] or "", cols["icp"][i] or ""
-        if not co or not icp or co == icp:
-            continue
-        if pair and frozenset((co, icp)) != pair:
-            continue
+        if not co or not icp or co == icp: continue
+        if pair and frozenset((co, icp)) != pair: continue
+
         usd = cols["indicative_usd_amt"][i] or 0.0
         trx = cols["trx_amt"][i] or 0.0
         if abs(trx) >= 0.005:
             ccy_s, amt = cols["trx_currency"][i] or "", trx
         else:
             ccy_s, amt = cols["base_currency"][i] or "", cols["fc_amt"][i] or 0.0
+
         usd_cents = round(usd * 100.0)
         sign = (usd_cents > 0) - (usd_cents < 0)
         snative = round(abs(amt) * 100.0) * sign
         gl = cols["gl_date"][i]
-        gl_day = gl.toordinal() - 719163 if gl else 0  # days since 1970-01-01
-        rid = len(rows)
-        usd_by_id.append(usd_cents)
-        # Bare cells; the engine lowers strings by column kind.
-        text = " ".join(s for s in (cols[f][i] for f in FIELDS) if s)
-        rows.append([rid, [
-            key(co, icp), ccy_s, gl_day, cols["objsub"][i] or "", snative, text,
-        ]])
-        if maxrows and len(rows) >= maxrows:
-            break
-    return schema, rows, usd_by_id
+        gl_day = gl.toordinal() - 719163 if gl else 0
 
+        rid = len(ids)
+        usd_by_id.append(usd_cents)
+
+        text = " ".join(s for s in (cols[f][i] for f in FIELDS) if s)
+        tokens = []
+        for word in text.split():
+            clean = "".join(c for c in word if c.isalnum())
+            if len(clean) >= 6:
+                tokens.append(fnv1a(clean.upper()))
+        tokens = list(set(tokens))
+        tokens.sort()
+
+        ids.append(rid)
+        units.append(fnv1a(f"{co}|{icp}"))
+        ccys.append(fnv1a(ccy_s))
+        days.append(gl_day)
+        objsubs.append(fnv1a(cols["objsub"][i] or ""))
+        natives.append(snative)
+        tokens_list.append(tokens)
+
+        if maxrows and len(ids) >= maxrows:
+            break
+
+    # Build Arrow RecordBatch
+    batch = pa.RecordBatch.from_arrays(
+        [
+            pa.array(ids, type=pa.uint64()),
+            pa.array(units, type=pa.int64()),
+            pa.array(ccys, type=pa.int64()),
+            pa.array(days, type=pa.int64()),
+            pa.array(objsubs, type=pa.int64()),
+            pa.array(natives, type=pa.int64()),
+            pa.array(tokens_list, type=pa.list_(pa.uint64()))
+        ],
+        names=["id", "unit", "ccy", "day", "objsub", "native", "tokens"]
+    )
+
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    arrow_bytes = sink.getvalue().to_pybytes()
+
+    return arrow_bytes, usd_by_id, len(ids)
 
 def plan():
     leg = {"op": "seq", "steps": [
         {"op": "agg_net", "key": "objsub", "tol": 100},
         {"op": "exact"},
         {"op": "signal", "signals": "tokens", "tol": 100, "cap": 256},
-        {"op": "flow", "day": "day",
-         "tokens": "tokens", "penalty": 1000.0, "window": -1},
+        {"op": "flow", "day": "day", "tokens": "tokens", "penalty": 1000.0, "window": -1},
     ]}
-    return {"op": "partition", "by": "unit",
-            "inner": {"op": "partition", "by": "ccy", "inner": leg}}
-
+    return {"primary": "native", "root": {"op": "partition", "by": "unit", "inner": {"op": "partition", "by": "ccy", "inner": leg}}}
 
 def main():
     args = sys.argv[1:]
@@ -95,45 +120,18 @@ def main():
     path = positional[0] if positional else "data/ledger.parquet"
 
     t0 = time.time()
-    schema, rows, usd_by_id = ingest(path, pair, maxrows)
-    print(f"ingested {len(rows)} rows in {time.time()-t0:.2f}s")
+    arrow_bytes, usd_by_id, num_rows = ingest(path, pair, maxrows)
+    print(f"ingested {num_rows} rows in {time.time()-t0:.2f}s")
 
     fe = Florecon(WASM)
-    req = {"schema": {"cols": schema, "token_drop": ["OFFSETENTRY"]}, "rows": rows, "plan": {"primary": "native", "root": plan()}}
+    req = {"plan": plan(), "map": {"int_cols": {}, "token_cols": {}}} # Not strictly needed if Arrow provides schema, but good for type safety
     t1 = time.time()
-    env = fe.solve(req)
+    env = fe.solve(req, arrow_bytes)
     dt = time.time() - t1
     if not env["ok"]:
         print("ERROR:", env["error"]); return
     rep = env["report"]
-
-    total = len(rows)
-    total_value = sum(abs(v) for v in usd_by_id)
-    gid_of = {id: gid for id, gid in strict_assignments(rep)}
-    groups_by_id = {g["group_id"]: g for g in rep["groups"]}
-    residual_ids = {id for id, gid in gid_of.items() if groups_by_id[gid]["origin"] == "unmatched" and groups_by_id[gid]["size"] == 1}
-    matched_ids = set(gid_of) - residual_ids
-    matched_value = sum(abs(usd_by_id[i]) for i in matched_ids)
-    clean = sum(1 for g in rep["groups"] if abs(g["net"]) <= 100)
-    by_origin = {}
-    for g in rep["groups"]:
-        c, r = by_origin.get(g["origin"], (0, 0))
-        by_origin[g["origin"]] = (c + 1, r + g["size"])
-
-    print("\n=== florecon via WASM (wasmtime) ===")
-    print(f"  rows            : {total}")
-    print(f"  matched rows    : {len(matched_ids)} ({100*len(matched_ids)/max(total,1):.1f}% by count)")
-    print(f"  matched value   : {matched_value/100:.0f} of {total_value/100:.0f} usd "
-          f"({100*matched_value/max(total_value,1):.1f}% by value)")
-    print(f"  groups          : {len(rep['groups'])} ({clean} clean)")
-    for origin in sorted(by_origin):
-        c, r = by_origin[origin]
-        print(f"    {origin:<13} {c:>7} groups  {r:>8} rows")
-    print(f"  residual rows   : {len(residual_ids)}")
-    print(f"  wasm solve time : {dt:.2f}s")
-    # Conservation is enforced inside solve(); echo the partition identity.
-    print(f"  conservation    : {len(gid_of)} == {total} -> {len(gid_of)==total}")
-
-
+    print("SOLVED", dt, "seconds")
+    
 if __name__ == "__main__":
     main()

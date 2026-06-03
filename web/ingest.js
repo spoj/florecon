@@ -1,3 +1,4 @@
+import { Utf8, Int64, Uint64, makeVector, vectorFromArray, tableFromArrays, tableToIPC } from "apache-arrow";
 // Browser-side ingest: turn an uploaded CSV + a column mapping into the same
 // `data` object the viewer loads from data.json. This is the JS port of the
 // generic core of python/export_web.py — parse, map columns to engine roles,
@@ -123,16 +124,23 @@ export function buildDataset({ header, rows, mapping }) {
   // Rows (bare cells, positional against schema) + display (human view, joined
   // by id). `native` mirrors the engine amount so manual-group conservation can
   // read it back; `value` is the same column for a generic single-amount book.
-  const outRows = [], display = [];
+  const display = [];
+  const arrowCols = { id: makeVector({data: new BigInt64Array(rows.length), type: new Uint64()}) };
+  for (const c of cols) {
+    if (c.text) arrowCols[c.name] = new Array(rows.length).fill("");
+    else arrowCols[c.name] = makeVector({data: new BigInt64Array(rows.length), type: new Int64()});
+  }
   rows.forEach((r, id) => {
-    const cells = cols.map((c) => {
-      if (c.amount) return toCents(r[c.ci]);
-      if (c.date) return toEpochDay(r[c.ci]);
-      if (c.text) return c.cis.map((i) => String(r[i] ?? "")).filter(Boolean).join(" ");
-      if (c.kind === "number") return toInt(r[c.ci]);
-      return String(r[c.ci] ?? "");
-    });
-    outRows.push([id, cells]);
+
+    arrowCols.id.data[0].values[id] = BigInt(id);
+    for (const c of cols) {
+      if (c.amount) arrowCols[c.name].data[0].values[id] = BigInt(toCents(r[c.ci]));
+      else if (c.date) arrowCols[c.name].data[0].values[id] = BigInt(toEpochDay(r[c.ci]));
+      else if (c.text) arrowCols[c.name][id] = c.cis.map((i) => String(r[i] ?? "")).filter(Boolean).join(" ");
+      else if (c.kind === "number") arrowCols[c.name].data[0].values[id] = BigInt(toInt(r[c.ci]));
+      else arrowCols[c.name].data[0].values[id] = BigInt(fnv1a(String(r[c.ci] ?? "")));
+    }
+
     const d = { id };
     for (const c of cols) {
       if (c.amount) d.amount = toCents(r[c.ci]);
@@ -153,8 +161,30 @@ export function buildDataset({ header, rows, mapping }) {
     else if (c.text) fields.push({ key: c.name, label: c.label, kind: "text", slicer: false, detail: true });
   }
 
+  for (const c of cols) {
+    if (c.text) {
+      arrowCols[c.name] = vectorFromArray(arrowCols[c.name], new Utf8());
+    }
+  }
+
   return {
     pair: mapping.name || "uploaded",
-    schema, plan: {primary: "amount", root: plan}, fields, rows: outRows, display, netKey: "amount",
+    map: {
+      int_cols: Object.fromEntries(cols.filter(c => !c.text).map((c, i) => [c.name, i])),
+      token_cols: Object.fromEntries(cols.filter(c => c.text).map((c, i) => [c.name, i]))
+    },
+    plan: {primary: "amount", root: plan}, fields, display, netKey: "amount",
+    arrowBytes: tableToIPC(tableFromArrays(arrowCols), "stream"),
   };
+}
+
+
+// FNV-1a for keys
+function fnv1a(str) {
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= BigInt(str.charCodeAt(i));
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return hash > 0x7fffffffffffffffn ? hash - 0x10000000000000000n : hash;
 }

@@ -5,82 +5,6 @@
   "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the allocation-native Report. Contract version 8 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
   "x-contract-version": 8,
   "$defs": {
-    "Cell": {
-      "description": "A bare input cell: a number or a string. How it lowers is decided by its column's Kind in the Schema, not by the cell, so there is no per-cell tag. A Number column takes the integer as-is; a Key column lowers a string via FNV-1a (a numeric cell is an already-lowered key); a Tokens column lowers a free-text string to a reference-token set. The lowered engine form is internal and never on the wire. See src/lower.rs.",
-      "type": [
-        "integer",
-        "string"
-      ]
-    },
-    "Kind": {
-      "description": "How a column's cells lower.",
-      "enum": [
-        "number",
-        "key",
-        "tokens"
-      ]
-    },
-    "Column": {
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": "string"
-        },
-        "kind": {
-          "$ref": "#/$defs/Kind"
-        }
-      },
-      "required": [
-        "name",
-        "kind"
-      ],
-      "additionalProperties": false
-    },
-    "Schema": {
-      "type": "object",
-      "properties": {
-        "cols": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "token_drop": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "stopwords for Tokens lowering, matched upper-cased; optional"
-        }
-      },
-      "required": [
-        "cols"
-      ],
-      "additionalProperties": false
-    },
-    "Row": {
-      "description": "A bare positional row: one Cell per schema column.",
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/Cell"
-      }
-    },
-    "IdRow": {
-      "description": "A (ExtId, Row) pair: a caller-owned u64 id and its positional row.",
-      "type": "array",
-      "prefixItems": [
-        {
-          "type": "integer",
-          "minimum": 0
-        },
-        {
-          "$ref": "#/$defs/Row"
-        }
-      ],
-      "items": false,
-      "minItems": 2,
-      "maxItems": 2
-    },
     "Cond": {
       "description": "A predicate on a candidate pair used by the flow cost model.",
       "enum": [
@@ -155,22 +79,11 @@
       "description": "A self-contained batch solve: the JSON passed to the wasm `solve` export.",
       "type": "object",
       "properties": {
-        "schema": {
-          "$ref": "#/$defs/Schema"
-        },
-        "rows": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/IdRow"
-          }
-        },
         "plan": {
           "$ref": "#/$defs/Plan"
         }
       },
       "required": [
-        "schema",
-        "rows",
         "plan"
       ],
       "additionalProperties": false
@@ -184,24 +97,13 @@
             "op": {
               "const": "init"
             },
-            "schema": {
-              "$ref": "#/$defs/Schema"
-            },
             "plan": {
               "$ref": "#/$defs/Plan"
-            },
-            "rows": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/IdRow"
-              }
             }
           },
           "required": [
             "op",
-            "schema",
-            "plan",
-            "rows"
+            "plan"
           ],
           "additionalProperties": false
         },
@@ -210,17 +112,10 @@
           "properties": {
             "op": {
               "const": "upsert"
-            },
-            "rows": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/IdRow"
-              }
             }
           },
           "required": [
-            "op",
-            "rows"
+            "op"
           ],
           "additionalProperties": false
         },
@@ -572,323 +467,11 @@
       ],
       "additionalProperties": false
     },
-    "ScalarExpr": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "col": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "col"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "lit": {
-              "type": "integer"
-            }
-          },
-          "required": [
-            "lit"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "key": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "key"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "abs": {
-              "$ref": "#/$defs/ScalarRef"
-            }
-          },
-          "required": [
-            "abs"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "neg": {
-              "$ref": "#/$defs/ScalarRef"
-            }
-          },
-          "required": [
-            "neg"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "add": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/ScalarRef"
-              }
-            }
-          },
-          "required": [
-            "add"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "sub": {
-              "type": "array",
-              "prefixItems": [
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                },
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                }
-              ],
-              "items": false,
-              "minItems": 2,
-              "maxItems": 2
-            }
-          },
-          "required": [
-            "sub"
-          ],
-          "additionalProperties": false
-        }
-      ]
-    },
     "ScalarRef": {
-      "oneOf": [
-        {
-          "type": "string"
-        },
-        {
-          "$ref": "#/$defs/ScalarExpr"
-        }
-      ]
-    },
-    "BoolExpr": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "bool": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "bool"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "not": {
-              "$ref": "#/$defs/BoolRef"
-            }
-          },
-          "required": [
-            "not"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "and": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/BoolRef"
-              }
-            }
-          },
-          "required": [
-            "and"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "or": {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/BoolRef"
-              }
-            }
-          },
-          "required": [
-            "or"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "eq": {
-              "type": "array",
-              "prefixItems": [
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                },
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                }
-              ],
-              "items": false,
-              "minItems": 2,
-              "maxItems": 2
-            }
-          },
-          "required": [
-            "eq"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "ne": {
-              "type": "array",
-              "prefixItems": [
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                },
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                }
-              ],
-              "items": false,
-              "minItems": 2,
-              "maxItems": 2
-            }
-          },
-          "required": [
-            "ne"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "gt": {
-              "type": "array",
-              "prefixItems": [
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                },
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                }
-              ],
-              "items": false,
-              "minItems": 2,
-              "maxItems": 2
-            }
-          },
-          "required": [
-            "gt"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "ge": {
-              "type": "array",
-              "prefixItems": [
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                },
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                }
-              ],
-              "items": false,
-              "minItems": 2,
-              "maxItems": 2
-            }
-          },
-          "required": [
-            "ge"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "lt": {
-              "type": "array",
-              "prefixItems": [
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                },
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                }
-              ],
-              "items": false,
-              "minItems": 2,
-              "maxItems": 2
-            }
-          },
-          "required": [
-            "lt"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "le": {
-              "type": "array",
-              "prefixItems": [
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                },
-                {
-                  "$ref": "#/$defs/ScalarRef"
-                }
-              ],
-              "items": false,
-              "minItems": 2,
-              "maxItems": 2
-            }
-          },
-          "required": [
-            "le"
-          ],
-          "additionalProperties": false
-        }
-      ]
+      "type": "string"
     },
     "BoolRef": {
-      "oneOf": [
-        {
-          "type": "string"
-        },
-        {
-          "$ref": "#/$defs/BoolExpr"
-        }
-      ]
+      "type": "string"
     },
     "PlanNode": {
       "description": "A reconciliation strategy tree. Tagged union on `op`; primitives operate on the current allocation amount.",

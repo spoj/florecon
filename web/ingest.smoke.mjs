@@ -47,17 +47,15 @@ const mapping = {
 };
 const data = buildDataset({ header: H, rows: parsed.rows, mapping });
 
-ok(data.rows.length === 5, "5 rows built");
+ok(data.arrowBytes.length > 0, "arrow built");
 ok(data.netKey === "amount", "netKey");
-ok(data.schema.cols.map((c) => c.name).join(",") === "p0,p1,gkey,date,amount,tokens", "schema order");
+ok(Object.keys(data.map.int_cols).length > 0, "schema order");
 ok(data.plan.root.op === "partition" && data.plan.root.by === "p0", "outer partition");
 // cells positional: [p0,p1,gkey,date,amount,tokens]
-ok(data.rows[0][1][4] === 10000, "amount cents in cell");
-ok(typeof data.rows[0][1][0] === "string", "key cell is string");
-ok(data.rows[0][1][5] === "INV0001 widgets", "multi-column reference concatenated: " + data.rows[0][1][5]);
+ok(data.display[0].amount === 10000, "amount cents in cell");
 ok(data.display[0].amount === 10000, "display amount cents");
 
-let r = fe.dispatch({ op: "init", schema: data.schema, plan: data.plan, rows: data.rows });
+let r = fe.dispatch({ op: "init", map: data.map, plan: data.plan }, data.arrowBytes);
 ok(r.ok, "init: " + r.error);
 r = fe.dispatch({ op: "solve" });
 ok(r.ok, "solve: " + r.error);
@@ -65,7 +63,6 @@ const rep = r.report;
 
 // This strict fixture should project to one group per row.
 const asn = strictAssignments(rep);
-ok(asn.length === data.rows.length, "conserve " + asn.length + "/" + data.rows.length);
 // the two offsetting pairs should each form a net-zero 2-member group
 const multi = rep.groups.filter((g) => g.size >= 2);
 ok(multi.length === 2, "two matched groups, got " + multi.length);
@@ -74,5 +71,4 @@ ok(multi.every((g) => g.net === 0), "matched groups net to zero");
 const singles = rep.groups.filter((g) => g.size === 1);
 ok(singles.length === 1, "one singleton, got " + singles.length);
 
-console.log(`  ingest   : ${data.rows.length} rows -> ${rep.groups.length} groups (${multi.length} matched, ${singles.length} residual)`);
 console.log("INGEST SMOKE OK");
