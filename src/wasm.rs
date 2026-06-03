@@ -179,9 +179,7 @@ fn apply(slot: &mut Option<Workspace>, mut cmd: Cmd, arrow_bytes: &[u8]) -> Enve
             Err(e) => return Envelope::err(e.to_string()),
         };
         for (id, row) in rows_to_upsert {
-            if let Err(e) = ws.upsert(id, row) {
-                return Envelope::err(e.to_string());
-            }
+            ws.upsert(id, row);
         }
         let rep = ws.report();
         *slot = Some(ws);
@@ -194,9 +192,11 @@ fn apply(slot: &mut Option<Workspace>, mut cmd: Cmd, arrow_bytes: &[u8]) -> Enve
     };
     let result = match cmd {
         Cmd::Init { .. } => unreachable!(),
-        Cmd::Upsert {} => rows_to_upsert
+        Cmd::Upsert {} => { rows_to_upsert
             .into_iter()
-            .try_for_each(|(id, row)| ws.upsert(id, row)),
+            .for_each(|(id, row)| ws.upsert(id, row));
+            Ok(())
+        }
         Cmd::Remove { ids } => {
             ids.into_iter().for_each(|id| ws.remove(id));
             Ok(())

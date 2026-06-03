@@ -87,7 +87,8 @@ pub fn rows_from_ipc(bytes: &[u8]) -> Result<(Vec<ExtId>, Vec<PhysicalRow>, Colu
     }
 
     for (i, arr_dyn) in token_arrays.iter().enumerate() {
-        let arr = arr_dyn.as_string::<i32>();
+        let arr = arrow::compute::cast(arr_dyn, &DataType::Utf8).unwrap();
+        let arr = arr.as_string::<i32>();
         for row in 0..n {
             if arr.is_null(row) {
                 continue;
