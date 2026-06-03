@@ -248,6 +248,7 @@ impl Session {
             .iter()
             .map(|(id, row)| Item {
                 id: *id,
+                amount: 0,
                 data: row.clone(),
             })
             .collect();
@@ -256,7 +257,7 @@ impl Session {
 
         // Assign stable group ids: order groups by their smallest member.
         let mut groups = res.groups;
-        groups.sort_by_key(|g| g.members.iter().copied().min().unwrap_or(0));
+        groups.sort_by_key(|g| g.members.iter().map(|a| a.id).min().unwrap_or(0));
 
         let mut assignments = Vec::new();
         let mut group_out = Vec::with_capacity(groups.len() + res.residual.len());
@@ -264,8 +265,8 @@ impl Session {
         for g in groups {
             let gid = next_gid;
             next_gid += 1;
-            for &m in &g.members {
-                assignments.push((m, gid));
+            for m in &g.members {
+                assignments.push((m.id, gid));
             }
             group_out.push(GroupOut {
                 group_id: gid,
@@ -276,7 +277,13 @@ impl Session {
             });
         }
 
-        let mut residual: Vec<ExtId> = res.residual.into_iter().map(|i| i.id).collect();
+        let assigned_ids: BTreeSet<ExtId> = assignments.iter().map(|(id, _)| *id).collect();
+        let mut residual: Vec<ExtId> = res
+            .residual
+            .into_iter()
+            .map(|i| i.id)
+            .filter(|id| !assigned_ids.contains(id))
+            .collect();
         residual.sort_unstable();
         for id in residual {
             let gid = next_gid;
@@ -462,6 +469,7 @@ impl<E: Clone> Recon<E> {
             .filter(|(id, _)| !frozen_members.contains(id))
             .map(|(id, item)| Item {
                 id: *id,
+                amount: 0,
                 data: item.clone(),
             })
             .collect();
@@ -470,19 +478,33 @@ impl<E: Clone> Recon<E> {
         // Dissolve all live groups; keep frozen ones verbatim.
         self.groups.retain(|g| g.is_frozen());
         let mut new_groups = res.groups;
-        new_groups.sort_by_key(|g| g.members.iter().copied().min().unwrap_or(0));
+        new_groups.sort_by_key(|g| g.members.iter().map(|a| a.id).min().unwrap_or(0));
         for g in new_groups {
             self.groups.push(GroupRec {
                 id: self.next_id,
-                members: g.members,
+                members: g.members.into_iter().map(|a| a.id).collect(),
                 origin: g.origin.to_string(),
                 net: g.net,
                 status: Status::Live,
             });
             self.next_id += 1;
         }
-        // Leftovers become live singleton groups (origin "unmatched").
-        let mut leftover: Vec<ExtId> = res.residual.into_iter().map(|i| i.id).collect();
+        // Leftovers become live singleton groups (origin "unmatched"). The
+        // current high-level workspace is still row-partition shaped; if a
+        // lower-level fractional strategy returned a remainder for an id that is
+        // already represented in a group, keep the grouped row and drop the
+        // remainder from this legacy projection.
+        let grouped: BTreeSet<ExtId> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.members.iter().copied())
+            .collect();
+        let mut leftover: Vec<ExtId> = res
+            .residual
+            .into_iter()
+            .map(|i| i.id)
+            .filter(|id| !grouped.contains(id))
+            .collect();
         leftover.sort_unstable();
         for id in leftover {
             self.push_live_singleton(id);

@@ -31,25 +31,35 @@
 //! ambiguous residual where strategies would otherwise compete.
 
 use crate::engine::SolveStatus;
-use crate::flow::{ExtId, Matcher, Model};
+use crate::flow::{Allocation, ExtId, Matcher, Model};
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 use std::marker::PhantomData;
 
-/// One entry in the bag: a caller-owned id plus its payload.
+/// One lot in the bag: a caller-owned row/lot id plus its currently available
+/// signed amount and payload. A row-partition workload starts with one lot per
+/// row; a fractional strategy may split a lot by emitting a consumed allocation
+/// to a group and a remainder lot to residual.
 pub struct Item<E> {
     pub id: ExtId,
+    pub amount: i64,
     pub data: E,
 }
 
-/// A resolved group of matched entries.
+/// A resolved group of matched lot allocations.
 #[derive(Debug, Clone)]
 pub struct Group {
-    pub members: Vec<ExtId>,
+    pub members: Vec<Allocation>,
     /// Which primitive produced it.
     pub origin: &'static str,
     /// Residual in the canonical numeraire; zero means it nets out.
     pub net: i64,
+}
+
+impl Group {
+    pub fn member_ids(&self) -> Vec<ExtId> {
+        self.members.iter().map(|a| a.id).collect()
+    }
 }
 
 /// What a strategy returns: the groups it pulled and the residual it left.
@@ -358,7 +368,16 @@ where
                     let p = pos.pop().unwrap();
                     let n = neg.pop().unwrap();
                     groups.push(Group {
-                        members: vec![p.id, n.id],
+                        members: vec![
+                            Allocation {
+                                id: p.id,
+                                amount: (self.amount)(&p.data),
+                            },
+                            Allocation {
+                                id: n.id,
+                                amount: (self.amount)(&n.data),
+                            },
+                        ],
                         origin: "exact_1to1",
                         net: 0,
                     });
@@ -416,7 +435,13 @@ where
             });
             if items.len() >= 2 && sum.abs() <= self.tol && signs.0 && signs.1 {
                 groups.push(Group {
-                    members: items.iter().map(|i| i.id).collect(),
+                    members: items
+                        .iter()
+                        .map(|i| Allocation {
+                            id: i.id,
+                            amount: (self.amount)(&i.data),
+                        })
+                        .collect(),
                     origin: "agg_net",
                     net: sum,
                 });
@@ -470,7 +495,13 @@ where
             seg.push(item);
             if acc.abs() <= self.tol && seg.len() >= 2 {
                 groups.push(Group {
-                    members: seg.iter().map(|i| i.id).collect(),
+                    members: seg
+                        .iter()
+                        .map(|i| Allocation {
+                            id: i.id,
+                            amount: (self.amount)(&i.data),
+                        })
+                        .collect(),
                     origin: "running_zero",
                     net: acc,
                 });
@@ -548,7 +579,13 @@ where
                     used[i] = true;
                 }
                 groups.push(Group {
-                    members: members.iter().map(|&i| bag[i].id).collect(),
+                    members: members
+                        .iter()
+                        .map(|&i| Allocation {
+                            id: bag[i].id,
+                            amount: amt[i],
+                        })
+                        .collect(),
                     origin: "signal_group",
                     net: sum,
                 });
@@ -675,7 +712,7 @@ where
 
         let groups = self
             .matcher
-            .groups()
+            .allocation_groups()
             .into_iter()
             .map(|g| Group {
                 members: g.members,
@@ -683,11 +720,20 @@ where
                 net: g.net_base,
             })
             .collect();
-        let unmatched: std::collections::HashSet<ExtId> =
-            self.matcher.unmatched().into_iter().collect();
+        let unmatched: HashMap<ExtId, i64> = self
+            .matcher
+            .unmatched_allocations()
+            .into_iter()
+            .map(|a| (a.id, a.amount))
+            .collect();
         let residual = bag
             .into_iter()
-            .filter(|i| unmatched.contains(&i.id))
+            .filter_map(|mut i| {
+                unmatched.get(&i.id).map(|&amount| {
+                    i.amount = amount;
+                    i
+                })
+            })
             .collect();
         Resolution { groups, residual }
     }
@@ -735,10 +781,17 @@ mod tests {
     use super::*;
 
     fn bag(items: &[(ExtId, i64)]) -> Vec<Item<i64>> {
-        items.iter().map(|&(id, a)| Item { id, data: a }).collect()
+        items
+            .iter()
+            .map(|&(id, a)| Item {
+                id,
+                amount: a,
+                data: a,
+            })
+            .collect()
     }
     fn ids(g: &Group) -> Vec<ExtId> {
-        let mut m = g.members.clone();
+        let mut m = g.member_ids();
         m.sort();
         m
     }
@@ -755,7 +808,7 @@ mod tests {
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 1); // one +5/-5 pair (id 2 pairs with a +5)
-        assert!(r.groups[0].members.contains(&2));
+        assert!(r.groups[0].member_ids().contains(&2));
         // one +5 left unpaired plus the +3 -> 2 residual
         assert_eq!(r.residual.len(), 2);
     }
@@ -815,10 +868,12 @@ mod tests {
         let b = vec![
             Item {
                 id: 1,
+                amount: 5,
                 data: (1i64, 5i64),
             },
             Item {
                 id: 2,
+                amount: -5,
                 data: (100, -5),
             },
         ];
@@ -841,10 +896,12 @@ mod tests {
         let b = vec![
             Item {
                 id: 1,
+                amount: 5,
                 data: (4i64, 5i64),
             },
             Item {
                 id: 2,
+                amount: -5,
                 data: (7, -5),
             },
         ];
@@ -866,22 +923,27 @@ mod tests {
         let b = vec![
             Item {
                 id: 1,
+                amount: 100,
                 data: (1i64, 100i64),
             },
             Item {
                 id: 2,
+                amount: -100,
                 data: (2, -100),
             },
             Item {
                 id: 3,
+                amount: 50,
                 data: (3, 50),
             },
             Item {
                 id: 4,
+                amount: -30,
                 data: (4, -30),
             },
             Item {
                 id: 5,
+                amount: -20,
                 data: (5, -20),
             },
         ];
@@ -890,8 +952,8 @@ mod tests {
         let g: usize = r.groups.iter().map(|g| g.members.len()).sum();
         assert_eq!(g + r.residual.len(), 5);
         assert_eq!(r.groups.len(), 2);
-        assert_eq!(r.groups[0].members, vec![1, 2]);
-        assert_eq!(r.groups[1].members, vec![3, 4, 5]);
+        assert_eq!(r.groups[0].member_ids(), vec![1, 2]);
+        assert_eq!(r.groups[1].member_ids(), vec![3, 4, 5]);
     }
 
     #[test]
@@ -899,14 +961,17 @@ mod tests {
         let b = vec![
             Item {
                 id: 1,
+                amount: 100,
                 data: (1i64, 100i64),
             },
             Item {
                 id: 2,
+                amount: -100,
                 data: (2, -100),
             },
             Item {
                 id: 3,
+                amount: 7,
                 data: (3, 7),
             }, // never clears
         ];

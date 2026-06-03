@@ -21,10 +21,10 @@ use std::fs::File;
 
 #[derive(Clone)]
 struct Tx {
-    unit: u64,        // hashed unordered {company, icp}
-    ccy: u64,         // hashed native currency (shard key; FX vanishes within)
-    objsub: u64,      // hashed GL account (aggregation key)
-    snative: i64,     // signed native amount, minor units (canonical per shard)
+    unit: u64,    // hashed unordered {company, icp}
+    ccy: u64,     // hashed native currency (shard key; FX vanishes within)
+    objsub: u64,  // hashed GL account (aggregation key)
+    snative: i64, // signed native amount, minor units (canonical per shard)
     gl_day: i64,
     tokens: Vec<u64>, // hashed reference tokens (the cross-book bridge)
 }
@@ -111,7 +111,11 @@ fn tokens(fields: &[&str]) -> Vec<u64> {
                 .filter(|c| c.is_alphanumeric())
                 .collect::<String>()
                 .to_uppercase();
-            if t.len() < 6 || t.len() > 40 || t == "OFFSETENTRY" || t.chars().all(|c| c.is_alphabetic()) {
+            if t.len() < 6
+                || t.len() > 40
+                || t == "OFFSETENTRY"
+                || t.chars().all(|c| c.is_alphabetic())
+            {
                 continue;
             }
             let h = fnv1a(&t);
@@ -185,6 +189,7 @@ fn main() {
         usd_by_id.push(usd_cents);
         items.push(Item {
             id,
+            amount: snative,
             data: Tx {
                 unit: fnv1a(&format!("{}|{}", pair[0], pair[1])),
                 ccy: fnv1a(ccy_s),
@@ -213,7 +218,13 @@ fn main() {
                         // signals (amount-only fallbacks) where a far match is
                         // likely spurious.
                         exact_1to1(
-                            |t: &Tx| if t.snative != 0 { Some(t.snative.unsigned_abs()) } else { None },
+                            |t: &Tx| {
+                                if t.snative != 0 {
+                                    Some(t.snative.unsigned_abs())
+                                } else {
+                                    None
+                                }
+                            },
                             |t: &Tx| t.snative,
                         ),
                         signal_group(|t: &Tx| t.tokens.clone(), |t: &Tx| t.snative, TOL, CAP),
@@ -240,7 +251,11 @@ fn main() {
         e.0 += 1;
         e.1 += g.members.len();
         matched_rows += g.members.len();
-        matched_value += g.members.iter().map(|id| usd_by_id[*id as usize].abs()).sum::<i64>();
+        matched_value += g
+            .members
+            .iter()
+            .map(|a| usd_by_id[a.id as usize].abs())
+            .sum::<i64>();
         if g.net.abs() <= TOL {
             clean += 1;
         }

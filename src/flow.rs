@@ -13,7 +13,7 @@
 //! `cost` closure inspects. An "FX reprice" is therefore just an `upsert` with
 //! updated lanes — no special verb, no FX table in the engine.
 
-use crate::engine::{NodeId, Network, SolveStatus};
+use crate::engine::{Network, NodeId, SolveStatus};
 use std::collections::{BTreeMap, HashMap};
 
 /// External, caller-owned identity for a transaction (hash your reference/UUID
@@ -92,13 +92,33 @@ pub struct MatcherSnapshot<Tx> {
     by_match_key: HashMap<u64, Vec<ExtId>>,
 }
 
-/// A reconciled group: a connected component of matched transactions.
+/// A reconciled group: a connected component of matched transactions, in the
+/// legacy whole-row view.
 #[derive(Debug, Clone)]
 pub struct Group {
     pub members: Vec<ExtId>,
     /// Residual in the numeraire; zero means it nets out perfectly.
     pub net_base: i64,
     /// True when the group nets to zero.
+    pub clean: bool,
+}
+
+/// A signed matched or unmatched quantity allocated to one external row/lot id.
+/// Positive amounts come from source lots; negative amounts from sink lots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allocation {
+    pub id: ExtId,
+    pub amount: i64,
+}
+
+/// A reconciled group in allocation view. Unlike [`Group`], this represents the
+/// actual flow routed through matched arcs, so a partially consumed row appears
+/// with only the consumed amount and its remainder is returned separately by
+/// [`Matcher::unmatched_allocations`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocationGroup {
+    pub members: Vec<Allocation>,
+    pub net_base: i64,
     pub clean: bool,
 }
 
@@ -266,19 +286,98 @@ impl<M: Model> Matcher<M> {
 
     /// ExtIds with no matched arc in the current solution.
     pub fn unmatched(&self) -> Vec<ExtId> {
-        let mut matched: HashMap<NodeId, bool> = HashMap::new();
-        for (from, to, _) in self.net.matches() {
-            matched.insert(from, true);
-            matched.insert(to, true);
+        self.unmatched_allocations()
+            .into_iter()
+            .map(|a| a.id)
+            .collect()
+    }
+
+    /// Matched allocations grouped by connected component of positive-flow real
+    /// arcs. This is the lot-level readback: if a row is only partly consumed,
+    /// the group contains the consumed amount and the remainder appears in
+    /// [`Self::unmatched_allocations`].
+    pub fn allocation_groups(&self) -> Vec<AllocationGroup> {
+        let (matched_by_id, adj) = self.flow_readback();
+        let mut visited: HashMap<ExtId, bool> = HashMap::new();
+        let mut groups = Vec::new();
+        for &start in adj.keys() {
+            if visited.get(&start).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut stack = vec![start];
+            let mut ids = Vec::new();
+            visited.insert(start, true);
+            while let Some(n) = stack.pop() {
+                ids.push(n);
+                if let Some(neighbors) = adj.get(&n) {
+                    for &nb in neighbors {
+                        if !visited.get(&nb).copied().unwrap_or(false) {
+                            visited.insert(nb, true);
+                            stack.push(nb);
+                        }
+                    }
+                }
+            }
+            ids.sort_unstable();
+            let mut members: Vec<Allocation> = ids
+                .into_iter()
+                .filter_map(|id| {
+                    let amount = *matched_by_id.get(&id).unwrap_or(&0);
+                    (amount != 0).then_some(Allocation { id, amount })
+                })
+                .collect();
+            members.sort_by_key(|a| a.id);
+            let net_base: i64 = members.iter().map(|a| a.amount).sum();
+            groups.push(AllocationGroup {
+                clean: net_base == 0,
+                net_base,
+                members,
+            });
         }
-        let mut out: Vec<ExtId> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| !matched.get(&e.node).copied().unwrap_or(false))
-            .map(|(id, _)| *id)
-            .collect();
-        out.sort_unstable();
+        groups
+    }
+
+    /// Matched amount plus unmatched remainder per row/lot id. Remainders keep
+    /// the sign of the original base amount.
+    pub fn unmatched_allocations(&self) -> Vec<Allocation> {
+        let (matched_by_id, _adj) = self.flow_readback();
+        let mut out = Vec::new();
+        for (&id, e) in &self.entries {
+            let matched = *matched_by_id.get(&id).unwrap_or(&0);
+            let rem = e.base - matched;
+            if rem != 0 {
+                out.push(Allocation { id, amount: rem });
+            }
+        }
+        out.sort_by_key(|a| a.id);
         out
+    }
+
+    fn flow_readback(&self) -> (HashMap<ExtId, i64>, HashMap<ExtId, Vec<ExtId>>) {
+        let mut slot_to_ext: HashMap<NodeId, ExtId> = HashMap::new();
+        for (id, e) in &self.entries {
+            slot_to_ext.insert(e.node, *id);
+        }
+        let mut matched_by_id: HashMap<ExtId, i64> = HashMap::new();
+        let mut adj: HashMap<ExtId, Vec<ExtId>> = HashMap::new();
+        for (from, to, f) in self.net.matches() {
+            if let (Some(&a), Some(&b)) = (slot_to_ext.get(&from), slot_to_ext.get(&to)) {
+                let ea = &self.entries[&a];
+                let eb = &self.entries[&b];
+                let (src, snk) = if ea.base > 0 && eb.base < 0 {
+                    (a, b)
+                } else if eb.base > 0 && ea.base < 0 {
+                    (b, a)
+                } else {
+                    continue;
+                };
+                *matched_by_id.entry(src).or_insert(0) += f;
+                *matched_by_id.entry(snk).or_insert(0) -= f;
+                adj.entry(a).or_default().push(b);
+                adj.entry(b).or_default().push(a);
+            }
+        }
+        (matched_by_id, adj)
     }
 
     // --- candidate generation -------------------------------------------
@@ -492,8 +591,20 @@ mod tests {
     #[test]
     fn basic_recon() {
         let mut r = Matcher::new(Demo);
-        r.upsert(1, Tx { amount: 100, date: 0 });
-        r.upsert(2, Tx { amount: -100, date: 1 });
+        r.upsert(
+            1,
+            Tx {
+                amount: 100,
+                date: 0,
+            },
+        );
+        r.upsert(
+            2,
+            Tx {
+                amount: -100,
+                date: 1,
+            },
+        );
         r.solve();
         let groups = r.groups();
         assert_eq!(groups.len(), 1);
@@ -504,14 +615,38 @@ mod tests {
     #[test]
     fn streaming_add() {
         let mut r = Matcher::new(Demo);
-        r.upsert(1, Tx { amount: 100, date: 0 });
-        r.upsert(2, Tx { amount: -100, date: 0 });
+        r.upsert(
+            1,
+            Tx {
+                amount: 100,
+                date: 0,
+            },
+        );
+        r.upsert(
+            2,
+            Tx {
+                amount: -100,
+                date: 0,
+            },
+        );
         r.solve();
         assert_eq!(r.groups().len(), 1);
 
         // stream more
-        r.upsert(3, Tx { amount: 70, date: 5 });
-        r.upsert(4, Tx { amount: -70, date: 5 });
+        r.upsert(
+            3,
+            Tx {
+                amount: 70,
+                date: 5,
+            },
+        );
+        r.upsert(
+            4,
+            Tx {
+                amount: -70,
+                date: 5,
+            },
+        );
         r.solve();
         let g = r.groups();
         assert_eq!(g.len(), 2);
@@ -519,10 +654,82 @@ mod tests {
     }
 
     #[test]
+    fn allocation_readback_exposes_partial_matches() {
+        let mut r = Matcher::new(Demo);
+        r.upsert(
+            1,
+            Tx {
+                amount: 100,
+                date: 0,
+            },
+        );
+        r.upsert(
+            2,
+            Tx {
+                amount: 200,
+                date: 1,
+            },
+        );
+        r.upsert(
+            3,
+            Tx {
+                amount: -250,
+                date: 0,
+            },
+        );
+        r.solve();
+
+        let groups = r.allocation_groups();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].clean);
+        let mut members = groups[0].members.clone();
+        members.sort_by_key(|a| a.id);
+        assert_eq!(members.iter().map(|a| a.amount).sum::<i64>(), 0);
+        assert_eq!(
+            members
+                .iter()
+                .filter(|a| a.amount > 0)
+                .map(|a| a.amount)
+                .sum::<i64>(),
+            250
+        );
+        assert_eq!(
+            members
+                .iter()
+                .filter(|a| a.amount < 0)
+                .map(|a| a.amount)
+                .sum::<i64>(),
+            -250
+        );
+        assert!(
+            members
+                .iter()
+                .all(|a| a.amount.abs() <= r.entries[&a.id].base.abs())
+        );
+        let rem = r.unmatched_allocations();
+        assert_eq!(rem.iter().map(|a| a.amount).sum::<i64>(), 50);
+        assert_eq!(rem.len(), 1);
+        // The legacy whole-row view still reports connected row ids.
+        assert_eq!(r.groups()[0].members, vec![1, 2, 3]);
+    }
+
+    #[test]
     fn out_of_window_unmatched() {
         let mut r = Matcher::new(Demo);
-        r.upsert(1, Tx { amount: 100, date: 0 });
-        r.upsert(2, Tx { amount: -100, date: 100 }); // far outside window
+        r.upsert(
+            1,
+            Tx {
+                amount: 100,
+                date: 0,
+            },
+        );
+        r.upsert(
+            2,
+            Tx {
+                amount: -100,
+                date: 100,
+            },
+        ); // far outside window
         r.solve();
         assert_eq!(r.groups().len(), 0);
         assert_eq!(r.unmatched(), vec![1, 2]);
@@ -531,25 +738,68 @@ mod tests {
     #[test]
     fn correction_reprice() {
         let mut r = Matcher::new(Demo);
-        r.upsert(1, Tx { amount: 100, date: 0 });
-        r.upsert(2, Tx { amount: -100, date: 0 });
-        r.upsert(3, Tx { amount: -50, date: 0 });
+        r.upsert(
+            1,
+            Tx {
+                amount: 100,
+                date: 0,
+            },
+        );
+        r.upsert(
+            2,
+            Tx {
+                amount: -100,
+                date: 0,
+            },
+        );
+        r.upsert(
+            3,
+            Tx {
+                amount: -50,
+                date: 0,
+            },
+        );
         r.solve();
         // 1 matches 2 (exact)
-        assert!(r.groups().iter().any(|g| g.members.contains(&1) && g.members.contains(&2)));
+        assert!(
+            r.groups()
+                .iter()
+                .any(|g| g.members.contains(&1) && g.members.contains(&2))
+        );
 
         // correct tx 1 down to 50 -> should now prefer matching 3
-        r.upsert(1, Tx { amount: 50, date: 0 });
+        r.upsert(
+            1,
+            Tx {
+                amount: 50,
+                date: 0,
+            },
+        );
         r.solve();
         let g = r.groups();
-        assert!(g.iter().any(|g| g.clean && g.members.contains(&1) && g.members.contains(&3)));
+        assert!(
+            g.iter()
+                .any(|g| g.clean && g.members.contains(&1) && g.members.contains(&3))
+        );
     }
 
     #[test]
     fn remove_tx() {
         let mut r = Matcher::new(Demo);
-        r.upsert(1, Tx { amount: 100, date: 0 });
-        r.upsert(2, Tx { amount: -100, date: 0 });
+        r.upsert(
+            1,
+            Tx {
+                amount: 100,
+                date: 0,
+            },
+        );
+        r.upsert(
+            2,
+            Tx {
+                amount: -100,
+                date: 0,
+            },
+        );
         r.solve();
         assert_eq!(r.groups().len(), 1);
         r.remove(2);
@@ -588,8 +838,20 @@ mod tests {
 
         // "Month 1": match a pair, then cache.
         let mut r = Matcher::new(SModel);
-        r.upsert(1, STx { amount: 100, date: 0 });
-        r.upsert(2, STx { amount: -100, date: 0 });
+        r.upsert(
+            1,
+            STx {
+                amount: 100,
+                date: 0,
+            },
+        );
+        r.upsert(
+            2,
+            STx {
+                amount: -100,
+                date: 0,
+            },
+        );
         r.solve();
         let json = serde_json::to_string(&r.snapshot()).unwrap();
 
@@ -597,8 +859,20 @@ mod tests {
         let snap: MatcherSnapshot<STx> = serde_json::from_str(&json).unwrap();
         let mut r2 = Matcher::restore(SModel, snap);
         assert_eq!(r2.groups().len(), 1); // basis survived the round-trip
-        r2.upsert(3, STx { amount: 70, date: 1 });
-        r2.upsert(4, STx { amount: -70, date: 1 });
+        r2.upsert(
+            3,
+            STx {
+                amount: 70,
+                date: 1,
+            },
+        );
+        r2.upsert(
+            4,
+            STx {
+                amount: -70,
+                date: 1,
+            },
+        );
         r2.solve();
         let g = r2.groups();
         assert_eq!(g.len(), 2);
