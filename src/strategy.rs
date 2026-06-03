@@ -14,8 +14,8 @@
 //! ```
 //!
 //! Primitives ([`exact_1to1`], [`agg_net`], [`signal_group`], [`flow`]) are the
-//! leaves; combinators ([`seq`], [`partition_by`]) compose them. A whole
-//! pipeline is just an expression:
+//! leaves; combinators ([`seq`], [`partition_by`], [`branch`]) compose them. A
+//! whole pipeline is just an expression:
 //!
 //! ```ignore
 //! partition_by(unit, partition_by(ccy, seq(vec![
@@ -31,7 +31,7 @@
 //! ambiguous residual where strategies would otherwise compete.
 
 use crate::engine::SolveStatus;
-use crate::flow::{ExtId, Model, Matcher};
+use crate::flow::{ExtId, Matcher, Model};
 use std::collections::{BTreeSet, HashMap};
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -174,6 +174,57 @@ where
         key,
         factory: Box::new(factory),
         children: HashMap::new(),
+    })
+}
+
+struct Branch<E, FP> {
+    pred: FP,
+    and_then: Box<dyn Strategy<E>>,
+    or_else: Box<dyn Strategy<E>>,
+}
+
+impl<E, FP> Strategy<E> for Branch<E, FP>
+where
+    FP: Fn(&E) -> bool,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let mut yes = Vec::new();
+        let mut no = Vec::new();
+        for item in bag {
+            if (self.pred)(&item.data) {
+                yes.push(item);
+            } else {
+                no.push(item);
+            }
+        }
+        // Always run both children, even on empty input, so stateful leaves such
+        // as `flow` can observe rows that departed their branch and drop stale
+        // warm state.
+        let mut a = self.and_then.run(yes);
+        let b = self.or_else.run(no);
+        a.groups.extend(b.groups);
+        a.residual.extend(b.residual);
+        a
+    }
+}
+
+/// Route the bag by a predicate, run different child subtrees on the two sides,
+/// then join their groups/residuals. This is a structural split (unlike
+/// [`seq`], which cascades over residual, and unlike [`partition_by`], which
+/// runs the same child per shard). Conservation follows from the disjoint split
+/// and from each child conserving its own side.
+pub fn branch<E: 'static, FP>(
+    pred: FP,
+    and_then: Box<dyn Strategy<E>>,
+    or_else: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>>
+where
+    FP: Fn(&E) -> bool + 'static,
+{
+    Box::new(Branch {
+        pred,
+        and_then,
+        or_else,
     })
 }
 
@@ -350,7 +401,10 @@ where
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut buckets: HashMap<u64, Vec<Item<E>>> = HashMap::new();
         for item in bag {
-            buckets.entry((self.key)(&item.data)).or_default().push(item);
+            buckets
+                .entry((self.key)(&item.data))
+                .or_default()
+                .push(item);
         }
         let mut groups = Vec::new();
         let mut residual = Vec::new();
@@ -741,18 +795,41 @@ mod tests {
     }
 
     #[test]
+    fn branch_routes_to_different_children_and_conserves() {
+        let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
+        let mut s = branch(
+            |a: &i64| a.unsigned_abs() == 5,
+            agg_net(|_a: &i64| 1u64, |a: &i64| *a, 0),
+            agg_net(|_a: &i64| 2u64, |a: &i64| *a, 0),
+        );
+        let r = s.run(b);
+        conserves(4, &r);
+        assert_eq!(r.groups.len(), 2);
+        assert_eq!(r.residual.len(), 0);
+    }
+
+    #[test]
     fn windowed_blocks_far_matches() {
         // +5@1 and -5@100: global exact_1to1 would pair them; windowed (w=3)
         // must not -- they are too far apart in the ordering.
         let b = vec![
-            Item { id: 1, data: (1i64, 5i64) },
-            Item { id: 2, data: (100, -5) },
+            Item {
+                id: 1,
+                data: (1i64, 5i64),
+            },
+            Item {
+                id: 2,
+                data: (100, -5),
+            },
         ];
         let inner = exact_1to1(
             |d: &(i64, i64)| Some(d.1.unsigned_abs()),
             |d: &(i64, i64)| d.1,
         );
-        let r = { let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner); w.run(b) };
+        let r = {
+            let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner);
+            w.run(b)
+        };
         assert_eq!(r.groups.len(), 0);
         assert_eq!(r.residual.len(), 2);
     }
@@ -762,14 +839,23 @@ mod tests {
         // +5@4 and -5@7 fall in different bands (w=3) but within one window of
         // each other; the carry/look-ahead must still pair them.
         let b = vec![
-            Item { id: 1, data: (4i64, 5i64) },
-            Item { id: 2, data: (7, -5) },
+            Item {
+                id: 1,
+                data: (4i64, 5i64),
+            },
+            Item {
+                id: 2,
+                data: (7, -5),
+            },
         ];
         let inner = exact_1to1(
             |d: &(i64, i64)| Some(d.1.unsigned_abs()),
             |d: &(i64, i64)| d.1,
         );
-        let r = { let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner); w.run(b) };
+        let r = {
+            let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner);
+            w.run(b)
+        };
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.residual.len(), 0);
     }
@@ -778,11 +864,26 @@ mod tests {
     fn running_zero_segments_at_balance_clears() {
         // timeline: +100, -100 | +50, -30, -20  -> two clearing segments
         let b = vec![
-            Item { id: 1, data: (1i64, 100i64) },
-            Item { id: 2, data: (2, -100) },
-            Item { id: 3, data: (3, 50) },
-            Item { id: 4, data: (4, -30) },
-            Item { id: 5, data: (5, -20) },
+            Item {
+                id: 1,
+                data: (1i64, 100i64),
+            },
+            Item {
+                id: 2,
+                data: (2, -100),
+            },
+            Item {
+                id: 3,
+                data: (3, 50),
+            },
+            Item {
+                id: 4,
+                data: (4, -30),
+            },
+            Item {
+                id: 5,
+                data: (5, -20),
+            },
         ];
         let mut s = running_zero(|d: &(i64, i64)| d.0, |d: &(i64, i64)| d.1, 0);
         let r = s.run(b);
@@ -796,9 +897,18 @@ mod tests {
     #[test]
     fn running_zero_leaves_uncleared_tail() {
         let b = vec![
-            Item { id: 1, data: (1i64, 100i64) },
-            Item { id: 2, data: (2, -100) },
-            Item { id: 3, data: (3, 7) }, // never clears
+            Item {
+                id: 1,
+                data: (1i64, 100i64),
+            },
+            Item {
+                id: 2,
+                data: (2, -100),
+            },
+            Item {
+                id: 3,
+                data: (3, 7),
+            }, // never clears
         ];
         let mut s = running_zero(|d: &(i64, i64)| d.0, |d: &(i64, i64)| d.1, 0);
         let r = s.run(b);
@@ -811,7 +921,12 @@ mod tests {
     fn seq_then_partition_compose() {
         let mut pipeline = partition_by(
             |a: &i64| a.signum().unsigned_abs(), // silly key just to exercise sharding
-            || seq(vec![exact_1to1(|a: &i64| Some(a.unsigned_abs()), |a: &i64| *a)]),
+            || {
+                seq(vec![exact_1to1(
+                    |a: &i64| Some(a.unsigned_abs()),
+                    |a: &i64| *a,
+                )])
+            },
         );
         let b = bag(&[(1, 4), (2, -4), (3, 4), (4, -4)]);
         let r = pipeline.run(b);

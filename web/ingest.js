@@ -114,7 +114,7 @@ export function buildDataset({ header, rows, mapping }) {
     steps.push({ op: "signal", signals: "tokens", amount: "amount", tol, cap: 256 });
   if (tokCis.length && mapping.date != null)
     steps.push({
-      op: "flow", amount: "amount", day: "date", native: "amount",
+      op: "flow", amount: "amount", day: "date",
       tokens: "tokens", penalty: 1000.0, window: -1,
     });
   let plan = { op: "seq", steps };

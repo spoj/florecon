@@ -69,7 +69,7 @@ def plan():
         {"op": "agg_net", "key": "objsub", "amount": "native", "tol": 100},
         {"op": "exact", "amount": "native"},
         {"op": "signal", "signals": "tokens", "amount": "native", "tol": 100, "cap": 256},
-        {"op": "flow", "amount": "native", "day": "day", "native": "native",
+        {"op": "flow", "amount": "native", "day": "day",
          "tokens": "tokens", "penalty": 1000.0, "window": -1},
     ]}
     return {"op": "partition", "by": "unit",
@@ -109,7 +109,10 @@ def main():
 
     total = len(rows)
     total_value = sum(abs(v) for v in usd_by_id)
-    matched_ids = {a[0] for a in rep["assignments"]}
+    gid_of = {id: gid for id, gid in rep["assignments"]}
+    groups_by_id = {g["group_id"]: g for g in rep["groups"]}
+    residual_ids = {id for id, gid in gid_of.items() if groups_by_id[gid]["origin"] == "unmatched" and groups_by_id[gid]["size"] == 1}
+    matched_ids = set(gid_of) - residual_ids
     matched_value = sum(abs(usd_by_id[i]) for i in matched_ids)
     clean = sum(1 for g in rep["groups"] if abs(g["net"]) <= 100)
     by_origin = {}
@@ -126,11 +129,10 @@ def main():
     for origin in sorted(by_origin):
         c, r = by_origin[origin]
         print(f"    {origin:<13} {c:>7} groups  {r:>8} rows")
-    print(f"  residual rows   : {len(rep['residual'])}")
+    print(f"  residual rows   : {len(residual_ids)}")
     print(f"  wasm solve time : {dt:.2f}s")
     # Conservation is enforced inside solve(); echo the partition identity.
-    print(f"  conservation    : {len(matched_ids)} + {len(rep['residual'])} == {total} "
-          f"-> {len(matched_ids)+len(rep['residual'])==total}")
+    print(f"  conservation    : {len(gid_of)} == {total} -> {len(gid_of)==total}")
 
 
 if __name__ == "__main__":

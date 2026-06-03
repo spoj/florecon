@@ -12,141 +12,35 @@
 //! - [`Recon`] — the one generic stateful facade (`upsert` / `remove` / `solve`
 //!   / `freeze` / `breakup` / …); [`Workspace`] is its [`LoweredRow`] + [`Plan`]
 //!   specialization and [`Session`] is the stateless one-shot form.
-//! - [`Report`] — the relational result (`assignments` + `groups` + `residual`).
+//! - [`Report`] — the relational partition result (`assignments` + `groups`).
 //!
 //! Conservation is enforced at the boundary: a solve verifies that every input
-//! id lands in exactly one group or in the residual, so a malformed plan can
-//! never silently lose or double-count mass.
+//! id lands in exactly one group, so a malformed plan can never silently lose or
+//! double-count mass.
 
-use crate::flow::{ExtId, Model};
-use crate::lower::{Kind, Row, TokenCfg};
+use crate::flow::ExtId;
+use crate::lower::Row;
+use crate::plan_compile::compile;
 
 /// The wire-contract version: the shape of [`Plan`], [`Report`], and the WASM
 /// command set. Hosts (the Python wheel, the browser module) read it back from
 /// the engine and refuse to run against a mismatched binary. Bump it on any
 /// breaking change to those shapes.
 ///
-/// v4 makes the business representation canonical: a row is bare
+/// v5 uses a unified partition report and makes flow amount terminology generic: a row is bare
 /// [`Cell`](crate::lower::Cell)s (a number or a string) and the schema's
 /// per-column [`Kind`] decides how each lowers. The engine's lowered
 /// [`LoweredCell`] (`Int`/`Tokens`) form is an internal implementation detail —
 /// it is never on the wire.
-pub const CONTRACT_VERSION: u32 = 4;
-use crate::strategy::{
-    Item, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group, windowed,
-};
+pub const CONTRACT_VERSION: u32 = 5;
+pub use crate::error::ApiError;
+pub use crate::expr::{BoolExpr, BoolRef, ScalarExpr, ScalarRef};
+pub use crate::report::{GroupOut, Report, Status};
+pub use crate::row::{LoweredCell, LoweredRow};
+pub use crate::schema::{Column, Schema};
+
+use crate::strategy::{Item, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
-
-// ---------------------------------------------------------------------------
-// Typed records
-// ---------------------------------------------------------------------------
-
-/// A typed column value the engine works on — the *lowered*, internal form,
-/// produced from a business [`Cell`](crate::lower::Cell) by
-/// [`crate::lower`]. `Int` carries money (minor units), dates (days), and
-/// partition/bucket keys; `Tokens` carries hashed reference signals. Callers do
-/// not construct this; they describe rows with bare cells and a [`Schema`].
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum LoweredCell {
-    Int(i64),
-    Tokens(Vec<u64>),
-}
-
-/// One schema column: a name (referenced by the plan) and a [`Kind`] (how its
-/// cells lower).
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Column {
-    pub name: String,
-    pub kind: Kind,
-}
-
-/// Column layout shared by every row in a [`Session`]: the ordered, typed
-/// columns plus the text-token policy. Lowering ([`crate::lower`]) reads the
-/// per-column [`Kind`]s; the plan references columns by name.
-#[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Schema {
-    cols: Vec<Column>,
-    /// Stopwords for `Tokens` lowering (see [`crate::lower::tokens`]), matched
-    /// upper-cased. Empty by default; carried here so the lowering policy
-    /// travels with the schema it applies to.
-    #[cfg_attr(feature = "serde", serde(default))]
-    token_drop: Vec<String>,
-}
-
-impl Schema {
-    /// Schema from `(name, kind)` pairs.
-    pub fn typed<I, S>(cols: I) -> Self
-    where
-        I: IntoIterator<Item = (S, Kind)>,
-        S: Into<String>,
-    {
-        Schema {
-            cols: cols
-                .into_iter()
-                .map(|(name, kind)| Column {
-                    name: name.into(),
-                    kind,
-                })
-                .collect(),
-            token_drop: Vec::new(),
-        }
-    }
-
-    /// The per-column lowering kinds, positional against rows.
-    pub fn kinds(&self) -> Vec<Kind> {
-        self.cols.iter().map(|c| c.kind).collect()
-    }
-
-    /// The token-extraction policy for this schema (drop list from the schema,
-    /// length band at the [`TokenCfg`] defaults).
-    pub fn token_cfg(&self) -> TokenCfg {
-        TokenCfg {
-            drop: self.token_drop.clone(),
-            ..TokenCfg::default()
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.cols.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cols.is_empty()
-    }
-
-    fn index(&self, name: &str) -> Result<usize, ApiError> {
-        self.cols
-            .iter()
-            .position(|c| c.name == name)
-            .ok_or_else(|| ApiError::UnknownColumn(name.to_string()))
-    }
-}
-
-/// One row's column values, positional against the session [`Schema`].
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct LoweredRow {
-    pub values: Vec<LoweredCell>,
-}
-
-impl LoweredRow {
-    fn int(&self, idx: usize) -> i64 {
-        match self.values.get(idx) {
-            Some(LoweredCell::Int(i)) => *i,
-            _ => 0,
-        }
-    }
-
-    fn tokens(&self, idx: usize) -> Vec<u64> {
-        match self.values.get(idx) {
-            Some(LoweredCell::Tokens(t)) => t.clone(),
-            _ => Vec::new(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The plan (strategy tree as data)
@@ -160,37 +54,43 @@ impl LoweredRow {
 pub enum Plan {
     /// Cascade: each step runs on the previous step's residual.
     Seq { steps: Vec<Plan> },
-    /// Fork/join shard by an integer column, run `inner` per shard.
-    Partition { by: String, inner: Box<Plan> },
-    /// Run `inner` within a sliding window over an integer order column.
+    /// Fork/join shard by a scalar column/expression, run `inner` per shard.
+    Partition { by: ScalarRef, inner: Box<Plan> },
+    /// Route rows by a boolean column/expression, run different child subtrees
+    /// on each side, then join. This is a structural split; both sides conserve.
+    Branch {
+        pred: BoolRef,
+        and_then: Box<Plan>,
+        or_else: Box<Plan>,
+    },
+    /// Run `inner` within a sliding window over an integer order expression.
     Windowed {
-        order: String,
+        order: ScalarRef,
         width: i64,
         inner: Box<Plan>,
     },
-    /// Accept an aggregation bucket (integer `key`) that nets to zero in `tol`.
+    /// Accept an aggregation bucket (`key`) that nets to zero in `tol`.
     AggNet {
-        key: String,
-        amount: String,
+        key: ScalarRef,
+        amount: ScalarRef,
         tol: i64,
     },
     /// Pair opposite-sign rows with equal magnitude on `amount`.
-    Exact { amount: String },
+    Exact { amount: ScalarRef },
     /// Group rows that share an out-of-band token signal and net to zero.
     Signal {
         signals: String,
-        amount: String,
+        amount: ScalarRef,
         tol: i64,
         cap: usize,
     },
     /// The min-cost-flow arbiter over the residual.
     Flow {
-        /// Numeraire column conserved by the network.
-        amount: String,
-        /// Date/order column (days) for proximity candidate generation.
-        day: String,
-        /// Native-amount column used for exact-amount candidates and cost.
-        native: String,
+        /// Numeraire expression conserved by the network and used for
+        /// exact-amount candidates/cost.
+        amount: ScalarRef,
+        /// Date/order expression (days) for proximity candidate generation.
+        day: ScalarRef,
         /// Token-signal column used for reference-bridge candidates and cost.
         tokens: String,
         penalty: f64,
@@ -213,7 +113,7 @@ pub enum Plan {
 pub enum Cond {
     /// The two rows share at least one reference token.
     TokenShared,
-    /// The two rows have equal, non-zero absolute native amount.
+    /// The two rows have equal, non-zero absolute flow amount.
     AmountEqual,
 }
 
@@ -270,273 +170,11 @@ impl Default for CostSpec {
     }
 }
 
-/// Errors from compiling or running a [`Plan`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum ApiError {
-    UnknownColumn(String),
-    SchemaArity {
-        expected: usize,
-        got: usize,
-    },
-    /// The pipeline did not partition the input: some id was lost or assigned
-    /// to more than one group. Should be impossible — a bug guard.
-    ConservationViolated {
-        input: usize,
-        accounted: usize,
-    },
-    /// A group id referenced by an interactive op does not exist.
-    UnknownGroup(u64),
-    /// A manual op referenced an id that is not in the workspace.
-    UnknownId(ExtId),
-    /// A manual op would disturb a frozen (signed-off) group; unfreeze first.
-    FrozenMember(ExtId),
-    /// A manual group needs at least two distinct members.
-    DegenerateGroup,
-    /// A bare cell did not match its column [`Kind`] (e.g. a string in a
-    /// `Number` column). `col` is the column index; `want` the expected scalar.
-    BadCell {
-        col: usize,
-        want: &'static str,
-    },
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::UnknownColumn(c) => write!(f, "unknown column: {c}"),
-            ApiError::SchemaArity { expected, got } => {
-                write!(f, "row arity {got} != schema arity {expected}")
-            }
-            ApiError::ConservationViolated { input, accounted } => {
-                write!(f, "conservation violated: {accounted} accounted of {input}")
-            }
-            ApiError::UnknownGroup(g) => write!(f, "unknown group id: {g}"),
-            ApiError::UnknownId(id) => write!(f, "unknown row id: {id}"),
-            ApiError::FrozenMember(id) => {
-                write!(f, "row {id} is in a frozen group; unfreeze it first")
-            }
-            ApiError::DegenerateGroup => write!(f, "a manual group needs at least two rows"),
-            ApiError::BadCell { col, want } => {
-                write!(f, "column {col}: expected a {want}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ApiError {}
-
-// ---------------------------------------------------------------------------
-// Flow model bound to columns
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct PlanModel {
-    amount: usize,
-    day: usize,
-    native: usize,
-    tokens: usize,
-    penalty: f64,
-    window: i64,
-    cost: CostSpec,
-}
-
-impl Model for PlanModel {
-    type Tx = LoweredRow;
-
-    fn base_amount(&self, tx: &LoweredRow) -> i64 {
-        tx.int(self.amount)
-    }
-    fn penalty(&self, _tx: &LoweredRow) -> f64 {
-        self.penalty
-    }
-    fn block_key(&self, tx: &LoweredRow) -> i64 {
-        tx.int(self.day)
-    }
-    fn window(&self) -> i64 {
-        self.window
-    }
-    fn match_keys(&self, tx: &LoweredRow) -> Vec<u64> {
-        // Reference tokens bridge the two books; the native amount lets exact
-        // equal-magnitude rows become candidates even without a shared token.
-        let mut keys = tx.tokens(self.tokens);
-        let n = tx.int(self.native);
-        if n != 0 {
-            keys.push(n.unsigned_abs());
-        }
-        keys
-    }
-    fn cost(&self, a: &LoweredRow, b: &LoweredRow) -> Option<f64> {
-        let token_shared = {
-            let bt = b.tokens(self.tokens);
-            a.tokens(self.tokens).iter().any(|t| bt.contains(t))
-        };
-        let amount_equal = {
-            let (na, nb) = (a.int(self.native), b.int(self.native));
-            na != 0 && na.abs() == nb.abs()
-        };
-        let dd = (a.int(self.day) - b.int(self.day)).abs();
-        // First tier whose conditions hold and whose date gap is in range wins;
-        // a pair matched by no tier is forbidden (no arc).
-        for tier in &self.cost.tiers {
-            let holds = tier.when.iter().all(|c| match c {
-                Cond::TokenShared => token_shared,
-                Cond::AmountEqual => amount_equal,
-            });
-            if !holds {
-                continue;
-            }
-            if let Some(md) = tier.max_day
-                && dd > md
-            {
-                continue; // out of range for this tier; try a looser one
-            }
-            return Some(tier.base + tier.day_slope * dd as f64);
-        }
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Compiler: Plan -> Strategy<Row>
-// ---------------------------------------------------------------------------
-
-/// The conservation airlock, defined once. Asserts that exactly `input` ids were
-/// accounted for: each landing in exactly one group, or — at the batch boundary
-/// — in `assignments ⊎ residual`. The combinator algebra conserves *by
-/// construction*; this O(n) count at every public boundary is the belt that
-/// turns a hypothetical `compile` or `Strategy` bug into a loud error rather
-/// than a silently corrupted ledger. The two callers differ only in how they
-/// *count* (their two state models partition differently); the invariant and its
-/// error live here.
 fn conservation_airlock(input: usize, accounted: usize) -> Result<(), ApiError> {
     if accounted != input {
         return Err(ApiError::ConservationViolated { input, accounted });
     }
     Ok(())
-}
-
-fn compile(plan: &Plan, schema: &Schema) -> Result<Box<dyn Strategy<LoweredRow>>, ApiError> {
-    Ok(match plan {
-        Plan::Seq { steps } => {
-            let mut compiled = Vec::with_capacity(steps.len());
-            for s in steps {
-                compiled.push(compile(s, schema)?);
-            }
-            seq(compiled)
-        }
-        Plan::Partition { by, inner } => {
-            let k = schema.index(by)?;
-            // Validate the inner subtree once, eagerly, so a bad plan is an
-            // error here rather than a panic in the factory below.
-            compile(inner, schema)?;
-            // Each shard gets its OWN child subtree (and therefore its own warm
-            // flow `Matcher`), built on demand by this factory. Per-shard
-            // warm-start is then automatic — the flow leaf never learns it is
-            // sharded. Recompiling the same validated plan cannot fail.
-            let inner = (**inner).clone();
-            let schema = schema.clone();
-            let factory = move || compile(&inner, &schema).expect("inner plan already validated");
-            partition_by(move |r: &LoweredRow| r.int(k), factory)
-        }
-        Plan::Windowed {
-            order,
-            width,
-            inner,
-        } => {
-            let o = schema.index(order)?;
-            windowed(
-                move |r: &LoweredRow| r.int(o),
-                *width,
-                compile(inner, schema)?,
-            )
-        }
-        Plan::AggNet { key, amount, tol } => {
-            let (k, a) = (schema.index(key)?, schema.index(amount)?);
-            agg_net(
-                move |r: &LoweredRow| r.int(k) as u64,
-                move |r: &LoweredRow| r.int(a),
-                *tol,
-            )
-        }
-        Plan::Exact { amount } => {
-            let a = schema.index(amount)?;
-            exact_1to1(
-                move |r: &LoweredRow| {
-                    let v = r.int(a);
-                    if v != 0 { Some(v.unsigned_abs()) } else { None }
-                },
-                move |r: &LoweredRow| r.int(a),
-            )
-        }
-        Plan::Signal {
-            signals,
-            amount,
-            tol,
-            cap,
-        } => {
-            let (s, a) = (schema.index(signals)?, schema.index(amount)?);
-            signal_group(
-                move |r: &LoweredRow| r.tokens(s),
-                move |r: &LoweredRow| r.int(a),
-                *tol,
-                *cap,
-            )
-        }
-        Plan::Flow {
-            amount,
-            day,
-            native,
-            tokens,
-            penalty,
-            window,
-            cost,
-        } => {
-            let model = PlanModel {
-                amount: schema.index(amount)?,
-                day: schema.index(day)?,
-                native: schema.index(native)?,
-                tokens: schema.index(tokens)?,
-                penalty: *penalty,
-                window: *window,
-                cost: cost.clone(),
-            };
-            // Stateful warm leaf; one-shot callers (Session) just run it once.
-            flow(model)
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Result
-// ---------------------------------------------------------------------------
-
-/// One reconciled group in a [`Report`].
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct GroupOut {
-    pub group_id: u64,
-    pub origin: String,
-    /// Residual in the numeraire; zero means it nets out.
-    pub net: i64,
-    pub size: usize,
-}
-
-/// The relational result of [`Session::solve`]. `assignments` ⊎ `residual`
-/// partitions the input ids exactly (verified before this is returned).
-///
-/// Note the deliberate divergence from the interactive [`WorkspaceReport`]:
-/// the batch path is one-shot and holds no operator state, so it keeps an
-/// explicit `residual` list rather than collapsing unmatched rows into live
-/// singleton groups. Only the stateful workspace adopts the unified
-/// everything-is-a-group model.
-#[derive(Debug, Clone, PartialEq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Report {
-    /// `(id, group_id)`, one row per matched id.
-    pub assignments: Vec<(ExtId, u64)>,
-    pub groups: Vec<GroupOut>,
-    /// Ids left unmatched.
-    pub residual: Vec<ExtId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -621,9 +259,11 @@ impl Session {
         groups.sort_by_key(|g| g.members.iter().copied().min().unwrap_or(0));
 
         let mut assignments = Vec::new();
-        let mut group_out = Vec::with_capacity(groups.len());
-        for (gid, g) in groups.into_iter().enumerate() {
-            let gid = gid as u64;
+        let mut group_out = Vec::with_capacity(groups.len() + res.residual.len());
+        let mut next_gid = 0u64;
+        for g in groups {
+            let gid = next_gid;
+            next_gid += 1;
             for &m in &g.members {
                 assignments.push((m, gid));
             }
@@ -632,21 +272,32 @@ impl Session {
                 origin: g.origin.to_string(),
                 net: g.net,
                 size: g.members.len(),
+                status: Status::Live,
+            });
+        }
+
+        let mut residual: Vec<ExtId> = res.residual.into_iter().map(|i| i.id).collect();
+        residual.sort_unstable();
+        for id in residual {
+            let gid = next_gid;
+            next_gid += 1;
+            assignments.push((id, gid));
+            group_out.push(GroupOut {
+                group_id: gid,
+                origin: "unmatched".to_string(),
+                net: 0,
+                size: 1,
+                status: Status::Live,
             });
         }
         assignments.sort();
 
-        let mut residual: Vec<ExtId> = res.residual.into_iter().map(|i| i.id).collect();
-        residual.sort_unstable();
-
-        // Conservation airlock: assigned ⊎ residual must equal the input ids,
-        // with no id counted twice.
-        conservation_airlock(input, assignments.len() + residual.len())?;
+        // Conservation airlock: every input id has exactly one assignment.
+        conservation_airlock(input, assignments.len())?;
 
         Ok(Report {
             assignments,
             groups: group_out,
-            residual,
         })
     }
 }
@@ -679,35 +330,6 @@ impl SolveRequest {
 // Workspace — the interactive, stateful surface
 // ---------------------------------------------------------------------------
 
-/// The single recalc-status axis of a group. Only a human operator flips a
-/// group between these: `live` is the machine's current opinion (subject to
-/// recalc), `frozen` is the operator's decision (inviolable). Combined with
-/// arity it expresses matched/unmatched × proposed/forced — a live singleton is
-/// an unmatched row, a frozen singleton an accepted exception.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum Status {
-    Live,
-    Frozen,
-}
-
-/// One group in a [`Workspace`], live or frozen. `group_id` is stable for
-/// frozen groups so a front-end can reference them across operations; live
-/// singleton ids are ephemeral (re-minted every solve). `group_id` is stable so
-/// a front-end can reference it across operations.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct WsGroup {
-    pub group_id: u64,
-    pub origin: String,
-    pub net: i64,
-    pub size: usize,
-    /// The single recalc-status axis: `live` or `frozen`. (Matched vs unmatched
-    /// is arity — `size` — not status.)
-    pub status: Status,
-}
-
 struct GroupRec {
     id: u64,
     members: Vec<ExtId>,
@@ -725,12 +347,7 @@ impl GroupRec {
 /// The interactive result: a single partition of every input id into groups,
 /// each carrying its [`Status`]. There is no separate residual set — an
 /// unmatched row is a live singleton group (origin `"unmatched"`).
-#[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct WorkspaceReport {
-    pub assignments: Vec<(ExtId, u64)>,
-    pub groups: Vec<WsGroup>,
-}
+pub type WorkspaceReport = Report;
 
 /// A long-lived, editable reconciliation workspace over items of type `E`,
 /// driven by any [`Strategy`]. This is the one stateful facade; [`Workspace`]
@@ -1048,7 +665,7 @@ impl<E: Clone> Recon<E> {
             for &m in &g.members {
                 assignments.push((m, g.id));
             }
-            groups.push(WsGroup {
+            groups.push(GroupOut {
                 group_id: g.id,
                 origin: g.origin.clone(),
                 net: g.net,
@@ -1158,7 +775,7 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower::Cell;
+    use crate::lower::{Cell, Kind};
 
     fn schema() -> Schema {
         Schema::typed([
@@ -1209,7 +826,6 @@ mod tests {
                 Plan::Flow {
                     amount: "usd".into(),
                     day: "day".into(),
-                    native: "native".into(),
                     tokens: "tokens".into(),
                     penalty: 1000.0,
                     window: 30,
@@ -1219,6 +835,27 @@ mod tests {
         }
     }
 
+    fn unmatched_ids(rep: &Report) -> Vec<ExtId> {
+        let unmatched_gids: BTreeSet<u64> = rep
+            .groups
+            .iter()
+            .filter(|g| g.status == Status::Live && g.origin == "unmatched" && g.size == 1)
+            .map(|g| g.group_id)
+            .collect();
+        rep.assignments
+            .iter()
+            .filter(|(_, gid)| unmatched_gids.contains(gid))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    fn matched_groups(rep: &Report) -> Vec<&GroupOut> {
+        rep.groups
+            .iter()
+            .filter(|g| g.origin != "unmatched")
+            .collect()
+    }
+
     #[test]
     fn exact_pair_matches_and_conserves() {
         let mut s = Session::new(schema());
@@ -1226,8 +863,8 @@ mod tests {
         s.upsert(2, row(-100, 2, 0, -100, &[])).unwrap();
         s.upsert(3, row(7, 3, 0, 7, &[])).unwrap(); // unmatched
         let rep = s.solve(&full_pipeline()).unwrap();
-        assert_eq!(rep.assignments.len(), 2);
-        assert_eq!(rep.residual, vec![3]);
+        assert_eq!(rep.assignments.len(), 3);
+        assert_eq!(unmatched_ids(&rep), vec![3]);
         // 1 and 2 share a group.
         let g1 = rep.assignments.iter().find(|(id, _)| *id == 1).unwrap().1;
         let g2 = rep.assignments.iter().find(|(id, _)| *id == 2).unwrap().1;
@@ -1243,7 +880,7 @@ mod tests {
         s.upsert(2, row(-60, 2, 2, 0, &[42])).unwrap();
         s.upsert(3, row(-40, 3, 3, 0, &[42])).unwrap();
         let rep = s.solve(&full_pipeline()).unwrap();
-        assert_eq!(rep.residual.len(), 0);
+        assert_eq!(unmatched_ids(&rep).len(), 0);
         assert_eq!(rep.groups.len(), 1);
         assert_eq!(rep.groups[0].origin, "signal_group");
     }
@@ -1254,8 +891,35 @@ mod tests {
         s.upsert(1, row(100, 1, 7, 0, &[])).unwrap();
         s.upsert(2, row(-100, 2, 7, 0, &[])).unwrap();
         let rep = s.solve(&full_pipeline()).unwrap();
-        assert_eq!(rep.groups.len(), 1);
-        assert_eq!(rep.groups[0].origin, "agg_net");
+        assert_eq!(matched_groups(&rep).len(), 1);
+        assert_eq!(matched_groups(&rep)[0].origin, "agg_net");
+    }
+
+    #[test]
+    fn branch_predicate_routes_without_materializing_column() {
+        let plan = Plan::Branch {
+            pred: BoolRef::Expr(BoolExpr::Gt(
+                Box::new("objsub".into()),
+                Box::new(ScalarExpr::Lit(0).into()),
+            )),
+            and_then: Box::new(Plan::AggNet {
+                key: "objsub".into(),
+                amount: "usd".into(),
+                tol: 0,
+            }),
+            or_else: Box::new(Plan::Exact {
+                amount: "usd".into(),
+            }),
+        };
+        let mut s = Session::new(schema());
+        s.upsert(1, row(100, 1, 1, 0, &[])).unwrap();
+        s.upsert(2, row(-100, 2, 1, 0, &[])).unwrap();
+        s.upsert(3, row(50, 3, 0, 0, &[])).unwrap();
+        s.upsert(4, row(-50, 4, 0, 0, &[])).unwrap();
+        let rep = s.solve(&plan).unwrap();
+        assert_eq!(matched_groups(&rep).len(), 2);
+        assert!(rep.groups.iter().any(|g| g.origin == "agg_net"));
+        assert!(rep.groups.iter().any(|g| g.origin == "exact_1to1"));
     }
 
     #[test]
@@ -1271,8 +935,8 @@ mod tests {
         s.upsert(1, row(0, 1, 1, 50, &[])).unwrap();
         s.upsert(2, row(0, 2, 2, -50, &[])).unwrap();
         let rep = s.solve(&plan).unwrap();
-        assert_eq!(rep.groups.len(), 0);
-        assert_eq!(rep.residual.len(), 2);
+        assert_eq!(matched_groups(&rep).len(), 0);
+        assert_eq!(unmatched_ids(&rep).len(), 2);
     }
 
     #[test]
@@ -1320,7 +984,7 @@ mod tests {
         // A serialized Flow node without a `cost` field fills the default
         // cascade, so existing plans keep working and the data-driven cost is
         // backward compatible.
-        let json = r#"{"op":"flow","amount":"usd","day":"day","native":"native","tokens":"tokens","penalty":1000.0,"window":30}"#;
+        let json = r#"{"op":"flow","amount":"usd","day":"day","tokens":"tokens","penalty":1000.0,"window":30}"#;
         let plan: Plan = serde_json::from_str(json).unwrap();
         match plan {
             Plan::Flow { cost, .. } => assert_eq!(cost, CostSpec::default()),
@@ -1337,7 +1001,6 @@ mod tests {
             steps: vec![Plan::Flow {
                 amount: "usd".into(),
                 day: "day".into(),
-                native: "native".into(),
                 tokens: "tokens".into(),
                 penalty: 1000.0,
                 window: -1,
@@ -1358,8 +1021,12 @@ mod tests {
         s.upsert(1, row(100, 1, 0, 100, &[])).unwrap(); // equal amount,
         s.upsert(2, row(-100, 2, 0, -100, &[])).unwrap(); // no shared token
         let rep = s.solve(&plan).unwrap();
-        assert_eq!(rep.groups.len(), 0, "amount-only forbidden by this cost");
-        assert_eq!(rep.residual.len(), 2);
+        assert_eq!(
+            matched_groups(&rep).len(),
+            0,
+            "amount-only forbidden by this cost"
+        );
+        assert_eq!(unmatched_ids(&rep).len(), 2);
 
         // Give them a shared token and the same cost now pairs them.
         s.upsert(1, row(100, 1, 0, 100, &[7])).unwrap();
@@ -1698,7 +1365,6 @@ mod tests {
         Plan::Flow {
             amount: "usd".into(),
             day: "day".into(),
-            native: "native".into(),
             tokens: "tokens".into(),
             penalty: 1000.0,
             window: 30,

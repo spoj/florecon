@@ -33,7 +33,7 @@ def plan():
         {"op": "agg_net", "key": "objsub", "amount": "native", "tol": 100},
         {"op": "exact", "amount": "native"},
         {"op": "signal", "signals": "tokens", "amount": "native", "tol": 100, "cap": 256},
-        {"op": "flow", "amount": "native", "day": "day", "native": "native",
+        {"op": "flow", "amount": "native", "day": "day",
          "tokens": "tokens", "penalty": 1000.0, "window": -1},
     ]}
     return {"op": "partition", "by": "unit",

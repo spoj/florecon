@@ -5,7 +5,7 @@ dict the engine interprets; they nest exactly like the strategy combinators.
         plan.agg_net("objsub", "native", tol=100),
         plan.exact("native"),
         plan.signal("tokens", "native", tol=100, cap=256),
-        plan.flow("native", day="day", native="native", tokens="tokens"),
+        plan.flow("native", day="day", tokens="tokens"),
     )))
 """
 
@@ -41,21 +41,21 @@ def signal(signals: str, amount: str, tol: int = 0, cap: int = 256) -> dict:
 
 
 def flow(
-    amount: str,
-    day: str,
-    native: str,
+    amount,
+    day,
     tokens: str,
     penalty: float = 1000.0,
     window: int = -1,
     cost: dict = None,
 ) -> dict:
-    """The min-cost-flow arbiter over the residual. `cost` defaults to the
-    reference-bridge > exact-amount cascade; override with `cost_spec`."""
+    """The min-cost-flow arbiter over the residual. `amount` is the conserved
+    numeraire and the exact-amount signal; `cost` defaults to the
+    reference-bridge > exact-amount cascade. Pass `cost=cost_spec(...)` to
+    override."""
     node = {
         "op": "flow",
         "amount": amount,
         "day": day,
-        "native": native,
         "tokens": tokens,
         "penalty": penalty,
         "window": window,
@@ -69,6 +69,74 @@ def flow(
 
 TOKEN_SHARED = "token_shared"
 AMOUNT_EQUAL = "amount_equal"
+
+
+def col_ref(name: str) -> str:
+    return name
+
+
+def lit(value: int) -> dict:
+    return {"lit": int(value)}
+
+
+def key_lit(value: str) -> dict:
+    return {"key": value}
+
+
+def abs_(expr) -> dict:
+    return {"abs": expr}
+
+
+def neg(expr) -> dict:
+    return {"neg": expr}
+
+
+def add(*terms) -> dict:
+    return {"add": list(terms)}
+
+
+def sub(left, right) -> dict:
+    return {"sub": [left, right]}
+
+
+def eq(left, right) -> dict:
+    return {"eq": [left, right]}
+
+
+def ne(left, right) -> dict:
+    return {"ne": [left, right]}
+
+
+def gt(left, right) -> dict:
+    return {"gt": [left, right]}
+
+
+def ge(left, right) -> dict:
+    return {"ge": [left, right]}
+
+
+def lt(left, right) -> dict:
+    return {"lt": [left, right]}
+
+
+def le(left, right) -> dict:
+    return {"le": [left, right]}
+
+
+def and_(*preds) -> dict:
+    return {"and": list(preds)}
+
+
+def or_(*preds) -> dict:
+    return {"or": list(preds)}
+
+
+def not_(pred) -> dict:
+    return {"not": pred}
+
+
+def branch(pred, and_then: dict, or_else: dict) -> dict:
+    return {"op": "branch", "pred": pred, "and_then": and_then, "or_else": or_else}
 
 
 def tier(when, base: float, day_slope: float = 0.0, max_day: int = None) -> dict:

@@ -36,7 +36,11 @@ pub extern "C" fn alloc(len: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dealloc(ptr: u32, len: u32) {
     unsafe {
-        drop(Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize));
+        drop(Vec::from_raw_parts(
+            ptr as *mut u8,
+            len as usize,
+            len as usize,
+        ));
     }
 }
 
@@ -69,22 +73,10 @@ struct Envelope {
 
 fn run(bytes: &[u8]) -> Vec<u8> {
     let env = match serde_json::from_slice::<SolveRequest>(bytes) {
-        Err(e) => Envelope {
-            ok: false,
-            error: Some(format!("bad request json: {e}")),
-            report: None,
-        },
+        Err(e) => Envelope::err(format!("bad request json: {e}")),
         Ok(req) => match req.run() {
-            Ok(report) => Envelope {
-                ok: true,
-                error: None,
-                report: Some(report),
-            },
-            Err(e) => Envelope {
-                ok: false,
-                error: Some(e.to_string()),
-                report: None,
-            },
+            Ok(report) => Envelope::ok(report),
+            Err(e) => Envelope::err(e.to_string()),
         },
     };
     serde_json::to_vec(&env).unwrap_or_else(|_| br#"{"ok":false,"error":"serialize"}"#.to_vec())
@@ -94,9 +86,10 @@ fn run(bytes: &[u8]) -> Vec<u8> {
 // Stateful interactive surface: one workspace, driven by JSON commands.
 // ---------------------------------------------------------------------------
 
-use crate::plan::{Plan, Schema, Workspace, WorkspaceReport};
 use crate::flow::ExtId;
 use crate::lower::Row;
+use crate::plan::{Plan, Workspace};
+use crate::schema::Schema;
 
 thread_local! {
     static WS: RefCell<Option<Workspace>> = const { RefCell::new(None) };
@@ -145,25 +138,16 @@ enum Cmd {
     Report,
 }
 
-#[derive(serde::Serialize)]
-struct WsEnvelope {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    report: Option<WorkspaceReport>,
-}
-
-impl WsEnvelope {
-    fn ok(report: WorkspaceReport) -> Self {
-        WsEnvelope {
+impl Envelope {
+    fn ok(report: Report) -> Self {
+        Envelope {
             ok: true,
             error: None,
             report: Some(report),
         }
     }
     fn err(msg: String) -> Self {
-        WsEnvelope {
+        Envelope {
             ok: false,
             error: Some(msg),
             report: None,
@@ -172,7 +156,7 @@ impl WsEnvelope {
 }
 
 /// Run one JSON [`Cmd`] against the persistent workspace and return a JSON
-/// [`WsEnvelope`] packed as `(len << 32) | ptr`.
+/// [`Envelope`] packed as `(len << 32) | ptr`.
 ///
 /// # Safety
 /// `ptr`/`len` must name a readable buffer in this module's memory.
@@ -190,7 +174,7 @@ pub unsafe extern "C" fn dispatch(ptr: u32, len: u32) -> u64 {
 fn dispatch_json(bytes: &[u8]) -> Vec<u8> {
     let cmd: Cmd = match serde_json::from_slice(bytes) {
         Ok(c) => c,
-        Err(e) => return enc(WsEnvelope::err(format!("bad command json: {e}"))),
+        Err(e) => return enc(Envelope::err(format!("bad command json: {e}"))),
     };
     WS.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -199,25 +183,25 @@ fn dispatch_json(bytes: &[u8]) -> Vec<u8> {
     })
 }
 
-fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
+fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> Envelope {
     // Init is the only command that may run without an existing workspace.
     if let Cmd::Init { schema, plan, rows } = cmd {
         let mut ws = match Workspace::new(schema, plan) {
             Ok(ws) => ws,
-            Err(e) => return WsEnvelope::err(e.to_string()),
+            Err(e) => return Envelope::err(e.to_string()),
         };
         for (id, row) in rows {
             if let Err(e) = ws.upsert(id, row) {
-                return WsEnvelope::err(e.to_string());
+                return Envelope::err(e.to_string());
             }
         }
         let rep = ws.report();
         *slot = Some(ws);
-        return WsEnvelope::ok(rep);
+        return Envelope::ok(rep);
     }
     let ws = match slot.as_mut() {
         Some(ws) => ws,
-        None => return WsEnvelope::err("no workspace: send init first".into()),
+        None => return Envelope::err("no workspace: send init first".into()),
     };
     let result = match cmd {
         Cmd::Init { .. } => unreachable!(),
@@ -247,11 +231,11 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd) -> WsEnvelope {
         Cmd::Report => Ok(()),
     };
     match result {
-        Ok(()) => WsEnvelope::ok(ws.report()),
-        Err(e) => WsEnvelope::err(e.to_string()),
+        Ok(()) => Envelope::ok(ws.report()),
+        Err(e) => Envelope::err(e.to_string()),
     }
 }
 
-fn enc(env: WsEnvelope) -> Vec<u8> {
+fn enc(env: Envelope) -> Vec<u8> {
     serde_json::to_vec(&env).unwrap_or_else(|_| br#"{"ok":false,"error":"serialize"}"#.to_vec())
 }

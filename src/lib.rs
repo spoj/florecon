@@ -14,7 +14,7 @@
 //!   `Strategy: Bag -> (Groups, residual)`, conserving by construction. Cheap
 //!   deterministic primitives (`exact_1to1`, `agg_net`, `signal_group`,
 //!   `running_zero`) cascade ahead of the `flow` arbiter via `seq`,
-//!   `partition_by`, and `windowed`.
+//!   `partition_by`, `branch`, and `windowed`.
 //! - [`plan`] — the consumption surface: a serializable [`plan::Plan`] (the
 //!   strategy tree as data, pricing included via [`plan::CostSpec`]), one
 //!   generic stateful facade [`plan::Recon`] (with [`plan::Workspace`] its
@@ -51,14 +51,24 @@
 //! ```
 
 pub mod engine;
+pub mod error;
+pub mod expr;
 pub mod flow;
 pub mod lower;
 pub mod plan;
+mod plan_compile;
+pub mod report;
+pub mod row;
+pub mod schema;
 pub mod strategy;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
 pub use engine::{ArcId, Network, NodeId, SolveStatus};
+pub use error::ApiError;
 pub use flow::{ExtId, Group, Matcher, Model};
 pub use lower::{Cell, Kind, Row, TokenCfg};
+pub use report::{GroupOut, Report, Status};
+pub use row::{LoweredCell, LoweredRow};
+pub use schema::{Column, Schema};

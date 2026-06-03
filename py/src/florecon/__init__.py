@@ -14,7 +14,7 @@ native extension to compile.
         P.agg_net("objsub", "native", tol=100),
         P.exact("native"),
         P.signal("tokens", "native", tol=100, cap=256),
-        P.flow("native", day="day", native="native", tokens="tokens"),
+        P.flow("native", day="day", tokens="tokens"),
     )))
 
     ws = Workspace(sch, pln)

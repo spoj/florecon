@@ -7,7 +7,7 @@
 //! This module lowers those to stable i64s with a pure FNV-1a hash.
 //!
 //! How a cell lowers is a property of its *column*, not the cell, so the policy
-//! lives in the [`Schema`](crate::plan::Schema) as a per-column [`Kind`]:
+//! lives in the [`Schema`](crate::schema::Schema) as a per-column [`Kind`]:
 //!
 //! | [`Kind`] | cell  | lowers to        | matching semantics      |
 //! |----------|-------|------------------|-------------------------|
@@ -39,7 +39,8 @@
 //! assert_eq!(row.values.len(), 4);
 //! ```
 
-use crate::plan::{ApiError, LoweredCell, LoweredRow};
+use crate::error::ApiError;
+use crate::row::{LoweredCell, LoweredRow};
 
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
@@ -119,7 +120,7 @@ pub fn tokens(fields: &[String], cfg: &TokenCfg) -> Vec<u64> {
 }
 
 /// How a column's cells lower to engine values. A column-level property (the
-/// whole column is one kind), declared once in the [`Schema`](crate::plan::Schema).
+/// whole column is one kind), declared once in the [`Schema`](crate::schema::Schema).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]

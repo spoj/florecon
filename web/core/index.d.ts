@@ -1,16 +1,22 @@
 // Type surface for @florecon/core. The wire shapes follow schema/plan.schema.json.
 
+export type Status = "live" | "frozen";
+
+export interface Group {
+  group_id: number;
+  origin: string;
+  net: number;
+  size: number;
+  /** The single recalc-status axis: live (machine opinion) or frozen (operator
+   * decision). Matched vs unmatched is arity (`size`), not status. */
+  status: Status;
+}
+
 export interface Report {
+  /** One assignment per input row. Unmatched rows are live singleton groups with
+   * origin "unmatched"; there is no separate residual bucket. */
   assignments: [number, number][];
-  groups: {
-    group_id: number;
-    origin: string;
-    net: number;
-    size: number;
-    /** The single recalc-status axis: live (machine opinion) or frozen (operator
-     * decision). Matched vs unmatched is arity (`size`), not status. */
-    status: "live" | "frozen";
-  }[];
+  groups: Group[];
 }
 
 export interface Envelope {
@@ -40,8 +46,47 @@ export interface Schema {
   token_drop?: string[];
 }
 
-/** A serializable Plan node (tagged union on `op`). See the JSON Schema. */
-export type Plan = Record<string, unknown>;
+export type ScalarRef = string | ScalarExpr;
+export type ScalarExpr =
+  | { col: string }
+  | { lit: number }
+  | { key: string }
+  | { abs: ScalarRef }
+  | { neg: ScalarRef }
+  | { add: ScalarRef[] }
+  | { sub: [ScalarRef, ScalarRef] };
+
+export type BoolRef = string | BoolExpr;
+export type BoolExpr =
+  | { bool: boolean }
+  | { not: BoolRef }
+  | { and: BoolRef[] }
+  | { or: BoolRef[] }
+  | { eq: [ScalarRef, ScalarRef] }
+  | { ne: [ScalarRef, ScalarRef] }
+  | { gt: [ScalarRef, ScalarRef] }
+  | { ge: [ScalarRef, ScalarRef] }
+  | { lt: [ScalarRef, ScalarRef] }
+  | { le: [ScalarRef, ScalarRef] };
+
+export type Cond = "token_shared" | "amount_equal";
+export interface CostTier {
+  when: Cond[];
+  base: number;
+  day_slope?: number;
+  max_day?: number | null;
+}
+export interface CostSpec { tiers: CostTier[]; }
+
+export type Plan =
+  | { op: "seq"; steps: Plan[] }
+  | { op: "partition"; by: ScalarRef; inner: Plan }
+  | { op: "branch"; pred: BoolRef; and_then: Plan; or_else: Plan }
+  | { op: "windowed"; order: ScalarRef; width: number; inner: Plan }
+  | { op: "agg_net"; key: ScalarRef; amount: ScalarRef; tol: number }
+  | { op: "exact"; amount: ScalarRef }
+  | { op: "signal"; signals: string; amount: ScalarRef; tol: number; cap: number }
+  | { op: "flow"; amount: ScalarRef; day: ScalarRef; tokens: string; penalty: number; window: number; cost?: CostSpec };
 
 export interface SolveRequest {
   schema: Schema;
@@ -49,8 +94,19 @@ export interface SolveRequest {
   plan: Plan;
 }
 
-/** Any interactive command: init/upsert/remove/solve/freeze/.../report. */
-export type Cmd = Record<string, unknown>;
+export type Cmd =
+  | { op: "init"; schema: Schema; plan: Plan; rows?: IdRow[] }
+  | { op: "upsert"; rows: IdRow[] }
+  | { op: "remove"; ids: number[] }
+  | { op: "solve" }
+  | { op: "freeze"; group_id: number }
+  | { op: "freeze_clean"; tol: number }
+  | { op: "freeze_singletons"; ids: number[] }
+  | { op: "unfreeze"; group_id: number }
+  | { op: "breakup"; group_id: number }
+  | { op: "group"; ids: number[]; net?: number; origin?: string }
+  | { op: "ungroup"; ids: number[] }
+  | { op: "report" };
 
 export class Florecon {
   /** The wire-contract version this host speaks. */
