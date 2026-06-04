@@ -94,6 +94,7 @@ export interface Plan {
 
 export type Cmd =
   | { op: "init"; plan: Plan }
+  | { op: "replan"; plan: Plan }
   | { op: "upsert" }
   | { op: "remove"; ids: number[] }
   | { op: "solve" }

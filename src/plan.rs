@@ -49,7 +49,11 @@ use crate::plan_compile::compile;
 /// [`PlanNode::Snap`] move sub-`Tol` edges to/onto the residual/dominant edge;
 /// and `flow` is generalized (`day` → `order_by`, `max_day` dropped,
 /// `day_slope` → `slope`, `amount_bps` → `amount_tol: Tol`). Breaking.
-pub const CONTRACT_VERSION: u32 = 17;
+/// v18 adds the [`Cmd::Replan`](crate::wasm) command: recompile a new [`Plan`]
+/// against the live schema and swap it into an existing workspace, preserving
+/// rows, frozen decisions, and the id allocator. Purely additive to the wire
+/// (one new command); every v17 plan is a valid v18 plan.
+pub const CONTRACT_VERSION: u32 = 18;
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use crate::row::{PhysicalRow, ColumnMap};
@@ -555,6 +559,23 @@ impl<E: Clone> Recon<E> {
             groups: Vec::new(),
             next_id: 0,
         }
+    }
+
+    /// Swap the compiled strategy and primary-amount extractor in place, keeping
+    /// the rows, the groups (frozen decisions included), and the monotonic id
+    /// allocator. The next [`solve`](Self::solve) recomputes the live pool under
+    /// the new strategy; frozen groups are preserved verbatim with stable ids.
+    /// Backs [`Workspace::replan`], which lets a caller iterate on a plan without
+    /// re-ingesting rows or re-applying frozen decisions. The freshly compiled
+    /// strategy starts cold (no warm flow state) — correct, since a changed plan
+    /// invalidates the old basis anyway.
+    pub fn replace_strategy(
+        &mut self,
+        strategy: Box<dyn Strategy<E>>,
+        primary: impl Fn(&E) -> i64 + 'static,
+    ) {
+        self.strategy = strategy;
+        self.primary = Box::new(primary);
     }
 
     pub fn len(&self) -> usize {
@@ -1151,7 +1172,7 @@ impl Workspace {
         // The interactive workspace persists across solves (Recon stores the
         // strategy once), so compile the warm, shard-keyed flow leaf.
         let compiled = compile(&plan, &map)?;
-        let primary = compiled.primary.clone();
+        let primary = compiled.primary;
         Ok(Workspace {
             map,
             inner: Recon::new(compiled.strategy, move |r: &PhysicalRow| r.int(primary)),
@@ -1160,6 +1181,20 @@ impl Workspace {
 
     pub fn map(&self) -> &ColumnMap {
         &self.map
+    }
+
+    /// Recompile `plan` against the existing schema and swap it in, preserving
+    /// rows, frozen decisions, and the id allocator. Live groups are recomputed
+    /// on the next [`solve`](Recon::solve). Fails — leaving the workspace
+    /// unchanged — if the plan references an unknown column (the plan is compiled
+    /// before anything is mutated). The schema is unchanged; typically the
+    /// primary column is too, so existing frozen amounts stay meaningful.
+    pub fn replan(&mut self, plan: Plan) -> Result<(), ApiError> {
+        let compiled = compile(&plan, &self.map)?;
+        let primary = compiled.primary;
+        self.inner
+            .replace_strategy(compiled.strategy, move |r: &PhysicalRow| r.int(primary));
+        Ok(())
     }
 }
 
@@ -1211,6 +1246,73 @@ mod tests {
             PlanNode::Signal { signals: "tokens".into(), tol: 0, cap: 256 },
             PlanNode::Flow { order_by: "day".into(), tokens: "tokens".into(), penalty: 1000.0, window: 30, cost: CostSpec::default() },
         ]})
+    }
+
+    #[test]
+    fn replan_preserves_rows_and_frozen_then_applies_new_plan() {
+        // Start under `exact`: it pairs (1,2) cleanly but cannot touch the
+        // three-leg objsub bucket (3,4,5), which nets to zero only in aggregate.
+        let mut ws = Workspace::new(map(), plan(PlanNode::Exact {})).unwrap();
+        ws.upsert(1, row(100, 1, 0, 0, &[]));
+        ws.upsert(2, row(-100, 2, 0, 0, &[]));
+        ws.upsert(3, row(50, 1, 700, 0, &[]));
+        ws.upsert(4, row(30, 1, 700, 0, &[]));
+        ws.upsert(5, row(-80, 1, 700, 0, &[]));
+        ws.solve().unwrap();
+        ws.freeze_clean(0); // sign off the clean (1,2) pair
+
+        // Retune the plan in place: net by the objsub bucket instead. Rows and
+        // the frozen decision must survive; the new rule must now apply.
+        ws.replan(plan(PlanNode::AggNet { key: "objsub".into(), tol: Tol::Abs(0) }))
+            .unwrap();
+        ws.solve().unwrap();
+        let rep = ws.report();
+
+        // The frozen (1,2) pair is preserved verbatim.
+        let frozen: Vec<_> = rep
+            .groups
+            .iter()
+            .filter(|g| g.status == Status::Frozen)
+            .collect();
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(frozen[0].size, 2);
+        let frozen_rows: BTreeSet<ExtId> = rep
+            .allocations
+            .iter()
+            .filter(|a| a.group_id == frozen[0].group_id)
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(frozen_rows, BTreeSet::from([1, 2]));
+
+        // The three-leg objsub bucket now nets into one live group under the new plan.
+        let netted: Vec<_> = rep
+            .groups
+            .iter()
+            .filter(|g| g.status == Status::Live && g.origin == "agg_net")
+            .collect();
+        assert_eq!(netted.len(), 1);
+        assert_eq!(netted[0].size, 3);
+        assert_eq!(netted[0].net, 0);
+
+        // Conservation: every one of the five rows lands in exactly one group.
+        let rows: BTreeSet<ExtId> = rep.allocations.iter().map(|a| a.id).collect();
+        assert_eq!(rows, BTreeSet::from([1, 2, 3, 4, 5]));
+    }
+
+    /// A replan that references an unknown column is rejected, leaving the
+    /// workspace unchanged and still solvable under the original plan.
+    #[test]
+    fn replan_with_unknown_column_fails_and_preserves_workspace() {
+        let mut ws = Workspace::new(map(), plan(PlanNode::Exact {})).unwrap();
+        ws.upsert(1, row(100, 1, 0, 0, &[]));
+        ws.upsert(2, row(-100, 2, 0, 0, &[]));
+        assert!(
+            ws.replan(plan(PlanNode::AggNet { key: "nope".into(), tol: Tol::Abs(0) }))
+                .is_err()
+        );
+        ws.solve().unwrap();
+        let rep = ws.report();
+        assert!(rep.groups.iter().any(|g| g.size == 2 && g.net == 0));
     }
 
     #[cfg(feature = "serde")]

@@ -25,6 +25,7 @@ SAMPLES = [
         {"op": "flow", "order_by": "day", "tokens": "tokens", "penalty": 1000.0, "window": -1},
     ]}}},
     {"op": "solve"},
+    {"op": "replan", "plan": {"primary": "native", "root": {"op": "exact"}}},
     {"op": "freeze_clean", "tol": 0},
     {"op": "report"},
 ]

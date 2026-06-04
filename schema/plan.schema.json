@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd protocol that drives a persistent workspace, and the allocation-native Report. Contract version 17 (see plan::CONTRACT_VERSION / the abi_version wasm export). There is a single `dispatch` entry point and a single Cmd protocol; a stateless batch solve is just `init` + `solve`. Rows and column identity cross out-of-band as an Arrow IPC batch whose schema is the column map; no schema/map rides this JSON.",
-  "x-contract-version": 17,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd protocol that drives a persistent workspace, and the allocation-native Report. Contract version 18 (see plan::CONTRACT_VERSION / the abi_version wasm export). There is a single `dispatch` entry point and a single Cmd protocol; a stateless batch solve is just `init` + `solve`. Rows and column identity cross out-of-band as an Arrow IPC batch whose schema is the column map; no schema/map rides this JSON.",
+  "x-contract-version": 18,
   "$defs": {
     "Cond": {
       "description": "A predicate on a candidate pair used by the flow cost model.",
@@ -115,6 +115,23 @@
           "properties": {
             "op": {
               "const": "init"
+            },
+            "plan": {
+              "$ref": "#/$defs/Plan"
+            }
+          },
+          "required": [
+            "op",
+            "plan"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "description": "Recompile a new Plan against the live schema and swap it into the existing workspace, preserving rows and frozen decisions. The next `solve` re-matches under it.",
+          "properties": {
+            "op": {
+              "const": "replan"
             },
             "plan": {
               "$ref": "#/$defs/Plan"

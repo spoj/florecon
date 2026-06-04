@@ -47,6 +47,9 @@ enum Cmd {
     Init {
         plan: Plan,
     },
+    Replan {
+        plan: Plan,
+    },
     Upsert {},
     Remove { ids: Vec<ExtId> },
     Solve,
@@ -148,6 +151,9 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd, arrow_bytes: &[u8]) -> Envelope
     };
     let result = match cmd {
         Cmd::Init { .. } => unreachable!("handled above"),
+        // Recompile a new plan against the live schema and swap it in, keeping
+        // rows + frozen decisions. The next `solve` re-matches under it.
+        Cmd::Replan { plan } => ws.replan(plan),
         // Incremental rows lower against the live map by column name, so an
         // upsert batch is order-independent and validates its columns.
         Cmd::Upsert {} => match crate::arrow::rows_from_ipc_mapped(arrow_bytes, ws.map()) {

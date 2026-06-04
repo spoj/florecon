@@ -10,7 +10,7 @@ import wasmtime
 from .data import KEY, NUMBER, TOKENS, cat
 
 # Must equal the engine's abi_version() export (plan::CONTRACT_VERSION).
-CONTRACT_VERSION = 17
+CONTRACT_VERSION = 18
 
 
 class ContractMismatch(RuntimeError):
@@ -187,6 +187,23 @@ class Workspace:
         self.last = self.fe.dispatch({"op": "remove", "ids": list(ids)})
         _ok(self.last)
         return self
+
+    def replan(self, plan, primary=None) -> dict:
+        """Recompile `plan` against the live schema and swap it in, preserving
+        rows and frozen decisions. The next :meth:`solve` re-matches under the
+        new plan — use it to iterate on a plan without re-ingesting rows. `plan`
+        is a full ``{'primary','root'}`` dict or a bare root node with
+        ``primary=``."""
+        if primary is not None:
+            plan = {"primary": primary, "root": plan}
+        if not (isinstance(plan, dict) and "primary" in plan and "root" in plan):
+            raise ValueError(
+                "plan must be {'primary': <col>, 'root': <node>} or pass primary="
+            )
+        self.last = self.fe.dispatch({"op": "replan", "plan": plan})
+        _ok(self.last)
+        self.plan = plan
+        return self.last.get("report", {})
 
     def solve(self) -> dict:
         self.last = self.fe.dispatch({"op": "solve"})
