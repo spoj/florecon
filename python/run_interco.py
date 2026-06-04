@@ -52,13 +52,6 @@ def ingest(path, pair=None, maxrows=None):
         usd_by_id.append(usd_cents)
 
         text = " ".join(s for s in (cols[f][i] for f in FIELDS) if s)
-        tokens = []
-        for word in text.split():
-            clean = "".join(c for c in word if c.isalnum())
-            if len(clean) >= 6:
-                tokens.append(fnv1a(clean.upper()))
-        tokens = list(set(tokens))
-        tokens.sort()
 
         ids.append(rid)
         units.append(fnv1a(f"{co}|{icp}"))
@@ -66,12 +59,13 @@ def ingest(path, pair=None, maxrows=None):
         days.append(gl_day)
         objsubs.append(fnv1a(cols["objsub"][i] or ""))
         natives.append(snative)
-        tokens_list.append(tokens)
+        tokens_list.append(text)
 
         if maxrows and len(ids) >= maxrows:
             break
 
-    # Build Arrow RecordBatch
+    # Build Arrow RecordBatch. The reference text is sent raw utf8; the engine
+    # tokenizes and hashes it itself (no pre-hashed token lists on the wire).
     batch = pa.RecordBatch.from_arrays(
         [
             pa.array(ids, type=pa.uint64()),
@@ -80,7 +74,7 @@ def ingest(path, pair=None, maxrows=None):
             pa.array(days, type=pa.int64()),
             pa.array(objsubs, type=pa.int64()),
             pa.array(natives, type=pa.int64()),
-            pa.array(tokens_list, type=pa.list_(pa.uint64()))
+            pa.array(tokens_list, type=pa.string())
         ],
         names=["id", "unit", "ccy", "day", "objsub", "native", "tokens"]
     )
@@ -119,14 +113,22 @@ def main():
             i += 1
     path = positional[0] if positional else "data/ledger.parquet"
 
+    if not pathlib.Path(path).exists():
+        print(f"no parquet at {path}; skipping (pass a path to run against real data)")
+        return
+
     t0 = time.time()
     arrow_bytes, usd_by_id, num_rows = ingest(path, pair, maxrows)
     print(f"ingested {num_rows} rows in {time.time()-t0:.2f}s")
 
     fe = Florecon(WASM)
-    req = {"plan": plan(), "map": {"int_cols": {}, "token_cols": {}}} # Not strictly needed if Arrow provides schema, but good for type safety
+    # Stateless batch solve = `init` (plan + rows) then `solve`, over a
+    # workspace we discard. Column identity comes from the Arrow batch schema.
     t1 = time.time()
-    env = fe.solve(req, arrow_bytes)
+    env = fe.dispatch({"op": "init", "plan": plan()}, arrow_bytes)
+    if not env["ok"]:
+        print("ERROR:", env["error"]); return
+    env = fe.dispatch({"op": "solve"})
     dt = time.time() - t1
     if not env["ok"]:
         print("ERROR:", env["error"]); return

@@ -193,4 +193,3 @@ button.ghost { border: none; background: none; color: var(--accent); padding: 5p
 #preview td, #preview th { white-space: nowrap; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 #run-recon { margin-top: 14px; }
 .setup-err { color: var(--bad); font-size: 12px; margin-top: 10px; min-height: 16px; }
-.setup-foot { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }

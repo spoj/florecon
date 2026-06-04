@@ -45,9 +45,11 @@ Four layers, each a thin lowering of the one above:
 | Plan | `plan` | Serializable `Plan` (the strategy tree as data, pricing included via `CostSpec`), one generic stateful facade `Recon<E>` (with `Workspace` its `Row` specialization), allocation-native `Report`. Conservation enforced at the boundary. |
 
 The `wasm` feature compiles the `plan` API into a single C-ABI module (`alloc` /
-`dealloc` / `solve` / `dispatch` over linear memory, no wasm-bindgen) that any
+`dealloc` / `dispatch` over linear memory, no wasm-bindgen) that any
 runtime can drive — the same artifact targets the browser, Databricks, or a
-wasmtime wheel.
+wasmtime wheel. There is one entry point: `dispatch` drives a persistent
+workspace via the `Cmd` protocol, and a stateless batch solve is just `init`
+followed by `solve` on a workspace the caller discards.
 
 ## The vocabulary is the brand
 
@@ -153,15 +155,16 @@ sch = schema([
     col("objsub", KEY), col("native", NUMBER), col("tokens", TOKENS),
 ])
 pln = P.partition("unit", P.partition("ccy", P.seq(
-    P.agg_net("objsub", "native", tol=100),
-    P.exact("native"),
-    P.signal("tokens", "native", tol=100, cap=256),
-    P.flow("native", day="day", tokens="tokens"),
+    P.agg_net("objsub", tol=100),
+    P.exact(),
+    P.signal("tokens", tol=100, cap=256),
+    P.flow(day="day", tokens="tokens"),
 )))
 
-ws = Workspace(sch, pln)
-# bare cells: a string for key/tokens columns, an int for number columns; the
-# engine lowers strings to ids itself (you ship business values, not hashes).
+ws = Workspace(sch, pln, primary="native")
+# Bare cells: a string for key/tokens columns, an int for number columns. You
+# ship business values, not hashes — the host hashes key columns and the engine
+# tokenizes free text; the Arrow batch schema is the engine's column map.
 ws.upsert(1, [key("00492", "00288"), "USD", 1, "61500", 100, "INV1"])
 ws.upsert(2, [key("00492", "00288"), "USD", 2, "61500", -100, "INV1"])
 ws.solve()                      # one clean group; ws.freeze(0) signs it off
@@ -178,8 +181,8 @@ python python/run_interco.py [path.parquet] [--pair COMPANY ICP] [--max N]
 An interactive reconciliation UI: cross-filtering slicers, a groups table, a
 line-level detail pane, and the verbs (freeze / break up / recalc) driven by the
 stateful `Workspace`. Slicers and detail columns are rendered from a portable
-`fields` descriptor in `data.json`, so a differently-shaped book ports by
-shipping a different descriptor — no UI code changes. The groups table is itself
+`fields` descriptor built during ingest, so a differently-shaped book ports by
+building a different descriptor — no UI code changes. The groups table is itself
 a slicer (multi-select to union groups into the detail pane); with nothing
 selected the detail pane is a faithful, unfiltered timeline of every line in
 view, so nothing is ever "matched away" and hidden while groupings are still
@@ -187,10 +190,8 @@ volatile. All computation runs in the wasm in the browser — the data never
 leaves the client.
 
 ```bash
-. .venv/bin/activate && python python/export_web.py [--pair COMPANY ICP]  # -> web/data.json
-python python/enrich_web.py        # add display fields to the committed sample (no source parquet)
 python -m http.server 8000        # serve from the repo root
-# open http://localhost:8000/web/index.html
+# open http://localhost:8000/web/index.html  — upload a CSV, map columns, solve
 node web/smoke.mjs                # headless check of the browser host ABI
 ```
 
@@ -203,7 +204,7 @@ the engine owns the rows and the conserved allocation hypergraph.
 
 ```bash
 pip install jsonschema
-python schema/validate.py web/data.json   # validate a SolveRequest against the contract
+python schema/validate.py          # validate the built-in canonical commands
 ```
 
 `schema/plan.schema.json` is the single source of truth for what crosses the

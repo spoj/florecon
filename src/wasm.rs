@@ -1,4 +1,4 @@
-use crate::plan::{Report, SolveRequest};
+use crate::plan::Report;
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
@@ -25,23 +25,6 @@ pub unsafe extern "C" fn dealloc(ptr: u32, len: u32) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn solve(req_ptr: u32, req_len: u32, arrow_ptr: u32, arrow_len: u32) -> u64 {
-    let bytes = unsafe { std::slice::from_raw_parts(req_ptr as *const u8, req_len as usize) };
-    let arrow_bytes = if arrow_len > 0 {
-        unsafe { std::slice::from_raw_parts(arrow_ptr as *const u8, arrow_len as usize) }
-    } else {
-        &[]
-    };
-    let mut out = run(bytes, arrow_bytes);
-    out.shrink_to_fit();
-    debug_assert_eq!(out.len(), out.capacity());
-    let len = out.len() as u64;
-    let mut out = ManuallyDrop::new(out);
-    let ptr = out.as_mut_ptr() as u64;
-    (len << 32) | ptr
-}
-
 #[derive(serde::Serialize)]
 struct Envelope {
     ok: bool,
@@ -51,30 +34,8 @@ struct Envelope {
     report: Option<Report>,
 }
 
-fn run(bytes: &[u8], arrow_bytes: &[u8]) -> Vec<u8> {
-    let env = match serde_json::from_slice::<SolveRequest>(bytes) {
-        Err(e) => Envelope::err(format!("bad request json: {e}")),
-        Ok(mut req) => {
-            let parsed_rows = match crate::arrow::rows_from_ipc(arrow_bytes) {
-                Ok((ids, rows, map)) => {
-                    req.map = map;
-                    ids.into_iter().zip(rows.into_iter()).collect::<Vec<_>>()
-                }
-                Err(e) => return enc(Envelope::err(e.to_string())),
-            };
-            
-            match req.run(parsed_rows) {
-                Ok(report) => Envelope::ok(report),
-                Err(e) => Envelope::err(e.to_string()),
-            }
-        }
-    };
-    enc(env)
-}
-
 use crate::flow::ExtId;
 use crate::plan::{AllocationSpec, Plan, Workspace};
-use crate::row::{PhysicalRow, ColumnMap};
 
 thread_local! {
     static WS: RefCell<Option<Workspace>> = const { RefCell::new(None) };
@@ -84,8 +45,6 @@ thread_local! {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Cmd {
     Init {
-        #[serde(default)]
-        map: ColumnMap,
         plan: Plan,
     },
     Upsert {},
@@ -158,45 +117,44 @@ fn dispatch_json(bytes: &[u8], arrow_bytes: &[u8]) -> Vec<u8> {
     })
 }
 
-fn apply(slot: &mut Option<Workspace>, mut cmd: Cmd, arrow_bytes: &[u8]) -> Envelope {
-    let mut rows_to_upsert = Vec::new();
-    if arrow_bytes.len() > 0 {
-        match crate::arrow::rows_from_ipc(arrow_bytes) {
-            Ok((ids, arr_rows, parsed_map)) => {
-                let parsed_rows = ids.into_iter().zip(arr_rows.into_iter()).collect::<Vec<_>>();
-                rows_to_upsert.extend(parsed_rows);
-                if let Cmd::Init { map, .. } = &mut cmd {
-                    *map = parsed_map;
-                }
-            }
+fn apply(slot: &mut Option<Workspace>, cmd: Cmd, arrow_bytes: &[u8]) -> Envelope {
+    // `init` establishes the session: the batch schema *is* the column map, so
+    // we derive the map here and seed the workspace with whatever rows came in
+    // the same batch (possibly none — a schema-only init opens an empty book).
+    if let Cmd::Init { plan } = cmd {
+        let (ids, rows, map) = match crate::arrow::rows_from_ipc(arrow_bytes) {
+            Ok(parsed) => parsed,
             Err(e) => return Envelope::err(e.to_string()),
-        }
-    }
-
-    if let Cmd::Init { map, plan } = cmd {
+        };
         let mut ws = match Workspace::new(map, plan) {
             Ok(ws) => ws,
             Err(e) => return Envelope::err(e.to_string()),
         };
-        for (id, row) in rows_to_upsert {
+        for (id, row) in ids.into_iter().zip(rows) {
             ws.upsert(id, row);
         }
         let rep = ws.report();
         *slot = Some(ws);
         return Envelope::ok(rep);
     }
-    
+
     let ws = match slot.as_mut() {
         Some(ws) => ws,
         None => return Envelope::err("no workspace: send init first".into()),
     };
     let result = match cmd {
-        Cmd::Init { .. } => unreachable!(),
-        Cmd::Upsert {} => { rows_to_upsert
-            .into_iter()
-            .for_each(|(id, row)| ws.upsert(id, row));
-            Ok(())
-        }
+        Cmd::Init { .. } => unreachable!("handled above"),
+        // Incremental rows lower against the live map by column name, so an
+        // upsert batch is order-independent and validates its columns.
+        Cmd::Upsert {} => match crate::arrow::rows_from_ipc_mapped(arrow_bytes, ws.map()) {
+            Ok((ids, rows)) => {
+                for (id, row) in ids.into_iter().zip(rows) {
+                    ws.upsert(id, row);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         Cmd::Remove { ids } => {
             ids.into_iter().for_each(|id| ws.remove(id));
             Ok(())

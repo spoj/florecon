@@ -23,7 +23,7 @@ const data = buildDataset({
 });
 
 const t0 = performance.now();
-let r = fe.dispatch({ op: "init", map: data.map, plan: data.plan }, data.arrowBytes);
+let r = fe.dispatch({ op: "init", plan: data.plan }, data.arrowBytes);
 if (!r.ok) throw new Error("init: " + r.error);
 const tColdStart = performance.now();
 r = fe.dispatch({ op: "solve" });

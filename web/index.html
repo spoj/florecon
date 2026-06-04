@@ -5,12 +5,27 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>florecon — reconciliation workbench</title>
   <link rel="stylesheet" href="styles.css" />
+  <!-- The app is served as raw ES modules (no bundler). `ingest.js` imports the
+       bare specifier "apache-arrow", which a browser cannot resolve on its own —
+       without this map the whole module graph fails to load and NOTHING wires up
+       (the dropzone, buttons, etc. all go dead). Map it (and its transitive bare
+       deps) to the ESM builds shipped in node_modules, relative to /web/ so it
+       works regardless of where the static root is mounted. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "apache-arrow": "../node_modules/apache-arrow/Arrow.dom.mjs",
+      "flatbuffers": "../node_modules/flatbuffers/mjs/flatbuffers.js",
+      "tslib": "../node_modules/tslib/tslib.es6.mjs"
+    }
+  }
+  </script>
 </head>
 <body>
   <section id="setup" class="setup">
     <div class="setup-card">
       <div class="brand">florecon <span class="sub">reconciliation workbench</span></div>
-      <p class="setup-lead">Upload a CSV, map its columns to recon roles, and solve — or open the bundled demo book.</p>
+      <p class="setup-lead">Upload a CSV, map its columns to recon roles, and solve. All computation runs locally in WASM — the data never leaves your browser.</p>
 
       <div id="dropzone" class="dropzone">
         <input id="file-input" type="file" accept=".csv,text/csv" hidden />
@@ -30,9 +45,6 @@
       </div>
 
       <div id="setup-err" class="setup-err"></div>
-      <div class="setup-foot">
-        <button id="load-demo" class="link">or open the interco demo →</button>
-      </div>
     </div>
   </section>
 

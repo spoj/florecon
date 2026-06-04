@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd set, and the allocation-native Report. Contract version 8 (see plan::CONTRACT_VERSION / the abi_version wasm export).",
-  "x-contract-version": 8,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd protocol that drives a persistent workspace, and the allocation-native Report. Contract version 10 (see plan::CONTRACT_VERSION / the abi_version wasm export). There is a single `dispatch` entry point and a single Cmd protocol; a stateless batch solve is just `init` + `solve`. Rows and column identity cross out-of-band as an Arrow IPC batch whose schema is the column map; no schema/map rides this JSON.",
+  "x-contract-version": 10,
   "$defs": {
     "Cond": {
       "description": "A predicate on a candidate pair used by the flow cost model.",
@@ -76,17 +76,8 @@
       "additionalProperties": false
     },
     "SolveRequest": {
-      "description": "A self-contained batch solve: the JSON passed to the wasm `solve` export.",
-      "type": "object",
-      "properties": {
-        "plan": {
-          "$ref": "#/$defs/Plan"
-        }
-      },
-      "required": [
-        "plan"
-      ],
-      "additionalProperties": false
+      "description": "Deprecated alias kept for tooling: a batch solve is now the `init` command followed by `solve`. Equivalent to the payload of a `fixed_point`-free `init`.",
+      "$ref": "#/$defs/Cmd"
     },
     "Cmd": {
       "description": "An interactive command driving the stateful Workspace via the wasm `dispatch` export. Tagged union on `op`.",
@@ -497,6 +488,29 @@
           "additionalProperties": false
         },
         {
+          "title": "fixed_point",
+          "description": "Repeat `inner` on its own residual until a pass changes nothing more, or `max` passes elapse. Stateful leaves inside `inner` persist across passes.",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "fixed_point"
+            },
+            "inner": {
+              "$ref": "#/$defs/PlanNode"
+            },
+            "max": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 16
+            }
+          },
+          "required": [
+            "op",
+            "inner"
+          ],
+          "additionalProperties": false
+        },
+        {
           "title": "partition",
           "type": "object",
           "properties": {
@@ -749,5 +763,5 @@
       ]
     }
   },
-  "$ref": "#/$defs/SolveRequest"
+  "$ref": "#/$defs/Cmd"
 }

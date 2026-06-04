@@ -31,7 +31,7 @@ async function freshDom() {
     File: window.File, Event: window.Event, localStorage: window.localStorage,
   });
   global.TextEncoder = TextEncoder; global.TextDecoder = TextDecoder;
-  // Serve local files (wasm, data.json) the way fetch() would over http.
+  // Serve local files (wasm, etc.) the way fetch() would over http.
   global.fetch = async (u) => {
     const b = readFileSync(new URL(String(u), here));
     return {
@@ -53,6 +53,18 @@ const tick = (ms) => new Promise((r) => setTimeout(r, ms));
   const css = readFileSync(new URL("styles.css", here), "utf8");
   ok(/\[hidden\]\s*\{[^}]*display:\s*none\s*!important/.test(css),
     "styles.css must force [hidden] { display: none !important } so overlays can hide");
+}
+
+// Node resolves the bare "apache-arrow" import (ingest.js) from node_modules, but
+// a browser cannot without an import map. Missing it silently kills the whole
+// setup.js module graph (dropzone/buttons go dead). jsdom won't reproduce that,
+// so guard the import map statically.
+{
+  const html = readFileSync(new URL("index.html", here), "utf8");
+  const map = html.match(/<script[^>]*type=["']importmap["'][^>]*>([\s\S]*?)<\/script>/i);
+  ok(map, "index.html must declare an <script type=importmap> for bare module specifiers");
+  ok(/"apache-arrow"\s*:/.test(map[1]),
+    "import map must resolve the bare \"apache-arrow\" specifier ingest.js imports");
 }
 
 // --- upload path ----------------------------------------------------------

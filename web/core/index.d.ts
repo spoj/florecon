@@ -45,49 +45,16 @@ export interface Envelope {
   report?: Report | null;
 }
 
-/** A bare input cell: a number or a string. How it lowers is decided by its
- * column's `kind` in the schema, not by the cell. A `number` column takes the
- * integer as-is; a `key` column lowers a string to one id (a numeric cell is an
- * already-numeric key); a `tokens` column lowers free text to a signal set. */
-export type Cell = number | string;
-/** A bare positional row: one Cell per schema column. */
-export type Row = Cell[];
-export type IdRow = [number, Row];
+// Rows and column identity cross the boundary as an Arrow IPC stream batch, not
+// as JSON. Column 0 is the row id (UInt64); every other column is either an
+// Int64 integer lane (money minor units, epoch day, or a host-hashed
+// categorical key) or a Utf8 free-text column the engine tokenizes. The engine
+// derives its column map from that schema, so no `schema`/`map` rides the wire.
 
-/** How a column's cells lower. */
-export type Kind = "number" | "key" | "tokens";
-export interface Column {
-  name: string;
-  kind: Kind;
-}
-export interface Schema {
-  cols: Column[];
-  /** Stopwords for `tokens` lowering, matched upper-cased; optional. */
-  token_drop?: string[];
-}
-
-export type ScalarRef = string | ScalarExpr;
-export type ScalarExpr =
-  | { col: string }
-  | { lit: number }
-  | { key: string }
-  | { abs: ScalarRef }
-  | { neg: ScalarRef }
-  | { add: ScalarRef[] }
-  | { sub: [ScalarRef, ScalarRef] };
-
-export type BoolRef = string | BoolExpr;
-export type BoolExpr =
-  | { bool: boolean }
-  | { not: BoolRef }
-  | { and: BoolRef[] }
-  | { or: BoolRef[] }
-  | { eq: [ScalarRef, ScalarRef] }
-  | { ne: [ScalarRef, ScalarRef] }
-  | { gt: [ScalarRef, ScalarRef] }
-  | { ge: [ScalarRef, ScalarRef] }
-  | { lt: [ScalarRef, ScalarRef] }
-  | { le: [ScalarRef, ScalarRef] };
+// Plan selectors are plain column names (strings) resolved against the Arrow
+// batch schema; there is no expression language on the wire. A Plan is one
+// primary numeraire (the report/conservation column) plus a strategy root.
+// Mirrors schema/plan.schema.json.
 
 export type Cond = "token_shared" | "amount_equal";
 export interface CostTier {
@@ -98,28 +65,30 @@ export interface CostTier {
 }
 export interface CostSpec { tiers: CostTier[]; }
 
-export type Plan =
-  | { op: "seq"; steps: Plan[] }
-  | { op: "partition"; by: ScalarRef; inner: Plan }
-  | { op: "branch"; pred: BoolRef; and_then: Plan; or_else: Plan }
-  | { op: "windowed"; order: ScalarRef; width: number; inner: Plan }
-  | { op: "lots"; amount: ScalarRef; inner: Plan }
-  | { op: "soak_small"; max_bps?: number | null; max_abs?: number | null; origin: string; by?: ScalarRef | null }
-  | { op: "soak_all"; origin: string; by?: ScalarRef | null }
-  | { op: "agg_net"; key: ScalarRef; amount: ScalarRef; tol: number }
-  | { op: "exact"; amount: ScalarRef }
-  | { op: "signal"; signals: string; amount: ScalarRef; tol: number; cap: number }
-  | { op: "flow"; amount: ScalarRef; day: ScalarRef; tokens: string; penalty: number; window: number; cost?: CostSpec };
+export type PlanNode =
+  | { op: "seq"; steps: PlanNode[] }
+  | { op: "fixed_point"; inner: PlanNode; max?: number }
+  | { op: "partition"; by: string; inner: PlanNode }
+  | { op: "branch"; pred: string; and_then: PlanNode; or_else: PlanNode }
+  | { op: "windowed"; order: string; width: number; inner: PlanNode }
+  | { op: "pivot"; amount: string; inner: PlanNode }
+  | { op: "soak_small"; max_bps?: number | null; max_abs?: number | null; origin: string; by?: string | null }
+  | { op: "soak_all"; origin: string; by?: string | null }
+  | { op: "agg_net"; key: string; tol: number }
+  | { op: "exact" }
+  | { op: "signal"; signals: string; tol: number; cap: number }
+  | { op: "flow"; day: string; tokens: string; penalty: number; window: number; cost?: CostSpec };
 
-export interface SolveRequest {
-  schema: Schema;
-  rows: IdRow[];
-  plan: Plan;
+export interface Plan {
+  /** The report/conservation numeraire column; every primitive operates on it
+   * unless a `pivot` subtree switches numeraire. */
+  primary: string;
+  root: PlanNode;
 }
 
 export type Cmd =
-  | { op: "init"; schema: Schema; plan: Plan; rows?: IdRow[] }
-  | { op: "upsert"; rows: IdRow[] }
+  | { op: "init"; plan: Plan }
+  | { op: "upsert" }
   | { op: "remove"; ids: number[] }
   | { op: "solve" }
   | { op: "freeze"; group_id: number }
@@ -143,8 +112,9 @@ export class Florecon {
   static load(url: string): Promise<Florecon>;
   constructor(instance: WebAssembly.Instance);
 
-  /** Stateless batch solve. */
-  solve(request: SolveRequest): Envelope;
-  /** Drive the stateful workspace with one command. */
-  dispatch(command: Cmd): Envelope;
+  /** The single low-level entry point: drive the persistent workspace with one
+   * command. `init`/`upsert` carry their rows in `arrowBytes`; column identity
+   * is derived from the batch schema. A stateless batch solve is just an `init`
+   * command followed by a `solve` command. */
+  dispatch(command: Cmd, arrowBytes?: Uint8Array | null): Envelope;
 }

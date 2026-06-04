@@ -1,7 +1,6 @@
 import { Utf8, Int64, Uint64, makeVector, vectorFromArray, tableFromArrays, tableToIPC } from "apache-arrow";
-// Browser-side ingest: turn an uploaded CSV + a column mapping into the same
-// `data` object the viewer loads from data.json. This is the JS port of the
-// generic core of python/export_web.py — parse, map columns to engine roles,
+// Browser-side ingest: turn an uploaded CSV + a column mapping into the viewer
+// `data` object the workbench consumes. Parse, map columns to engine roles,
 // lower nothing (the wasm engine lowers strings by column kind), build a plan,
 // and emit the display/fields descriptor the data-driven UI renders.
 //
@@ -81,14 +80,17 @@ export function toEpochDay(raw) {
 //   name:       <string>,                // dataset label
 // }
 //
-// Returns { pair, schema, plan, fields, rows, display, netKey } — exactly the
-// shape data.json carries and app.js consumes.
+// Returns { pair, plan, fields, display, netKey, arrowBytes } — exactly the
+// shape the workbench consumes. Column identity is NOT shipped
+// separately: the engine derives it from the Arrow IPC batch schema (column 0
+// is the row id; Int64 columns are integer lanes, Utf8 columns are free text
+// the engine tokenizes).
 export function buildDataset({ header, rows, mapping }) {
   const tol = Number.isFinite(mapping.tol) ? mapping.tol : 0;
   const parts = mapping.partitions || [];
 
-  // The engine schema columns, in the order cells are emitted. Each carries the
-  // source CSV column index and the role flags the descriptor/coercion need.
+  // The Arrow columns, in the order they are emitted. Each carries the source
+  // CSV column index and the role flags the descriptor/coercion need.
   const cols = [];
   parts.forEach((ci, i) =>
     cols.push({ name: `p${i}`, kind: "key", ci, label: header[ci], dim: true }));
@@ -103,8 +105,6 @@ export function buildDataset({ header, rows, mapping }) {
   const tokCis = (Array.isArray(tok) ? tok : tok != null ? [tok] : []).filter((i) => i != null);
   if (tokCis.length)
     cols.push({ name: "tokens", kind: "tokens", cis: tokCis, label: tokCis.map((i) => header[i]).join(" + "), text: true });
-
-  const schema = { cols: cols.map((c) => ({ name: c.name, kind: c.kind })), token_drop: [] };
 
   // Plan: only the steps whose columns exist. Cheap/strict leaves first, the
   // expensive min-cost flow last (and only when it has signals + time to use).
@@ -121,9 +121,8 @@ export function buildDataset({ header, rows, mapping }) {
   let plan = { op: "seq", steps };
   for (let i = parts.length - 1; i >= 0; i--) plan = { op: "partition", by: `p${i}`, inner: plan };
 
-  // Rows (bare cells, positional against schema) + display (human view, joined
-  // by id). `native` mirrors the engine amount so manual-group conservation can
-  // read it back; `value` is the same column for a generic single-amount book.
+  // Arrow columns (one typed lane per `cols` entry) + display (human view,
+  // joined by id). `native` mirrors the engine amount so manual-group
   const display = [];
   const arrowCols = { id: makeVector({data: new BigInt64Array(rows.length), type: new Uint64()}) };
   for (const c of cols) {
@@ -169,10 +168,6 @@ export function buildDataset({ header, rows, mapping }) {
 
   return {
     pair: mapping.name || "uploaded",
-    map: {
-      int_cols: Object.fromEntries(cols.filter(c => !c.text).map((c, i) => [c.name, i])),
-      token_cols: Object.fromEntries(cols.filter(c => c.text).map((c, i) => [c.name, i]))
-    },
     plan: {primary: "amount", root: plan}, fields, display, netKey: "amount",
     arrowBytes: tableToIPC(tableFromArrays(arrowCols), "stream"),
   };

@@ -3,8 +3,8 @@ use crate::flow::Model;
 use crate::plan::{Cond, CostSpec, Plan, PlanNode};
 use crate::row::{PhysicalRow, ColumnMap};
 use crate::strategy::{
-    SoakMode, Strategy, agg_net, branch, exact_1to1_any, flow, partition_by, pivot, seq,
-    signal_group, soak_all, soak_small, windowed,
+    SoakMode, Strategy, agg_net, branch, exact_1to1_any, fixed_point, flow, partition_by, pivot,
+    seq, signal_group, soak_all, soak_small, windowed,
 };
 
 #[derive(Clone)]
@@ -96,6 +96,9 @@ fn compile_node(
                 compiled.push(compile_node(s, map)?);
             }
             seq(compiled)
+        }
+        PlanNode::FixedPoint { inner, max } => {
+            fixed_point(compile_node(inner, map)?, *max)
         }
         PlanNode::Partition { by, inner } => {
             let k = map.int_index(by)?;

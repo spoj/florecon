@@ -7,6 +7,14 @@ def seq(*steps) -> dict:
     """Cascade: each step runs on the previous step's residual."""
     return {"op": "seq", "steps": list(steps)}
 
+def fixed_point(inner: dict, max: int = 16) -> dict:
+    """Repeat ``inner`` on its own residual until it reaches a fixed point (a
+    pass that groups nothing more) or ``max`` passes elapse, accumulating every
+    group found along the way. State inside ``inner`` (e.g. a warm flow matcher)
+    persists across passes; the loop is reentrant-safe because each node treats
+    its incoming bag as the authoritative present-set."""
+    return {"op": "fixed_point", "inner": inner, "max": int(max)}
+
 def partition(by, inner: dict) -> dict:
     """Fork/join: shard by an integer column, run `inner` per shard."""
     return {"op": "partition", "by": by, "inner": inner}

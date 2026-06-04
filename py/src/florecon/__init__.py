@@ -10,19 +10,23 @@ native extension to compile.
         col("unit", KEY), col("ccy", KEY), col("day", NUMBER),
         col("objsub", KEY), col("native", NUMBER), col("tokens", TOKENS),
     ])
-    pln = P.partition("unit", P.partition("ccy", P.seq(
+    root = P.partition("unit", P.partition("ccy", P.seq(
         P.agg_net("objsub", tol=100),
         P.exact(),
         P.signal("tokens", tol=100, cap=256),
         P.flow("day", "tokens"),
     )))
 
-    ws = Workspace(sch, pln)
+    # `native` is the primary numeraire the report nets on.
+    ws = Workspace(sch, root, primary="native")
     # bare cells: a string for key/tokens columns, an int for number columns
-    ws.upsert(1, [key("00492", "00288"), "USD", 0, "61500", 100, "INV1"])
-    ws.upsert(2, [key("00492", "00288"), "USD", 1, "61500", -100, "INV1"])
+    ws.upsert(1, [key("00492", "00288"), "USD", 0, "61500", 100, "INV0001"])
+    ws.upsert(2, [key("00492", "00288"), "USD", 1, "61500", -100, "INV0001"])
     ws.solve()
     print(ws.report())
+    # rows stream in incrementally; solve() again to warm re-solve
+    ws.upsert(3, [key("00492", "00288"), "USD", 2, "61500", 50, "INV0002"])
+    ws.solve()
 """
 
 from ._host import CONTRACT_VERSION, ContractMismatch, Florecon, Workspace

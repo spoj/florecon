@@ -1,6 +1,5 @@
 import pyarrow as pa
-from typing import Dict, Any, Callable
-from ._host import Florecon, Workspace
+from ._host import Florecon
 
 # Optional polars import
 try:
@@ -89,29 +88,19 @@ def solve(df, plan_def: dict, primary_amount, wasm_path=None) -> dict:
     with pa.ipc.new_stream(sink, arrow_table.schema) as writer:
         writer.write_table(arrow_table)
     arrow_bytes = sink.getvalue().to_pybytes()
-    
-    # Build Map (all ints except List<UInt64> or string tokens)
-    int_cols = {}
-    token_cols = {}
-    for i, field in enumerate(arrow_table.schema):
-        if field.name == "id" or i == 0:
-            continue
-        # We assume string columns are tokens, everything else int (or castable)
-        if pa.types.is_string(field.type) or pa.types.is_large_string(field.type) or pa.types.is_list(field.type):
-            token_cols[field.name] = len(token_cols)
-        else:
-            int_cols[field.name] = len(int_cols)
-            
-    req = {
-        "plan": final_plan,
-        "map": {
-            "int_cols": int_cols,
-            "token_cols": token_cols
-        }
-    }
-    
+
+    # The Arrow batch schema *is* the engine's column map: int64 columns are
+    # integer lanes, utf8 columns are free-text reference lanes the engine
+    # tokenizes. No separate map crosses the wire.
+    #
+    # A stateless batch solve is host-side sugar over the single `dispatch`
+    # concept: open a throwaway workspace with `init` (plan + rows), then
+    # `solve`, and read the report.
     fe = Florecon(wasm_path)
-    env = fe.solve(req, arrow_bytes)
+    env = fe.dispatch({"op": "init", "plan": final_plan}, arrow_bytes)
+    if not env.get("ok"):
+        raise RuntimeError(env.get("error"))
+    env = fe.dispatch({"op": "solve"})
     if not env.get("ok"):
         raise RuntimeError(env.get("error"))
     return env.get("report")

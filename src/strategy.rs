@@ -149,6 +149,74 @@ pub fn seq<E: 'static>(steps: Vec<Box<dyn Strategy<E>>>) -> Box<dyn Strategy<E>>
     Box::new(Seq { steps })
 }
 
+struct FixedPoint<E> {
+    inner: Box<dyn Strategy<E>>,
+    max_passes: usize,
+}
+
+/// A stable fingerprint of remaining work: the sorted multiset of
+/// `(id, current amount)`. Two residuals with the same fingerprint represent
+/// identical outstanding work, so a pass that reproduces it has reached a fixed
+/// point. Amount is included so a pass that only *re-prices* a residual lot
+/// (e.g. a partial match upstream) still counts as progress.
+fn residual_fingerprint<E>(items: &[Item<E>]) -> Vec<(ExtId, i64)> {
+    let mut v: Vec<(ExtId, i64)> = items.iter().map(|i| (i.id, i.amount)).collect();
+    v.sort_unstable();
+    v
+}
+
+impl<E> Strategy<E> for FixedPoint<E> {
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let mut groups = Vec::new();
+        let mut residual = bag;
+        let mut fp = residual_fingerprint(&residual);
+        for _ in 0..self.max_passes {
+            if residual.is_empty() {
+                break;
+            }
+            let r = self.inner.run(std::mem::take(&mut residual));
+            groups.extend(r.groups);
+            residual = r.residual;
+            let next = residual_fingerprint(&residual);
+            // A pass that left the outstanding work unchanged is a no-op: the
+            // loop has converged. (A pass can only reproduce the same
+            // fingerprint by leaving the residual untouched, since grouped ids
+            // leave the residual entirely.)
+            if next == fp {
+                break;
+            }
+            fp = next;
+        }
+        Resolution { groups, residual }
+    }
+}
+
+/// Iterate `inner` on its own residual until it reaches a fixed point -- a pass
+/// that changes nothing more -- or `max_passes` elapse, accumulating every
+/// group found along the way. Conservation holds by construction: each pass
+/// conserves, and only the residual is re-fed while groups are locked in.
+///
+/// State inside `inner` **persists across passes** (the warm flow [`Matcher`],
+/// per-shard [`partition_by`] children, ...): the loop reuses the same compiled
+/// subtree rather than rebuilding it. That is sound because every node treats
+/// its incoming bag as the *authoritative present-set* and reconciles against
+/// what it previously held -- the same discipline that makes warm re-solve
+/// correct -- so re-running a node on its own (shrunken) residual is
+/// reentrant-safe: departed ids are dropped, surviving ids are re-priced, and a
+/// globally-optimal leaf like `flow` simply reproduces its residual and the loop
+/// converges. `max_passes` is a hard bound; reaching it returns the best result
+/// so far (still conserving), so a pathological non-convergent `inner` is
+/// bounded rather than unbounded.
+pub fn fixed_point<E: 'static>(
+    inner: Box<dyn Strategy<E>>,
+    max_passes: usize,
+) -> Box<dyn Strategy<E>> {
+    Box::new(FixedPoint {
+        inner,
+        max_passes: max_passes.max(1),
+    })
+}
+
 struct PartitionBy<E, K, FK> {
     key: FK,
     /// Builds a fresh child subtree the first time a shard key is seen.
@@ -1247,6 +1315,72 @@ mod tests {
         assert_eq!(r.groups.len(), 1);
         assert_eq!(ids(&r.groups[0]), vec![1, 2]);
         assert_eq!(r.residual.len(), 1);
+    }
+
+    /// A deliberately non-maximal leaf: it groups *at most one* opposite-sign
+    /// equal-magnitude pair per call and returns everything else as residual.
+    /// One `run` is not enough to clear a fully matchable bag, so it is the
+    /// honest probe for the fixed-point loop's repeat-until-stable contract.
+    struct OnePair;
+    impl Strategy<i64> for OnePair {
+        fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+            for i in 0..bag.len() {
+                for j in (i + 1)..bag.len() {
+                    if bag[i].amount == -bag[j].amount && bag[i].amount != 0 {
+                        let mut residual = Vec::new();
+                        let mut members = Vec::new();
+                        for (k, item) in bag.into_iter().enumerate() {
+                            if k == i || k == j {
+                                members.push(Allocation { id: item.id, amount: item.amount });
+                            } else {
+                                residual.push(item);
+                            }
+                        }
+                        let g = Group { members, origin: "onepair".into(), net: 0 };
+                        return Resolution { groups: vec![g], residual };
+                    }
+                }
+            }
+            Resolution { groups: vec![], residual: bag }
+        }
+    }
+
+    #[test]
+    fn fixed_point_drives_a_non_maximal_leaf_to_completion() {
+        // A single pass of OnePair clears exactly one pair.
+        let mut once = OnePair;
+        let r = once.run(bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]));
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.residual.len(), 2);
+
+        // Wrapped in fixed_point, it iterates until nothing more matches.
+        let mut fp = fixed_point(Box::new(OnePair), 16);
+        let r = fp.run(bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]));
+        conserves(4, &r);
+        assert_eq!(r.groups.len(), 2, "both pairs found across passes");
+        assert_eq!(r.residual.len(), 0);
+    }
+
+    #[test]
+    fn fixed_point_leaves_unmatchable_residual_and_terminates() {
+        // 3 and 4 (+7, +3) can never pair: the loop must converge, not spin.
+        let mut fp = fixed_point(Box::new(OnePair), 16);
+        let r = fp.run(bag(&[(1, 5), (2, -5), (3, 7), (4, 3)]));
+        conserves(4, &r);
+        assert_eq!(r.groups.len(), 1);
+        let mut left: Vec<ExtId> = r.residual.iter().map(|i| i.id).collect();
+        left.sort();
+        assert_eq!(left, vec![3, 4]);
+    }
+
+    #[test]
+    fn fixed_point_respects_the_pass_cap() {
+        // With a 1-pass cap it behaves exactly like a single OnePair run.
+        let mut fp = fixed_point(Box::new(OnePair), 1);
+        let r = fp.run(bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]));
+        conserves(4, &r);
+        assert_eq!(r.groups.len(), 1, "cap of 1 means one pass");
+        assert_eq!(r.residual.len(), 2);
     }
 
     #[test]

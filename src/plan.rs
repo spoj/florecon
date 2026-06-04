@@ -27,10 +27,12 @@ use crate::plan_compile::compile;
 /// the engine and refuse to run against a mismatched binary. Bump it on any
 /// breaking change to those shapes.
 ///
-/// v8 makes the plan primary numeraire explicit and removes leaf-local amount
-/// fields: every strategy primitive operates on the current allocation amount;
-/// `pivot` is the only subtree-local numeraire switch.
-pub const CONTRACT_VERSION: u32 = 8;
+/// v10 converges the wire to a single concept: one `dispatch` entry point
+/// driving a persistent workspace via the [`Cmd`](crate::wasm) protocol. There
+/// is no separate stateless `solve` export or `SolveRequest` shape -- a batch
+/// solve is just `init` + `solve` on a workspace the caller discards. Column
+/// identity still rides in the Arrow batch schema (the schema *is* the map).
+pub const CONTRACT_VERSION: u32 = 10;
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use crate::row::{PhysicalRow, ColumnMap};
@@ -69,6 +71,16 @@ pub struct Plan {
 pub enum PlanNode {
     /// Cascade: each step runs on the previous step's residual.
     Seq { steps: Vec<PlanNode> },
+    /// Repeat `inner` on its own residual until it reaches a fixed point (a pass
+    /// that groups nothing more) or `max` passes elapse. State inside `inner`
+    /// (e.g. a warm flow `Matcher`) persists across passes; every node treats
+    /// its incoming bag as the authoritative present-set, which is what makes
+    /// the loop reentrant-safe.
+    FixedPoint {
+        inner: Box<PlanNode>,
+        #[cfg_attr(feature = "serde", serde(default = "default_fixed_point_passes"))]
+        max: usize,
+    },
     /// Fork/join shard by a scalar column/expression, run `inner` per shard.
     Partition { by: String, inner: Box<PlanNode> },
     /// Route rows by a boolean column/expression, run different child subtrees
@@ -134,6 +146,14 @@ pub enum PlanNode {
         #[cfg_attr(feature = "serde", serde(default))]
         cost: CostSpec,
     },
+}
+
+/// The default pass cap for [`PlanNode::FixedPoint`] when omitted on the wire.
+/// Generous enough for any realistic cascade to converge, but bounded so a
+/// non-convergent inner strategy can never spin unboundedly.
+#[cfg(feature = "serde")]
+fn default_fixed_point_passes() -> usize {
+    16
 }
 
 // ---------------------------------------------------------------------------
@@ -353,33 +373,6 @@ fn report_from_resolution(
         groups: group_out,
         allocations,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Batch request (the portable wire shape for a whole-shard solve)
-// ---------------------------------------------------------------------------
-
-/// A self-contained batch solve: schema + rows + plan. This is the JSON a WASM
-/// or other batch host ships across the boundary in one coarse crossing.
-#[cfg(feature = "serde")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SolveRequest {
-    #[serde(default)]
-    pub map: ColumnMap,
-    pub plan: Plan,
-}
-
-#[cfg(feature = "serde")]
-impl SolveRequest {
-    
-
-    /// Lower the rows against the map, build the session, and run the plan.
-    /// The returned report is allocation-native; row/group views are explicit
-    /// projections over `allocations`.
-    pub fn run(self, rows: Vec<(ExtId, PhysicalRow)>) -> Result<Report, ApiError> {
-        let session = Session::from_rows(self.map, rows)?;
-        session.solve(&self.plan)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,5 +1073,28 @@ mod tests {
         s.upsert(2, row(-100, 2, 0, -999, &[])).unwrap();
         let rep = s.solve(&full_pipeline()).unwrap();
         assert_eq!(rep.allocations.len(), 2);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn fixed_point_serde_shape_and_default_max() {
+        // `max` omitted on the wire takes the default; the node round-trips.
+        let node: PlanNode =
+            serde_json::from_str(r#"{"op":"fixed_point","inner":{"op":"exact"}}"#).unwrap();
+        match &node {
+            PlanNode::FixedPoint { inner, max } => {
+                assert_eq!(*max, default_fixed_point_passes());
+                assert!(matches!(**inner, PlanNode::Exact {}));
+            }
+            _ => panic!("expected fixed_point"),
+        }
+        let explicit: PlanNode = serde_json::from_str(
+            r#"{"op":"fixed_point","max":3,"inner":{"op":"exact"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<PlanNode>(&serde_json::to_string(&explicit).unwrap()).unwrap(),
+            explicit,
+        );
     }
 }

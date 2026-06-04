@@ -91,7 +91,7 @@ export function connectedComponents(report) {
 export class Florecon {
   // The wire-contract version this host speaks; must equal the engine's
   // abi_version() export. Bump in lockstep with plan::CONTRACT_VERSION.
-  static CONTRACT_VERSION = 8;
+  static CONTRACT_VERSION = 10;
 
   static async load(url) {
     const bytes = await (await fetch(url)).arrayBuffer();
@@ -112,7 +112,9 @@ export class Florecon {
       );
     }
     this.engineVersion = v;
-  }  _call(fn, payload, arrowBytes = null) {
+  }
+
+  _call(fn, payload, arrowBytes = null) {
     const data = this.enc.encode(JSON.stringify(payload));
     const n = data.length;
     const ptr = this.ex.alloc(n);
@@ -137,13 +139,11 @@ export class Florecon {
     return JSON.parse(this.dec.decode(out));
   }
 
-  // Stateful interactive command (init/upsert/remove/solve/freeze/...).
+  // The single low-level entry point: one command (init/upsert/remove/solve/
+  // freeze/...) against the persistent workspace. A stateless batch solve is
+  // just `dispatch({op:"init", plan}, arrowBytes)` followed by
+  // `dispatch({op:"solve"})`.
   dispatch(cmd, arrowBytes = null) {
     return this._call(this.ex.dispatch, cmd, arrowBytes);
-  }
-
-  // Stateless batch solve.
-  solve(req, arrowBytes = null) {
-    return this._call(this.ex.solve, req, arrowBytes);
   }
 }

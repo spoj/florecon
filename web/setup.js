@@ -1,8 +1,8 @@
-// Setup screen + entry point: pick a dataset (the bundled demo, or an uploaded
-// CSV mapped to engine roles), build the viewer `data` object, and hand it to
-// the workbench. The workbench (app.js) is otherwise unchanged and data-driven.
+// Setup screen + entry point: upload a CSV, map its columns to engine roles,
+// build the viewer `data` object, and hand it to the workbench. The workbench
+// (app.js) is otherwise unchanged and data-driven.
 
-import { startApp, startDemo } from "./app.js";
+import { startApp } from "./app.js";
 import { parseCsv, buildDataset, toCents } from "./ingest.js";
 
 const $ = (id) => document.getElementById(id);
@@ -151,8 +151,17 @@ function onFile(file) {
 function wire() {
   const drop = $("dropzone");
   const input = $("file-input");
-  drop.onclick = () => input.click();
-  input.onchange = () => { if (input.files[0]) onFile(input.files[0]); };
+  drop.onclick = (e) => {
+    if (e.target !== input) {
+      input.click();
+    }
+  };
+  input.onchange = () => { 
+    if (input.files[0]) {
+      onFile(input.files[0]); 
+      input.value = "";
+    }
+  };
   drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
   drop.ondragleave = () => drop.classList.remove("over");
   drop.ondrop = (e) => {
@@ -160,11 +169,6 @@ function wire() {
     if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]);
   };
   $("run-recon").onclick = runUpload;
-  $("load-demo").onclick = async () => {
-    $("setup-err").textContent = "";
-    try { await startDemo(); show("app"); }
-    catch (e) { console.error(e); show("setup"); $("setup-err").textContent = "Demo failed: " + e.message; }
-  };
 }
 
 show("setup");

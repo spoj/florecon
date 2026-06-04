@@ -3,12 +3,11 @@ import { TagStore } from "./core/tagstore.js";
 
 const TOL = 100; // group is "clean" if |net| <= 1.00 value unit
 const WASM = "./core/engine.wasm";
-const DATA = "./data.json";
 
 const state = {
   fe: null,
   data: null,
-  fields: [],           // portable display descriptor from data.json
+  fields: [],           // portable display descriptor carried alongside the data
   slicers: [],          // [{key,label,valueOf}] system dims first, then data dims
   detailCols: [],       // [{label, kind, render}]
   valueKey: "usd",      // which amount field is the conserved "value"
@@ -96,8 +95,9 @@ function setStatus(msg, err = false) {
 }
 
 // ---- field-driven configuration -----------------------------------------
-// Slicers and detail columns are derived from data.json `fields`, so a book
-// of a different shape ports by shipping a different descriptor.
+// Slicers and detail columns are derived from the viewer `data` object's
+// `fields` descriptor, so a book of a different shape ports by building a
+// different descriptor.
 function configureFromFields() {
   const fields = state.data.fields || [];
   state.fields = fields;
@@ -105,7 +105,7 @@ function configureFromFields() {
   state.valueKey = valField.amt || "usd";
   // The engine conserves its plan `amount` column, which may differ from the
   // displayed value (e.g. native vs usd). Datasets name it explicitly; default
-  // to the legacy `native` so the bundled demo keeps working.
+  // to `native` when a dataset omits it.
   state.netKey = (typeof state.data.plan?.primary === "string" ? state.data.plan.primary : null) || state.data.netKey || "native";
 
   // System slicers (engine-derived) lead; underlying-data dims follow.
@@ -195,17 +195,11 @@ async function startApp(data) {
 
   setStatus(`init: ${state.data.display.length} rows…`);
   const init = state.fe.dispatch({
-    op: "init", map: state.data.map, plan: state.data.plan
+    op: "init", plan: state.data.plan
   }, state.data.arrowBytes);
   if (!init.ok) return setStatus("init error: " + init.error, true);
   solve();
   wireUi();
-}
-
-// Load the bundled interco demo dataset and start.
-export async function startDemo() {
-  const data = await (await fetch(DATA)).json();
-  return startApp(data);
 }
 
 export { startApp };
@@ -782,7 +776,7 @@ function wireUi() {
 function boot2() {
   resetGroupDisplayLabels();
   const init = state.fe.dispatch({
-    op: "init", map: state.data.map, plan: state.data.plan
+    op: "init", plan: state.data.plan
   }, state.data.arrowBytes);
   if (!init.ok) return setStatus("init error: " + init.error, true);
   solve();

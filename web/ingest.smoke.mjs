@@ -49,13 +49,17 @@ const data = buildDataset({ header: H, rows: parsed.rows, mapping });
 
 ok(data.arrowBytes.length > 0, "arrow built");
 ok(data.netKey === "amount", "netKey");
-ok(Object.keys(data.map.int_cols).length > 0, "schema order");
+// Column identity travels in the Arrow schema now, not a JSON map: the host
+// must NOT emit a wire `map` (the engine derives it from the batch).
+ok(data.map === undefined, "no redundant wire map");
+ok(data.schema === undefined, "no vestigial wire schema");
+ok(data.plan.primary === "amount", "plan primary numeraire");
 ok(data.plan.root.op === "partition" && data.plan.root.by === "p0", "outer partition");
 // cells positional: [p0,p1,gkey,date,amount,tokens]
 ok(data.display[0].amount === 10000, "amount cents in cell");
 ok(data.display[0].amount === 10000, "display amount cents");
 
-let r = fe.dispatch({ op: "init", map: data.map, plan: data.plan }, data.arrowBytes);
+let r = fe.dispatch({ op: "init", plan: data.plan }, data.arrowBytes);
 ok(r.ok, "init: " + r.error);
 r = fe.dispatch({ op: "solve" });
 ok(r.ok, "solve: " + r.error);

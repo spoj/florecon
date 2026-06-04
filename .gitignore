@@ -1,7 +1,6 @@
 /target
 /.venv
 __pycache__/
-web/data.json
 py/src/florecon/_engine.wasm
 py/dist/
 py/build/
