@@ -19,7 +19,15 @@ ACME,USD,4000,2024-01-05,42.00,INV0002,stray`;
 const parsed = parseCsv(csv);
 const data = buildDataset({
   header: parsed.header, rows: parsed.rows,
-  mapping: { amount: 4, gkey: 2, date: 3, tokens: [5, 6], partitions: [0, 1], tol: 0 },
+  columns: [
+    { ci: 0, name: "entity", kind: "key" },
+    { ci: 1, name: "currency", kind: "key" },
+    { ci: 2, name: "account", kind: "key" },
+    { ci: 3, name: "date", kind: "date" },
+    { ci: 4, name: "amount", kind: "amount" },
+    { ci: 5, name: "ref", kind: "text" },
+    { ci: 6, name: "memo", kind: "display" },
+  ],
 });
 
 const t0 = performance.now();

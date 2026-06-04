@@ -28,6 +28,10 @@ pub struct GroupOut {
     /// The single recalc-status axis: `live` or `frozen`. (Matched vs unmatched
     /// is a client projection over the allocation hypergraph, not core state.)
     pub status: Status,
+    /// Optional human-facing explanation of why the group formed (the plan's
+    /// author label), distinct from the machine `origin`. `None` when unlabeled.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub reason: Option<String>,
 }
 
 /// One signed lot allocation in a [`Report`]. This is the incidence edge of the

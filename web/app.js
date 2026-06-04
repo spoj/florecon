@@ -1,5 +1,10 @@
 import { Florecon, primaryAssignments } from "./core/florecon.js";
 import { TagStore } from "./core/tagstore.js";
+import { buildDataset } from "./ingest.js";
+import {
+  serializeWorkspace, parseWorkspace, applyFrozen,
+  resultsCsv, groupsCsv, resultJson, download, pickTextFile, slug,
+} from "./core/persist.js";
 
 const TOL = 100; // group is "clean" if |net| <= 1.00 value unit
 const WASM = "./core/engine.wasm";
@@ -33,17 +38,23 @@ const state = {
   search: "",
   sort: { key: "value", dir: -1 },
   detailSort: { key: "date", dir: 1 },
+  tagging: false,        // inline tag-entry box open in the detail action bar
 };
 
+// Cancellation token for the async/cancellable slicer (filter) recompute. Each
+// filter change bumps it; a superseded recompute sees a stale token and bails,
+// so only the final selection finishes (see renderFiltered).
+let filterToken = 0;
+
 const $ = (id) => document.getElementById(id);
-const SHORT = { live: "L", frozen: "F", unmatched: "U", exception: "E", manual: "M" };
+const SHORT = { live: "L", frozen: "F", unmatched: "U", manual: "M" };
 const fmt = (cents) => (cents / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmt0 = (cents) => (cents / 100).toLocaleString("en-US", { maximumFractionDigits: 0 });
 const esc = (s) => (s ?? "").toString().replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-// Stable dataset fingerprint for the localStorage namespace: pair + the sorted
-// row ids. Row ids are the stable identity tags are keyed by, so the same book
-// rehydrates the same tag overlay across reloads (djb2-ish, base36).
+// Stable dataset fingerprint, retained only for diagnostics/labels. Tags are
+// in-memory for the page session only (see TagStore) — nothing is persisted to
+// the browser, so a reload always starts from a clean, predictable slate.
 function datasetHash(data) {
   const ids = (data.display || []).map((d) => d.id).sort((a, b) => a - b);
   let h = 5381 >>> 0;
@@ -139,10 +150,24 @@ function configureFromFields() {
       cols.push({
         key: f.key, label: f.label, num: true,
         sortVal: (l) => amt(l, f.amt), hl: (l) => String(amt(l, f.amt)),
+        total: (l) => amt(l, f.amt), fmtTotal: (v) => fmt(v),
         render: (l) => {
           const v = amt(l, f.amt);
           const ccy = f.ccy ? esc(l[f.ccy]) + " " : "";
           return `<span class="${v >= 0 ? "pos" : "neg"}">${ccy}${fmt(v)}</span>`;
+        },
+      });
+    } else if (f.kind === "num") {
+      // Display-only numeric column (natural magnitude, not cents). Summed in
+      // the detail totals row like the conserved amount, but never reconciled.
+      const numFmt = (v) => v.toLocaleString("en-US", { maximumFractionDigits: 2 });
+      cols.push({
+        key: f.key, label: f.label, num: true,
+        sortVal: (l) => Number(l[f.amt] || 0), hl: (l) => String(Number(l[f.amt] || 0)),
+        total: (l) => Number(l[f.amt] || 0), fmtTotal: numFmt,
+        render: (l) => {
+          const v = Number(l[f.amt] || 0);
+          return `<span class="${v >= 0 ? "pos" : "neg"}">${numFmt(v)}</span>`;
         },
       });
     } else if (f.kind === "date") {
@@ -153,7 +178,7 @@ function configureFromFields() {
       });
     } else {
       cols.push({
-        key: f.key, label: f.label, wide: f.key === "ref" || f.key === "account",
+        key: f.key, label: f.label, wide: f.wide || f.key === "ref" || f.key === "account",
         sortVal: (l) => l[f.key] || "", hl: (l) => l[f.key] || "",
         render: (l) => `<span title="${esc(l[f.key])}">${esc(l[f.key])}</span>`,
       });
@@ -247,7 +272,7 @@ function rebuild() {
       engine_id: g.group_id,
       display_id,
       signature,
-      frozen: g.status === "frozen", members: [], value: 0, clean: Math.abs(g.net) <= TOL,
+      frozen: g.status === "frozen", members: [], value: 0, netProj: 0, clean: Math.abs(g.net) <= TOL,
     };
     state.groupsById.set(g.group_id, view);
     gidsBySig.set(signature, g.group_id);
@@ -270,7 +295,7 @@ function rebuild() {
     // hypergraph for its row table. Raw allocations remain available on report.
     const gid = gidOf.has(d.id) ? gidOf.get(d.id) : -1;
     const g = state.groupsById.get(gid);
-    if (g) { g.members.push(d.id); g.value += Math.abs(Number(d[vk] || 0)); }
+    if (g) { g.members.push(d.id); g.value += Math.abs(Number(d[vk] || 0)); g.netProj += Number(d.native || 0); }
     const matched = g ? g.size >= 2 : false;
     return {
       ...d,
@@ -278,10 +303,11 @@ function rebuild() {
       display_gid: g ? g.display_id : -1,
       month: (d.date || "").slice(0, 7),
       origin: g ? g.origin : "unmatched",
-      // Render-time status from (status × arity): live match / frozen match /
-      // live singleton (unmatched) / frozen singleton (accepted exception).
+      // Render-time status from (status × arity). With the exception concept
+      // removed there are three states: live match, frozen (accepted, any
+      // arity), and live singleton (unmatched/residual).
       status: g
-        ? (g.frozen ? (matched ? "frozen" : "exception") : (matched ? "live" : "unmatched"))
+        ? (g.frozen ? "frozen" : (matched ? "live" : "unmatched"))
         : "unmatched",
       clean: g ? g.clean : false,
     };
@@ -348,37 +374,52 @@ function renderFacets() {
   host.innerHTML = "";
   const vk = state.valueKey;
   for (const sl of state.slicers) {
-    // cross-filter: count this dim over lines filtered by every OTHER dim
-    const base = state.lines.filter((l) => lineMatches(l, sl.key));
-    const agg = new Map();
-    for (const l of base) {
-      // single-value slicers contribute one value; the tag facet contributes a
-      // list (a line in N buckets bumps N facet rows). Untagged lines add none.
+    // Stable universe + order from ALL lines (independent of the current
+    // filters), so toggling one slicer never reorders or drops another's chips
+    // — a value whose cross-filtered count falls to 0 stays in place, dimmed,
+    // and returns to the same screen position when you deselect.
+    const total = new Map();
+    for (const l of state.lines) {
       const vals0 = sl.valuesOf ? sl.valuesOf(l) : [sl.valueOf(l) || "—"];
-      for (const v of vals0) {
-        const e = agg.get(v) || { n: 0, val: 0 };
-        e.n++; e.val += Math.abs(Number(l[vk] || 0)); agg.set(v, e);
-      }
+      for (const v of vals0) total.set(v, (total.get(v) || 0) + 1);
     }
     // hide an empty many-to-many facet (no tags yet) so it is not a bare header
-    if (sl.multi && agg.size === 0) continue;
-    let vals = [...agg.entries()].sort((a, b) => b[1].n - a[1].n);
-    const max = vals.length ? vals[0][1].n : 1;
+    if (sl.multi && total.size === 0) continue;
+
+    // current cross-filtered counts (this dim over lines filtered by every
+    // OTHER dim). Missing => 0; the chip still renders from the stable universe.
+    const base = state.lines.filter((l) => lineMatches(l, sl.key));
+    const cur = new Map();
+    for (const l of base) {
+      const vals0 = sl.valuesOf ? sl.valuesOf(l) : [sl.valueOf(l) || "—"];
+      for (const v of vals0) {
+        const e = cur.get(v) || { n: 0, val: 0 };
+        e.n++; e.val += Math.abs(Number(l[vk] || 0)); cur.set(v, e);
+      }
+    }
+
     const active = state.filters.get(sl.key) || new Set();
+    // fixed order by total count desc, value as tiebreak (deterministic).
+    const order = [...total.keys()].sort((a, b) =>
+      total.get(b) - total.get(a) || (a < b ? -1 : a > b ? 1 : 0));
+    const max = order.length ? total.get(order[0]) : 1;
     const cap = 12;
-    const more = vals.length - cap;
-    vals = vals.slice(0, cap);
+    const head = order.slice(0, cap);
+    for (const v of active) if (total.has(v) && !head.includes(v)) head.push(v);
+    const more = order.length - head.length;
 
     const div = document.createElement("div");
     div.className = "facet" + (sl.system ? " sys" : "");
-    div.innerHTML = `<h4>${esc(sl.label)}</h4>` + vals.map(([v, e]) => {
+    div.innerHTML = `<h4>${esc(sl.label)}</h4>` + head.map((v) => {
+      const e = cur.get(v) || { n: 0, val: 0 };
       const on = active.has(v) ? " active" : "";
+      const zero = e.n === 0 ? " zero" : "";
       const w = (100 * e.n / max).toFixed(0);
       // tag facet renders the human label + a colour swatch; data-val stays the
       // stable TagId so filtering/cross-filter keep working.
       const lbl = sl.labelOf ? sl.labelOf(v) : v;
       const dot = sl.colorOf ? `<span class="tag-dot" style="background:${esc(sl.colorOf(v))}"></span>` : "";
-      return `<div class="facet-val${on}" data-dim="${esc(sl.key)}" data-val="${esc(v)}">
+      return `<div class="facet-val${on}${zero}" data-dim="${esc(sl.key)}" data-val="${esc(v)}" title="click to filter · ⌘/Ctrl-click to add">
         <span class="bar" style="width:${w}%"></span>
         <span class="lbl" title="${esc(lbl)}">${dot}${esc(lbl)}</span>
         <span class="cnt">${e.n}</span></div>`;
@@ -386,7 +427,17 @@ function renderFacets() {
     host.appendChild(div);
   }
   host.querySelectorAll(".facet-val[data-dim]").forEach((el) => {
-    el.onclick = () => toggleFilter(el.dataset.dim, el.dataset.val);
+    // Plain click = single-select (replace this dim's selection, or toggle off
+    // if it was the only active value). ⌘/Ctrl/Shift-click = additive toggle.
+    // Optimistic chip feedback; the cancellable recompute reconciles the rest.
+    el.onclick = (e) => {
+      const additive = e.ctrlKey || e.metaKey || e.shiftKey;
+      if (!additive)
+        el.closest(".facet").querySelectorAll(".facet-val.active")
+          .forEach((x) => { if (x !== el) x.classList.remove("active"); });
+      el.classList.toggle("active");
+      selectFilter(el.dataset.dim, el.dataset.val, additive);
+    };
   });
 }
 
@@ -401,8 +452,13 @@ function renderGroups(fl) {
 
   const { key, dir } = state.sort;
   rows.sort((a, b) => {
-    const av = key === "status" ? (a.frozen ? 1 : 0) : key === "group_id" ? a.display_id : a[key];
-    const bv = key === "status" ? (b.frozen ? 1 : 0) : key === "group_id" ? b.display_id : b[key];
+    const pick = (g) =>
+      key === "status" ? (g.frozen ? 1 : 0)
+      : key === "group_id" ? g.display_id
+      : key === "reason" ? (g.reason || g.origin || "")
+      : key === "net" ? g.netProj
+      : g[key];
+    const av = pick(a), bv = pick(b);
     return av > bv ? dir : av < bv ? -dir : a.display_id - b.display_id;
   });
 
@@ -411,14 +467,15 @@ function renderGroups(fl) {
   body.innerHTML = rows.slice(0, CAP).map((g) => {
     const sel = state.selectedGids.has(g.group_id) ? " sel" : "";
     const st = g.frozen ? "frozen" : "live";
-    const netCls = g.clean ? "" : "dirty";
+    const netCls = Math.abs(g.netProj) <= TOL ? "" : "dirty";
     return `<tr class="${sel}" data-gid="${g.group_id}" title="engine group_id ${g.group_id}">
       <td><span class="badge b-${st}" title="${st}">${SHORT[st] || "?"}</span></td>
       <td>${g.display_id}</td>
       <td><span class="badge o-${g.origin}">${g.origin}</span></td>
+      <td class="why" title="${esc(g.reason || "")}">${esc(g.reason || "")}</td>
       <td class="num">${g.size}</td>
       <td class="num">${fmt0(g.value)}</td>
-      <td class="num ${netCls}">${g.clean ? "0" : fmt(g.net)}</td>
+      <td class="num ${netCls}">${fmt(g.netProj)}</td>
     </tr>`;
   }).join("");
   body.querySelectorAll("tr").forEach((tr) => {
@@ -469,6 +526,7 @@ function renderDetail(fl) {
     lines = [...ids].map((id) => byId.get(id)).filter(Boolean);
     head.innerHTML = sel.length === 1
       ? `Group #${groupNo(sel[0])} · <span class="badge o-${sel[0].origin}">${sel[0].origin}</span>`
+        + (sel[0].reason ? ` · <span class="why-head">${esc(sel[0].reason)}</span>` : "")
       : `${sel.length} groups · union`;
     scope = "selected groups (full)";
   } else {
@@ -482,6 +540,8 @@ function renderDetail(fl) {
   // action bar: line-selection tools always on, plus group-focus verbs
   state.shownLineIds = lines.map((l) => l.id);
   const nsl = state.selectedLines.size;
+  const tgt = nsl || lines.length;        // act on the selection, else all visible
+  const onAll = !nsl && lines.length > 0; // operating on the whole visible set
   const focusActs = [];
   if (sel.length) {
     const net = sel.reduce((a, g) => a + g.net, 0);
@@ -489,29 +549,35 @@ function renderDetail(fl) {
     const frozenAll = sel.every((g) => g.frozen);
     const val = fmt0(lines.reduce((a, l) => a + Math.abs(Number(l[vk] || 0)), 0));
     focusActs.push(
-      `<button id="act-freeze">${frozenAll ? "Unfreeze" : "Freeze"}${sel.length > 1 ? " all" : ""}</button>`,
-      `<button id="act-breakup">Break up${sel.length > 1 ? " all" : ""}</button>`,
-      `<span class="gmeta">${lines.length} lines · ${val} ${vk} · net ${clean ? "0 ✓" : fmt(net)}</span>`);
+      `<button id="act-freeze" class="mini">${frozenAll ? "Unfreeze" : "Freeze"}${sel.length > 1 ? " all" : ""}</button>`,
+      `<button id="act-breakup" class="mini">Break up${sel.length > 1 ? " all" : ""}</button>`,
+      `<span class="gmeta">${lines.length} lines · ${val} ${vk} · net ${fmt(net)}</span>`);
   }
   const selTool =
     `<span class="seltool">select
       <button class="link" id="sel-all">all</button>
       <button class="link" id="sel-none">none</button>
       <button class="link" id="sel-invert">invert</button></span>`;
-  const lineActs = nsl ? [
-    `<button id="act-match" class="primary">Match ${nsl}</button>`,
-    `<button id="act-freezesel">Freeze ${nsl}</button>`,
-    `<button id="act-unmatch">Unmatch ${nsl}</button>`,
-    `<button id="act-tag">Tag\u2026</button>`,
-    `<button id="act-untag">Untag</button>`,
+  // Inline tag entry (no modal prompt): Tag\u2026 opens a text box right in the
+  // action bar; Enter / “tag” commits, Esc / ✕ cancels.
+  const tagCtl = state.tagging
+    ? `<span class="tagbox"><input id="tag-input" type="text" placeholder="tag name\u2026" />`
+      + `<button id="tag-ok" class="primary mini">tag ${tgt}</button>`
+      + `<button id="tag-cancel" class="mini" title="cancel">✕</button></span>`
+    : `<button id="act-tag" class="mini">Tag\u2026</button>`;
+  const lineActs = tgt ? [
+    `<button id="act-match" class="primary mini">Match ${tgt}${onAll ? " (all)" : ""}</button>`,
+    `<button id="act-freezesel" class="mini">Freeze ${tgt}${onAll ? " (all)" : ""}</button>`,
+    `<button id="act-unmatch" class="mini">Unmatch ${tgt}${onAll ? " (all)" : ""}</button>`,
+    tagCtl,
+    `<button id="act-untag" class="mini">Untag</button>`,
   ] : [];
-  // Commit verbs: a tagged selection is a pre-decision "review bucket".
-  // Each verb reuses an existing engine op, then drops the tags (no new state).
+  // Commit verbs for a tagged "review bucket": promote to a frozen manual match,
+  // or release (just untag). Reuses existing engine ops; no exception state.
   const taggedSel = [...state.selectedLines].filter((id) => state.tags.tagsOf(id).size > 0);
   const commitActs = taggedSel.length ? [
-    `<button id="act-promote-match" class="primary">\u2192 Match ${taggedSel.length}</button>`,
-    `<button id="act-promote-exc">\u2192 Exceptions</button>`,
-    `<button id="act-release">Release</button>`,
+    `<button id="act-promote-match" class="primary mini">\u2192 Match ${taggedSel.length}</button>`,
+    `<button id="act-release" class="mini">Release</button>`,
   ] : [];
   acts.innerHTML = selTool + lineActs.join("") + commitActs.join("") + focusActs.join("");
   $("sel-all").onclick = () => { for (const id of state.shownLineIds) state.selectedLines.add(id); render(); };
@@ -521,16 +587,28 @@ function renderDetail(fl) {
       if (state.selectedLines.has(id)) state.selectedLines.delete(id); else state.selectedLines.add(id);
     render();
   };
-  if (nsl) {
+  if (tgt) {
     $("act-match").onclick = matchSelected;
     $("act-freezesel").onclick = freezeSelected;
     $("act-unmatch").onclick = unmatchSelected;
-    $("act-tag").onclick = tagSelected;
     $("act-untag").onclick = untagSelected;
+    if (state.tagging) {
+      const inp = $("tag-input");
+      inp.value = state.tagText || "";
+      inp.focus(); inp.select();
+      inp.oninput = () => { state.tagText = inp.value; };
+      inp.onkeydown = (e) => {
+        if (e.key === "Enter") { e.preventDefault(); commitTag(inp.value); }
+        else if (e.key === "Escape") { e.preventDefault(); closeTagBox(); }
+      };
+      $("tag-ok").onclick = () => commitTag(inp.value);
+      $("tag-cancel").onclick = closeTagBox;
+    } else {
+      $("act-tag").onclick = () => { state.tagging = true; state.tagText = "reviewing"; render(); };
+    }
   }
   if (taggedSel.length) {
     $("act-promote-match").onclick = promoteMatch;
-    $("act-promote-exc").onclick = promoteExceptions;
     $("act-release").onclick = releaseTagged;
   }
   if (sel.length) {
@@ -587,9 +665,29 @@ function renderDetail(fl) {
   body.onmouseleave = () => applyHighlight(null, null);
 
   renderDetailHeader();
+  renderDetailTotals(lines, cols, nsl);
   foot.textContent = `${lines.length.toLocaleString()} lines · ${scope}`
     + (lines.length > CAP ? ` (showing ${CAP})` : "")
     + (nsl ? ` · ${nsl} selected` : "");
+}
+
+// Sticky totals row: sum every numeric detail column over the rows in scope.
+// Scope is the current line selection when there is one (sum a subset like a
+// spreadsheet), otherwise every shown line. Non-numeric columns stay blank.
+function renderDetailTotals(lines, cols, nsl) {
+  const foot = $("detail-foot-row");
+  if (!cols.some((c) => c.total)) { foot.innerHTML = ""; return; }
+  const scope = nsl ? lines.filter((l) => state.selectedLines.has(l.id)) : lines;
+  let labelled = false;
+  const cells = cols.map((c) => {
+    if (c.total) {
+      const sum = scope.reduce((a, l) => a + c.total(l), 0);
+      return `<td class="num"><span class="${sum >= 0 ? "pos" : "neg"}">${c.fmtTotal(sum)}</span></td>`;
+    }
+    if (!labelled) { labelled = true; return `<td class="tot-lbl">\u03a3 ${scope.length.toLocaleString()}${nsl ? " sel" : ""}</td>`; }
+    return `<td></td>`;
+  });
+  foot.innerHTML = `<tr>${cells.join("")}</tr>`;
 }
 
 // highlight every visible cell sharing the hovered column + value
@@ -610,7 +708,59 @@ function toggleFilter(dim, val) {
   if (!set) { set = new Set(); state.filters.set(dim, set); }
   if (set.has(val)) set.delete(val); else set.add(val);
   if (set.size === 0) state.filters.delete(dim);
-  render();
+  renderFiltered();
+}
+
+// Slicer click model: single-select by default (replace the dim's selection, or
+// toggle it off when clicking the sole active value); additive toggle when a
+// modifier is held. `toggleFilter` above stays the additive primitive.
+function selectFilter(dim, val, additive) {
+  let set = state.filters.get(dim);
+  if (additive) {
+    if (!set) { set = new Set(); state.filters.set(dim, set); }
+    if (set.has(val)) set.delete(val); else set.add(val);
+  } else {
+    set = set && set.size === 1 && set.has(val) ? new Set() : new Set([val]);
+    state.filters.set(dim, set);
+  }
+  if (set.size === 0) state.filters.delete(dim);
+  renderFiltered();
+}
+
+// Background, cancellable slicer recompute. Filtering a large book is the one
+// O(rows) pass that can jank the UI, so it runs off the click handler in
+// chunks; each filter change bumps `filterToken`, and a superseded run sees a
+// stale token and bails. Result: rapid toggles coalesce and only the final
+// selection is computed and painted. Engine/selection ops keep using the
+// synchronous render() (the DOM smoke reads selection state synchronously).
+function setSlicerBusy(on) {
+  const head = document.querySelector("#facets .panel-head");
+  if (head) head.classList.toggle("busy", !!on);
+}
+
+async function computeFilteredCancellable(token) {
+  const lines = state.lines, out = [];
+  const CHUNK = 8000;
+  for (let i = 0; i < lines.length; i += CHUNK) {
+    const end = Math.min(i + CHUNK, lines.length);
+    for (let j = i; j < end; j++) if (lineMatches(lines[j], null)) out.push(lines[j]);
+    if (end < lines.length) {
+      await new Promise((r) => setTimeout(r));
+      if (token !== filterToken) return null; // superseded by a newer toggle
+    }
+  }
+  return out;
+}
+
+async function renderFiltered() {
+  const my = ++filterToken;
+  setSlicerBusy(true);
+  await Promise.resolve(); // let a burst of toggles collapse to the last one
+  if (my !== filterToken) return;
+  const fl = await computeFilteredCancellable(my);
+  if (fl === null || my !== filterToken) return;
+  renderMetrics(fl); renderFacets(); renderGroups(fl); renderDetail(fl);
+  setSlicerBusy(false);
 }
 
 function toggleGroup(gid, e) {
@@ -646,8 +796,14 @@ function groupCmds(cmds) {
 
 // Manually match the selected lines into one frozen group. The net is the sum
 // of the conserved amount (native) the engine reconciles on.
+// The lines an action targets: the explicit selection when there is one,
+// otherwise every line currently visible in the detail pane ("act on all").
+function actionLineIds() {
+  return state.selectedLines.size ? [...state.selectedLines] : [...state.shownLineIds];
+}
+
 function matchSelected() {
-  const ids = [...state.selectedLines];
+  const ids = actionLineIds();
   if (ids.length < 2) return setStatus("select at least two lines to match", true);
   const net = ids.reduce((a, id) => a + Number(state.displayById.get(id)?.[state.netKey] || 0), 0);
   const r = state.fe.dispatch({ op: "group", ids, net, origin: "manual" });
@@ -657,10 +813,11 @@ function matchSelected() {
   setStatus(`matched ${ids.length} lines into a manual group`);
 }
 
-// Freeze from the selection: live singletons (unmatched rows) become accepted
-// exceptions via `freeze_singletons`; live matches get their group frozen.
+// Freeze from the selection: live singletons (unmatched rows) are accepted via
+// `freeze_singletons`; live matches get their group frozen. Either way the
+// result is simply "frozen" — there is no separate exception state.
 function freezeSelected() {
-  const ids = [...state.selectedLines];
+  const ids = actionLineIds();
   const singles = [];
   const gids = new Set();
   for (const id of ids) {
@@ -677,10 +834,9 @@ function freezeSelected() {
   groupCmds(cmds);
   setStatus(`froze ${singles.length} unmatched + ${gids.size} group(s) from the selection`);
 }
-
 // Send the selected lines back to the residual (live groups only).
 function unmatchSelected() {
-  const ids = [...state.selectedLines];
+  const ids = actionLineIds();
   if (!ids.length) return;
   const r = state.fe.dispatch({ op: "ungroup", ids });
   if (!r.ok) return setStatus("unmatch error: " + r.error, true);
@@ -690,22 +846,29 @@ function unmatchSelected() {
 }
 
 // ---- tag overlay: host-side, no engine dispatch ----------------------------
-// Tag the selected lines into a review bucket. Tags are keyed by row id, so
-// they survive recalc automatically.
-function tagSelected() {
-  const ids = [...state.selectedLines];
-  if (!ids.length) return;
-  const label = (typeof prompt === "function" ? prompt("Tag selected lines — review bucket name:", "reviewing") : "reviewing");
+// Commit the inline tag box: tag the selected lines into a review bucket and
+// close the box. Tags are keyed by row id, so they survive recalc.
+function commitTag(name) {
+  const ids = actionLineIds();
+  state.tagging = false; state.tagText = "";
+  if (!ids.length) return render();
+  const label = (name || "reviewing").trim() || "reviewing";
   const tid = state.tags.ensureTag(label, "bucket");
-  if (!tid) return;
+  if (!tid) return render();
   for (const id of ids) state.tags.add(id, tid);
   render();
   setStatus(`tagged ${ids.length} lines as “${state.tags.label(tid)}”`);
 }
 
+// Cancel the inline tag box without tagging.
+function closeTagBox() {
+  state.tagging = false; state.tagText = "";
+  render();
+}
+
 // Clear every tag on the selected lines.
 function untagSelected() {
-  const ids = [...state.selectedLines];
+  const ids = actionLineIds();
   if (!ids.length) return;
   let n = 0;
   for (const id of ids) if (state.tags.tagsOf(id).size) { state.tags.clear(id); n++; }
@@ -729,19 +892,6 @@ function promoteMatch() {
   setStatus(`promoted ${ids.length} tagged lines to a manual match`);
 }
 
-// Commit verb: promote a tagged bucket to accepted exceptions
-// (op:"freeze_singletons"), then drop the tags.
-function promoteExceptions() {
-  const ids = taggedSelection();
-  if (!ids.length) return;
-  const r = state.fe.dispatch({ op: "freeze_singletons", ids });
-  if (!r.ok) return setStatus("promote error: " + r.error, true);
-  for (const id of ids) state.tags.clear(id);
-  state.selectedLines.clear();
-  state.report = r.report; rebuild(); render();
-  setStatus(`promoted ${ids.length} tagged lines to accepted exceptions`);
-}
-
 // Commit verb: release — just untag; rows stay live and flow back into recalc.
 function releaseTagged() {
   const ids = taggedSelection();
@@ -750,10 +900,65 @@ function releaseTagged() {
   setStatus(`released ${ids.length} tagged lines back to recalc`);
 }
 
+// ---- workspace save / load + result export (centralized in core/persist) ---
+function saveWorkspace() {
+  try {
+    const ws = serializeWorkspace({ data: state.data, report: state.report, tags: state.tags });
+    download(`${slug(state.data.pair)}.florecon.json`, JSON.stringify(ws, null, 2));
+    setStatus(`saved workspace: ${ws.frozen.length} frozen group(s), ${Object.keys(ws.tags.tags).length} tagged row(s)`);
+  } catch (e) {
+    setStatus("save failed: " + (e && e.message || e), true);
+  }
+}
+
+async function loadWorkspace() {
+  let text;
+  try { text = await pickTextFile(".json,application/json"); }
+  catch (e) { return setStatus("load failed: " + (e && e.message || e), true); }
+  if (!text) return;
+  let ws;
+  try { ws = parseWorkspace(text); }
+  catch (e) { return setStatus("not a valid workspace file: " + (e && e.message || e), true); }
+  try {
+    const s = ws.dataset;
+    const data = buildDataset({ header: s.header, rows: s.rows, columns: s.columns, plan: s.plan, name: s.name });
+    await startApp(data);                 // rebuild + init + solve (live proposals) + wireUi
+    const res = applyFrozen((cmd) => state.fe.dispatch(cmd), ws.frozen);
+    const rep = state.fe.dispatch({ op: "report" });
+    if (rep.ok) { state.report = rep.report; rebuild(); }
+    state.tags.restore(ws.tags);
+    render();
+    const warn = res.failed ? ` (⚠ ${res.failed} decision(s) could not be re-applied)` : "";
+    setStatus(`loaded workspace: ${res.groups} group(s) + ${res.singles} frozen row(s) restored${warn}`);
+  } catch (e) {
+    setStatus("load failed: " + (e && e.message || e), true);
+  }
+}
+
+function exportResult(fmt) {
+  if (!fmt) return;
+  try {
+    const base = slug(state.data.pair);
+    const assignments = primaryAssignments(state.report);
+    if (fmt === "rows")
+      download(`${base}.results.csv`, resultsCsv({ data: state.data, report: state.report, assignments }), "text/csv");
+    else if (fmt === "groups")
+      download(`${base}.groups.csv`, groupsCsv({ report: state.report }), "text/csv");
+    else if (fmt === "json")
+      download(`${base}.result.json`, resultJson({ data: state.data, report: state.report }), "application/json");
+    setStatus(`exported ${fmt}`);
+  } catch (e) {
+    setStatus("export failed: " + (e && e.message || e), true);
+  }
+}
+
 function wireUi() {
   $("recalc").onclick = () => solve();
+  $("save-ws").onclick = saveWorkspace;
+  $("load-ws").onclick = loadWorkspace;
+  $("export-fmt").onchange = (e) => { const v = e.target.value; e.target.value = ""; exportResult(v); };
   $("reset").onclick = () => { state.filters.clear(); state.selectedGids.clear(); state.selectedLines.clear(); state.search = ""; boot2(); };
-  $("clear-filters").onclick = () => { state.filters.clear(); render(); };
+  $("clear-filters").onclick = () => { state.filters.clear(); renderFiltered(); };
   $("clear-groupsel").onclick = () => { state.selectedGids.clear(); render(); };
   $("freeze-clean").onclick = () => {
     const r = state.fe.dispatch({ op: "freeze_clean", tol: TOL });

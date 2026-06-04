@@ -3,8 +3,8 @@ use crate::flow::Model;
 use crate::plan::{Cond, CostSpec, Plan, PlanNode};
 use crate::row::{PhysicalRow, ColumnMap};
 use crate::strategy::{
-    SoakMode, Strategy, agg_net, branch, exact_1to1_any, fixed_point, flow, partition_by, pivot,
-    seq, signal_group, soak_all, soak_small, windowed,
+    SoakMode, Strategy, agg_net, branch, exact_1to1_any, fixed_point, flow, labeled, partition_by,
+    pivot, seq, signal_group, soak_all, soak_small, windowed,
 };
 
 #[derive(Clone)]
@@ -55,9 +55,20 @@ impl Model for PlanModel {
         let amount_equal = a_amount != 0 && a_amount.abs() == b_amount.abs();
         let dd = (a.int(self.day) - b.int(self.day)).abs();
         for tier in &self.cost.tiers {
+            // A tier may relax AmountEqual to a relative tolerance in bps of the
+            // smaller leg; `None` keeps strict equality.
+            let amount_ok = match tier.amount_bps {
+                None => amount_equal,
+                Some(bps) => {
+                    a_amount != 0
+                        && b_amount != 0
+                        && (a_amount.abs() - b_amount.abs()).abs()
+                            <= a_amount.abs().min(b_amount.abs()) * bps.max(0) / 10_000
+                }
+            };
             let holds = tier.when.iter().all(|c| match c {
                 Cond::TokenShared => token_shared,
-                Cond::AmountEqual => amount_equal,
+                Cond::AmountEqual => amount_ok,
             });
             if !holds {
                 continue;
@@ -97,25 +108,26 @@ fn compile_node(
             }
             seq(compiled)
         }
+        PlanNode::Label { tag, inner } => labeled(tag.clone(), compile_node(inner, map)?),
         PlanNode::FixedPoint { inner, max } => {
             fixed_point(compile_node(inner, map)?, *max)
         }
         PlanNode::Partition { by, inner } => {
-            let k = map.int_index(by)?;
+            let key = by.compile(map)?;
             compile_node(inner, map)?;
             let inner = (**inner).clone();
             let map_clone = map.clone();
             let factory = move || compile_node(&inner, &map_clone).expect("already validated");
-            partition_by(move |r: &PhysicalRow| r.int(k), factory)
+            partition_by(move |r: &PhysicalRow| key(r), factory)
         }
         PlanNode::Branch {
             pred,
             and_then,
             or_else,
         } => {
-            let p = map.int_index(pred)?;
+            let p = pred.compile(map)?;
             branch(
-                move |r: &PhysicalRow| r.int(p) != 0,
+                move |r: &PhysicalRow| p(r) != 0,
                 compile_node(and_then, map)?,
                 compile_node(or_else, map)?,
             )
@@ -125,23 +137,23 @@ fn compile_node(
             width,
             inner,
         } => {
-            let o = map.int_index(order)?;
+            let o = order.compile(map)?;
             windowed(
-                move |r: &PhysicalRow| r.int(o),
+                move |r: &PhysicalRow| o(r),
                 *width,
                 compile_node(inner, map)?,
             )
         }
         PlanNode::Pivot { amount, inner } => {
-            let a = map.int_index(amount)?;
+            let a = amount.compile(map)?;
             pivot(
-                move |r: &PhysicalRow| r.int(a),
+                move |r: &PhysicalRow| a(r),
                 compile_node(inner, map)?,
             )
         }
         PlanNode::AggNet { key, tol } => {
-            let k = map.int_index(key)?;
-            agg_net(move |r: &PhysicalRow| r.int(k) as u64, *tol)
+            let k = key.compile(map)?;
+            agg_net(move |r: &PhysicalRow| k(r) as u64, *tol)
         }
         PlanNode::Exact {} => exact_1to1_any(),
         PlanNode::Signal { signals, tol, cap } => {

@@ -61,11 +61,15 @@ enum Cmd {
         net: i64,
         #[serde(default)]
         origin: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
     },
     GroupAllocations {
         allocations: Vec<AllocationSpec>,
         #[serde(default)]
         origin: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
     },
     RemoveAllocations { group_id: u64, ids: Vec<ExtId> },
     Ungroup { ids: Vec<ExtId> },
@@ -156,7 +160,7 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd, arrow_bytes: &[u8]) -> Envelope
             Err(e) => Err(e),
         },
         Cmd::Remove { ids } => {
-            ids.into_iter().for_each(|id| ws.remove(id));
+            ws.remove_many(&ids);
             Ok(())
         }
         Cmd::Solve => ws.solve(),
@@ -171,14 +175,15 @@ fn apply(slot: &mut Option<Workspace>, cmd: Cmd, arrow_bytes: &[u8]) -> Envelope
         }
         Cmd::Unfreeze { group_id } => ws.unfreeze(group_id),
         Cmd::Breakup { group_id } => ws.breakup(group_id),
-        Cmd::Group { ids, net, origin } => ws
-            .group(&ids, net, origin.as_deref().unwrap_or("manual"))
+        Cmd::Group { ids, net, origin, reason } => ws
+            .group(&ids, net, origin.as_deref().unwrap_or("manual"), reason)
             .map(|_| ()),
         Cmd::GroupAllocations {
             allocations,
             origin,
+            reason,
         } => ws
-            .group_allocations(&allocations, origin.as_deref().unwrap_or("manual"))
+            .group_allocations(&allocations, origin.as_deref().unwrap_or("manual"), reason)
             .map(|_| ()),
         Cmd::RemoveAllocations { group_id, ids } => ws.remove_allocations(group_id, &ids),
         Cmd::Ungroup { ids } => ws.ungroup(&ids),

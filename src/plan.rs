@@ -32,10 +32,17 @@ use crate::plan_compile::compile;
 /// is no separate stateless `solve` export or `SolveRequest` shape -- a batch
 /// solve is just `init` + `solve` on a workspace the caller discards. Column
 /// identity still rides in the Arrow batch schema (the schema *is* the map).
-pub const CONTRACT_VERSION: u32 = 10;
+/// v11 generalizes plan selectors (`branch.pred`, `partition.by`,
+/// `windowed.order`, `agg_net.key`, `pivot.amount`) from a bare column name to a
+/// [`Sel`](crate::sel::Sel) integer expression. Backward compatible on the
+/// wire: a bare JSON string still parses as a column reference, so every v10
+/// plan is a valid v11 plan.
+pub const CONTRACT_VERSION: u32 = 13;
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use crate::row::{PhysicalRow, ColumnMap};
+pub use crate::sel::Sel;
+pub use crate::strategy::Tol;
 
 use crate::strategy::{Item, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,6 +78,10 @@ pub struct Plan {
 pub enum PlanNode {
     /// Cascade: each step runs on the previous step's residual.
     Seq { steps: Vec<PlanNode> },
+    /// Stamp an author `tag` onto every group `inner` produces (its report
+    /// `reason`), naming a stage ("S3a exact", "intercompany netting") without
+    /// changing what forms the group. Residual lots are never labeled.
+    Label { tag: String, inner: Box<PlanNode> },
     /// Repeat `inner` on its own residual until it reaches a fixed point (a pass
     /// that groups nothing more) or `max` passes elapse. State inside `inner`
     /// (e.g. a warm flow `Matcher`) persists across passes; every node treats
@@ -81,29 +92,32 @@ pub enum PlanNode {
         #[cfg_attr(feature = "serde", serde(default = "default_fixed_point_passes"))]
         max: usize,
     },
-    /// Fork/join shard by a scalar column/expression, run `inner` per shard.
-    Partition { by: String, inner: Box<PlanNode> },
-    /// Route rows by a boolean column/expression, run different child subtrees
-    /// on each side, then join. This is a structural split; both sides conserve.
+    /// Fork/join shard by a scalar [`Sel`] key, run `inner` per shard.
+    Partition { by: Sel, inner: Box<PlanNode> },
+    /// Route rows by a [`Sel`] predicate (non-zero = true), run different child
+    /// subtrees on each side, then join. A structural split; both sides conserve.
     Branch {
-        pred: String,
+        pred: Sel,
         and_then: Box<PlanNode>,
         or_else: Box<PlanNode>,
     },
-    /// Run `inner` within a sliding window over an integer order expression.
+    /// Run `inner` within a sliding window over an integer order [`Sel`].
     Windowed {
-        order: String,
+        order: Sel,
         width: i64,
         inner: Box<PlanNode>,
     },
-    /// Temporarily match `inner` in another numeraire, converting produced
-    /// allocations and residuals back to the caller's active amount on exit.
+    /// Temporarily match `inner` in another numeraire (a [`Sel`] expression),
+    /// converting produced allocations and residuals back to the caller's active
+    /// amount on exit. The conserving boundary makes the `amount` expression
+    /// safe: it sets apportionment ratios, never the conserved total.
     Pivot {
-        amount: String,
+        amount: Sel,
         inner: Box<PlanNode>,
     },
-    /// Accept an aggregation bucket (`key`) that nets to zero in `tol`.
-    AggNet { key: String, tol: i64 },
+    /// Accept an aggregation bucket (a [`Sel`] `key`) that nets to zero within
+    /// `tol` (absolute, or relative to the bucket's smallest leg; see [`Tol`]).
+    AggNet { key: Sel, tol: Tol },
     /// Pair opposite-sign rows with equal current amount magnitude.
     Exact {},
     /// Group rows that share an out-of-band token signal and net to zero.
@@ -183,6 +197,11 @@ pub struct CostTier {
     pub day_slope: f64,
     #[cfg_attr(feature = "serde", serde(default))]
     pub max_day: Option<i64>,
+    /// Tolerance, in basis points of the smaller leg, for this tier's
+    /// [`Cond::AmountEqual`]. `None` means strict equality; `Some(10)` accepts
+    /// amounts within 0.1% of each other (the relative-tolerance idiom).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub amount_bps: Option<i64>,
 }
 
 /// The flow arbiter's cost model as ordered confidence tiers. This is the last
@@ -206,27 +225,56 @@ impl Default for CostSpec {
                     base: 1.5,
                     day_slope: 0.002,
                     max_day: None,
+                    amount_bps: None,
                 },
                 CostTier {
                     when: vec![Cond::TokenShared],
                     base: 2.0,
                     day_slope: 0.002,
                     max_day: None,
+                    amount_bps: None,
                 },
                 CostTier {
                     when: vec![Cond::AmountEqual],
                     base: 4.5,
                     day_slope: 0.02,
                     max_day: Some(92),
+                    amount_bps: None,
                 },
             ],
         }
     }
 }
 
-fn conservation_airlock(input: usize, accounted: usize) -> Result<(), ApiError> {
-    if accounted != input {
-        return Err(ApiError::ConservationViolated { input, accounted });
+/// Amount-conservation guard for the allocation-native report. The report is a
+/// lot hypergraph, so a row may be split across many groups — or, when its
+/// amount is zero, appear in no allocation at all. Row *presence* is therefore
+/// the wrong invariant; what must hold is that every input id's allocations sum
+/// to its original amount. `originals` is the authoritative input set (id ->
+/// original amount); `allocated` is the per-id sum over every group allocation.
+fn conservation_airlock(
+    originals: &BTreeMap<ExtId, i64>,
+    allocated: &BTreeMap<ExtId, i64>,
+) -> Result<(), ApiError> {
+    for (&id, &original) in originals {
+        let accounted = allocated.get(&id).copied().unwrap_or(0);
+        if accounted != original {
+            return Err(ApiError::ConservationViolated {
+                id,
+                original,
+                accounted,
+            });
+        }
+    }
+    // No allocation may reference an id absent from the input set.
+    for (&id, &accounted) in allocated {
+        if !originals.contains_key(&id) {
+            return Err(ApiError::ConservationViolated {
+                id,
+                original: 0,
+                accounted,
+            });
+        }
     }
     Ok(())
 }
@@ -293,7 +341,7 @@ impl Session {
     fn run_strategy(
         &self,
         plan: &Plan,
-    ) -> Result<(usize, crate::strategy::Resolution<PhysicalRow>), ApiError> {
+    ) -> Result<(BTreeMap<ExtId, i64>, crate::strategy::Resolution<PhysicalRow>), ApiError> {
         // Session is a stateless one-shot: compile the cold flow leaf.
         let compiled = compile(plan, &self.map)?;
         let mut strategy = compiled.strategy;
@@ -304,21 +352,21 @@ impl Session {
             .iter()
             .map(|(id, row)| Item::new(*id, row.int(compiled.primary), row.clone()))
             .collect();
-        let input = bag.len();
-        Ok((input, strategy.run(bag)))
+        let originals: BTreeMap<ExtId, i64> = bag.iter().map(|i| (i.id, i.original)).collect();
+        Ok((originals, strategy.run(bag)))
     }
 
     /// Run a plan over the current rows and return the allocation hypergraph.
     /// `allocations` is the single source of truth; row/group views are client
     /// projections over the report.
     pub fn solve(&self, plan: &Plan) -> Result<Report, ApiError> {
-        let (input, res) = self.run_strategy(plan)?;
-        report_from_resolution(input, res)
+        let (originals, res) = self.run_strategy(plan)?;
+        report_from_resolution(&originals, res)
     }
 }
 
 fn report_from_resolution(
-    input: usize,
+    originals: &BTreeMap<ExtId, i64>,
     res: crate::strategy::Resolution<PhysicalRow>,
 ) -> Result<Report, ApiError> {
     let mut groups = res.groups;
@@ -343,6 +391,7 @@ fn report_from_resolution(
             net: g.net,
             size: g.members.len(),
             status: Status::Live,
+            reason: g.reason,
         });
     }
 
@@ -362,12 +411,16 @@ fn report_from_resolution(
             net: i.amount,
             size: 1,
             status: Status::Live,
+            reason: None,
         });
     }
     allocations.sort_by_key(|a| (a.id, a.group_id));
 
-    let accounted: BTreeSet<ExtId> = allocations.iter().map(|a| a.id).collect();
-    conservation_airlock(input, accounted.len())?;
+    let allocated: BTreeMap<ExtId, i64> = allocations.iter().fold(BTreeMap::new(), |mut m, a| {
+        *m.entry(a.id).or_insert(0) += a.amount;
+        m
+    });
+    conservation_airlock(originals, &allocated)?;
 
     Ok(Report {
         groups: group_out,
@@ -392,6 +445,7 @@ struct GroupRec {
     origin: String,
     net: i64,
     status: Status,
+    reason: Option<String>,
 }
 
 impl GroupRec {
@@ -473,6 +527,7 @@ impl<E: Clone> Recon<E> {
             origin: "unmatched".to_string(),
             net: amount,
             status: Status::Live,
+            reason: None,
         });
         self.next_id += 1;
     }
@@ -492,6 +547,7 @@ impl<E: Clone> Recon<E> {
             allocations: vec![alloc],
             origin: "unmatched".to_string(),
             status: Status::Live,
+            reason: None,
         });
         self.next_id += 1;
     }
@@ -499,7 +555,14 @@ impl<E: Clone> Recon<E> {
     /// Insert or replace an item. A new id starts life as a live singleton
     /// group; the caller re-solves to fold it into matches.
     pub fn upsert(&mut self, id: ExtId, item: E) {
-        if self.items.insert(id, item).is_none() && !self.in_group(id) {
+        // A new id (insert returned None) cannot already be in a group: every
+        // grouped id is, by invariant, present in `items` (live singletons
+        // early-return on `items.get`; frozen/match groups are built from items
+        // and `remove` prunes them). So the old `&& !self.in_group(id)` guard
+        // was always true here — and, since it scans every group, it made a
+        // bulk init O(n^2) (each of n upserts scanning the growing singleton
+        // pool). Dropping it keeps init O(n log n) with identical semantics.
+        if self.items.insert(id, item).is_none() {
             self.push_live_singleton(id);
         }
     }
@@ -507,19 +570,35 @@ impl<E: Clone> Recon<E> {
     /// Remove an item from the workspace and from its group. A match that loses
     /// a member dissolves; its survivor returns to a fresh live singleton.
     pub fn remove(&mut self, id: ExtId) {
-        self.items.remove(&id);
+        self.remove_many(&[id]);
+    }
+
+    /// Remove many items in a single pass over the groups. Removing ids one at a
+    /// time is O(groups) per id (each `remove` scans every group), so a bulk
+    /// delete of m ids over n groups is O(n*m) — quadratic when m ~ n. This does
+    /// one `retain_mut` over the groups regardless of how many ids are dropped,
+    /// with identical end-state semantics to looping `remove`.
+    pub fn remove_many(&mut self, ids: &[ExtId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let victims: BTreeSet<ExtId> = ids.iter().copied().collect();
+        for id in &victims {
+            self.items.remove(id);
+        }
         let mut orphaned = Vec::new();
         self.groups.retain_mut(|g| {
-            if !g.contains(id) {
+            // Untouched groups pass through without rebuilding net.
+            if !g.allocations.iter().any(|a| victims.contains(&a.id)) {
                 return true;
             }
-            g.allocations.retain(|a| a.id != id);
+            g.allocations.retain(|a| !victims.contains(&a.id));
             g.net = g.allocations.iter().map(|a| a.amount).sum();
             if g.allocations.is_empty() {
                 false
             } else if g.size() == 1 {
-                // A match reduced to one allocation can no longer net; its survivor
-                // returns to the live pool as a fresh singleton.
+                // A match reduced to one allocation can no longer net; its
+                // survivor returns to the live pool as a fresh singleton.
                 orphaned.extend(g.allocations.iter().cloned());
                 false
             } else {
@@ -531,6 +610,7 @@ impl<E: Clone> Recon<E> {
         }
     }
 
+    #[allow(dead_code)]
     fn in_group(&self, id: ExtId) -> bool {
         self.groups.iter().any(|g| g.contains(id))
     }
@@ -540,7 +620,6 @@ impl<E: Clone> Recon<E> {
     /// live singleton for each leftover. Frozen groups are kept verbatim with
     /// stable ids.
     pub fn solve(&mut self) -> Result<(), ApiError> {
-        let total = self.items.len();
         let mut frozen: BTreeMap<ExtId, i64> = BTreeMap::new();
         for g in self.groups.iter().filter(|g| g.is_frozen()) {
             for a in &g.allocations {
@@ -583,6 +662,7 @@ impl<E: Clone> Recon<E> {
                 origin: g.origin,
                 net: g.net,
                 status: Status::Live,
+                reason: g.reason,
             });
             self.next_id += 1;
         }
@@ -592,12 +672,20 @@ impl<E: Clone> Recon<E> {
         for item in res.residual {
             self.singleton_from_item(item);
         }
-        let accounted: BTreeSet<ExtId> = self
+        let allocated: BTreeMap<ExtId, i64> = self
             .groups
             .iter()
-            .flat_map(|g| g.allocations.iter().map(|a| a.id))
+            .flat_map(|g| g.allocations.iter())
+            .fold(BTreeMap::new(), |mut m, a| {
+                *m.entry(a.id).or_insert(0) += a.amount;
+                m
+            });
+        let originals: BTreeMap<ExtId, i64> = self
+            .items
+            .iter()
+            .map(|(id, item)| (*id, (self.primary)(item)))
             .collect();
-        conservation_airlock(total, accounted.len())?;
+        conservation_airlock(&originals, &allocated)?;
         Ok(())
     }
 
@@ -667,7 +755,7 @@ impl<E: Clone> Recon<E> {
     /// for those row ids into one frozen manual group. Allocation-native clients
     /// should prefer [`group_allocations`](Recon::group_allocations) when they
     /// want to target exact residual amounts.
-    pub fn group(&mut self, ids: &[ExtId], net: i64, origin: &str) -> Result<u64, ApiError> {
+    pub fn group(&mut self, ids: &[ExtId], net: i64, origin: &str, reason: Option<String>) -> Result<u64, ApiError> {
         let mut members: Vec<ExtId> = Vec::new();
         for &id in ids {
             if !members.contains(&id) {
@@ -713,6 +801,7 @@ impl<E: Clone> Recon<E> {
             // amounts are known yet (e.g. manual grouping before first solve).
             net: if alloc_net == 0 { net } else { alloc_net },
             status: Status::Frozen,
+            reason,
         });
         Ok(id)
     }
@@ -725,6 +814,7 @@ impl<E: Clone> Recon<E> {
         &mut self,
         specs: &[AllocationSpec],
         origin: &str,
+        reason: Option<String>,
     ) -> Result<u64, ApiError> {
         let mut want: BTreeMap<ExtId, i64> = BTreeMap::new();
         for s in specs {
@@ -761,6 +851,7 @@ impl<E: Clone> Recon<E> {
             origin: origin.to_string(),
             net,
             status: Status::Frozen,
+            reason,
         });
         Ok(id)
     }
@@ -978,6 +1069,7 @@ impl<E: Clone> Recon<E> {
                 net: g.net,
                 size: g.size(),
                 status: g.status,
+                reason: g.reason.clone(),
             });
         }
         allocations.sort_by_key(|a| (a.id, a.group_id));
@@ -1059,7 +1151,7 @@ mod tests {
 
     fn full_pipeline() -> Plan {
         plan(PlanNode::Seq { steps: vec![
-            PlanNode::AggNet { key: "objsub".into(), tol: 0 },
+            PlanNode::AggNet { key: "objsub".into(), tol: Tol::Abs(0) },
             PlanNode::Exact {},
             PlanNode::Signal { signals: "tokens".into(), tol: 0, cap: 256 },
             PlanNode::Flow { day: "day".into(), tokens: "tokens".into(), penalty: 1000.0, window: 30, cost: CostSpec::default() },
@@ -1096,5 +1188,31 @@ mod tests {
             serde_json::from_str::<PlanNode>(&serde_json::to_string(&explicit).unwrap()).unwrap(),
             explicit,
         );
+    }
+
+    #[test]
+    fn zero_amount_row_conserves() {
+        // A zero-amount row legitimately yields no allocation in the lot
+        // hypergraph. Conservation is by amount, not row presence, so this must
+        // NOT trip the airlock. (Regression: real files carry blank/$0 rows.)
+        let mut s = Session::new(map());
+        s.upsert(1, row(100, 1, 0, 999, &[])).unwrap();
+        s.upsert(2, row(-100, 2, 0, -999, &[])).unwrap();
+        s.upsert(3, row(0, 3, 0, 0, &[])).unwrap(); // blank amount -> 0
+        let rep = s.solve(&full_pipeline()).unwrap();
+        // The pair nets; the zero row simply has no lot. Amounts conserve.
+        assert!(rep.allocations.iter().all(|a| a.id != 3) || rep.allocations.iter().any(|a| a.id == 3 && a.amount == 0));
+        assert!(rep.allocations.iter().any(|a| a.id == 1));
+        assert!(rep.allocations.iter().any(|a| a.id == 2));
+    }
+
+    #[test]
+    fn workspace_zero_amount_row_conserves() {
+        // Same invariant through the interactive Workspace/Recon solve path.
+        let mut ws = Workspace::new(map(), full_pipeline()).unwrap();
+        ws.upsert(1, row(100, 1, 0, 999, &[]));
+        ws.upsert(2, row(-100, 2, 0, -999, &[]));
+        ws.upsert(3, row(0, 3, 0, 0, &[]));
+        ws.solve().unwrap(); // must not return ConservationViolated
     }
 }

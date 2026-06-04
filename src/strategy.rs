@@ -74,11 +74,50 @@ pub struct Group {
     pub origin: String,
     /// Residual in the canonical numeraire; zero means it nets out.
     pub net: i64,
+    /// Optional human-facing explanation of *why* the group formed, distinct
+    /// from the machine `origin`. Stamped by the [`labeled`] combinator (the
+    /// author tag) and surfaced to clients on the report. `None` for an
+    /// unlabeled group; residual singletons are never labeled.
+    pub reason: Option<String>,
 }
 
 impl Group {
     pub fn member_ids(&self) -> Vec<ExtId> {
         self.members.iter().map(|a| a.id).collect()
+    }
+}
+
+/// An acceptance tolerance for a netting primitive. `Abs` is a fixed slack in
+/// the active numeraire; `Rel` is proportional — `bps` basis points of the
+/// bucket's smallest non-zero leg, but never below `floor`. Relative tolerance
+/// is the common reconciliation idiom ("within 0.1% of the smaller side"); it
+/// stays integer-exact, so conservation is untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(untagged))]
+pub enum Tol {
+    Abs(i64),
+    Rel { bps: i64, floor: i64 },
+}
+
+impl Tol {
+    /// The effective integer slack given the bucket's reference `scale` (its
+    /// smallest non-zero leg magnitude).
+    pub fn slack(&self, scale: i64) -> i64 {
+        match *self {
+            Tol::Abs(t) => t,
+            Tol::Rel { bps, floor } => {
+                let rel =
+                    (scale.unsigned_abs() as i128 * bps.max(0) as i128 / 10_000) as i64;
+                rel.max(floor.max(0))
+            }
+        }
+    }
+}
+
+impl From<i64> for Tol {
+    fn from(t: i64) -> Self {
+        Tol::Abs(t)
     }
 }
 
@@ -147,6 +186,39 @@ impl<E> Strategy<E> for Seq<E> {
 /// groups. This is the macro -> flow -> ... pipeline as a fold.
 pub fn seq<E: 'static>(steps: Vec<Box<dyn Strategy<E>>>) -> Box<dyn Strategy<E>> {
     Box::new(Seq { steps })
+}
+
+struct Labeled<E> {
+    tag: String,
+    inner: Box<dyn Strategy<E>>,
+}
+
+impl<E> Strategy<E> for Labeled<E> {
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let mut r = self.inner.run(bag);
+        for g in &mut r.groups {
+            g.reason = Some(match g.reason.take() {
+                Some(detail) => format!("{}: {}", self.tag, detail),
+                None => self.tag.clone(),
+            });
+        }
+        r
+    }
+}
+
+/// Stamp an author `tag` onto every group a subtree produces (in its `reason`
+/// field), prepending to any detail an inner label already set. Labeling is
+/// orthogonal to *what* forms the group, so it is a combinator rather than a
+/// field on every node: wrap a stage to name it ("S3a exact", "intercompany
+/// netting"). Residual lots are not groups, so they are never labeled.
+pub fn labeled<E: 'static>(
+    tag: impl Into<String>,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>> {
+    Box::new(Labeled {
+        tag: tag.into(),
+        inner,
+    })
 }
 
 struct FixedPoint<E> {
@@ -467,6 +539,7 @@ where
                         ],
                         origin: "exact_1to1".to_string(),
                         net: 0,
+                        reason: Some("exact 1:1 pair".to_string()),
                     });
                 }
                 residual.extend(pos);
@@ -496,7 +569,7 @@ pub fn exact_1to1_any<E: 'static>() -> Box<dyn Strategy<E>> {
 
 struct AggNet<E, FK> {
     key: FK,
-    tol: i64,
+    tol: Tol,
     _e: PhantomData<E>,
 }
 
@@ -520,7 +593,15 @@ where
                 let a = i.amount;
                 (p || a > 0, n || a < 0)
             });
-            if items.len() >= 2 && sum.abs() <= self.tol && signs.0 && signs.1 {
+            // Relative tolerance scales off the bucket's smallest non-zero leg.
+            let scale = items
+                .iter()
+                .map(|i| i.amount.abs())
+                .filter(|&v| v > 0)
+                .min()
+                .unwrap_or(0);
+            let tol = self.tol.slack(scale);
+            if items.len() >= 2 && sum.abs() <= tol && signs.0 && signs.1 {
                 groups.push(Group {
                     members: items
                         .iter()
@@ -531,6 +612,7 @@ where
                         .collect(),
                     origin: "agg_net".to_string(),
                     net: sum,
+                    reason: Some("aggregate net".to_string()),
                 });
             } else {
                 residual.extend(items);
@@ -541,15 +623,15 @@ where
 }
 
 /// Accept a whole aggregation bucket (e.g. an `objsub`, or a balance-sheet-level
-/// set) when it nets to zero within `tol`. The macro net-to-zero pre-filter:
-/// confirmation, not optimization.
-pub fn agg_net<E: 'static, FK>(key: FK, tol: i64) -> Box<dyn Strategy<E>>
+/// set) when it nets to zero within `tol` (absolute or relative; see [`Tol`]).
+/// The macro net-to-zero pre-filter: confirmation, not optimization.
+pub fn agg_net<E: 'static, FK>(key: FK, tol: impl Into<Tol>) -> Box<dyn Strategy<E>>
 where
     FK: Fn(&E) -> u64 + 'static,
 {
     Box::new(AggNet {
         key,
-        tol,
+        tol: tol.into(),
         _e: PhantomData,
     })
 }
@@ -587,6 +669,7 @@ where
                         .collect(),
                     origin: "running_zero".to_string(),
                     net: acc,
+                    reason: Some("running-balance zero".to_string()),
                 });
                 seg.clear();
                 acc = 0;
@@ -667,6 +750,7 @@ where
                         .collect(),
                     origin: "signal_group".to_string(),
                     net: sum,
+                    reason: Some("shared reference".to_string()),
                 });
             }
         }
@@ -889,6 +973,7 @@ where
                 members: g.members,
                 origin: "flow".to_string(),
                 net: g.net_base,
+                reason: Some("min-cost flow".to_string()),
             })
             .collect();
         let unmatched: HashMap<ExtId, i64> = self
@@ -1102,6 +1187,7 @@ where
                         }],
                         origin: self.origin.clone(),
                         net: item.amount,
+                        reason: None,
                     }),
                     SoakMode::Bucket => buckets.entry((self.key)(&item)).or_default().push(item),
                 }
@@ -1121,6 +1207,7 @@ where
                     .collect(),
                 origin: format!("{}:{}", self.origin, k.to_string()),
                 net,
+                reason: None,
             });
         }
         Resolution { groups, residual }
@@ -1199,6 +1286,7 @@ where
                     }],
                     origin: self.origin.clone(),
                     net: item.amount,
+                    reason: None,
                 }),
                 SoakMode::Bucket => buckets.entry((self.key)(&item)).or_default().push(item),
             }
@@ -1215,6 +1303,7 @@ where
                     .collect(),
                 origin: format!("{}:{}", self.origin, k.to_string()),
                 net,
+                reason: None,
             });
         }
         Resolution {
@@ -1281,6 +1370,56 @@ mod tests {
     }
 
     #[test]
+    fn agg_net_relative_tolerance_scales_with_smallest_leg() {
+        // Net residual of 9 against a smallest leg of 10_000: 10 bps = 10, so it
+        // is accepted; 5 bps = 5, so it is rejected. Absolute tol would need to
+        // know the magnitude up front; Rel derives it from the bucket.
+        let b = bag(&[(1, 10_000), (2, -9_991)]);
+        let mut s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 10, floor: 0 });
+        let r = s.run(b);
+        conserves(2, &r);
+        assert_eq!(r.groups.len(), 1, "9 <= 10 (10bps of 10_000)");
+
+        let b = bag(&[(1, 10_000), (2, -9_991)]);
+        let mut s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 5, floor: 0 });
+        let r = s.run(b);
+        conserves(2, &r);
+        assert_eq!(r.groups.len(), 0, "9 > 5 (5bps of 10_000)");
+    }
+
+    #[test]
+    fn agg_net_relative_floor_applies_to_tiny_buckets() {
+        // 10 bps of 100 is 0, but the floor of 3 lets a residual of 2 net.
+        let b = bag(&[(1, 100), (2, -98)]);
+        let mut s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 10, floor: 3 });
+        let r = s.run(b);
+        conserves(2, &r);
+        assert_eq!(r.groups.len(), 1);
+    }
+
+    #[test]
+    fn labeled_stamps_reason_on_groups_but_not_residual() {
+        let b = bag(&[(1, 5), (2, -5), (3, 7)]);
+        let mut s = labeled("S3a exact", exact_1to1_any());
+        let r = s.run(b);
+        conserves(3, &r);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].reason.as_deref(), Some("S3a exact: exact 1:1 pair"));
+        // The leftover row is residual, not a group, so it carries no label.
+        assert_eq!(r.residual.len(), 1);
+        assert_eq!(r.residual[0].id, 3);
+    }
+
+    #[test]
+    fn labeled_prepends_to_inner_detail() {
+        // An inner label is preserved as detail when an outer label wraps it.
+        let b = bag(&[(1, 5), (2, -5)]);
+        let mut s = labeled("outer", labeled("inner", exact_1to1_any()));
+        let r = s.run(b);
+        assert_eq!(r.groups[0].reason.as_deref(), Some("outer: inner: exact 1:1 pair"));
+    }
+
+    #[test]
     fn exact_pairs_and_leaves_residual() {
         let b = bag(&[(1, 5), (2, -5), (3, 5), (4, 3)]);
         let mut s = exact_1to1_any();
@@ -1336,7 +1475,7 @@ mod tests {
                                 residual.push(item);
                             }
                         }
-                        let g = Group { members, origin: "onepair".into(), net: 0 };
+                        let g = Group { members, origin: "onepair".into(), net: 0, reason: None };
                         return Resolution { groups: vec![g], residual };
                     }
                 }

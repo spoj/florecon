@@ -82,14 +82,13 @@ const tick = (ms) => new Promise((r) => setTimeout(r, ms));
   Object.defineProperty(input, "files", { value: [new window.File([csv], "book.csv")], configurable: true });
   input.dispatchEvent(new window.Event("change"));
   await tick(200);
-  ok(!$("map-panel").hidden, "mapping panel shown after upload");
-  ok($("map-tokens").multiple, "reference text is a multi-select");
-  ok($("map-partitions").multiple, "partition is a multi-select");
-
-  $("map-amount").value = "4"; $("map-gkey").value = "2"; $("map-date").value = "3";
-  for (const o of $("map-partitions").options) if (o.value === "0" || o.value === "1") o.selected = true;
-  for (const o of $("map-tokens").options) if (o.value === "5" || o.value === "6") o.selected = true;
-  $("map-tol").value = "0.01"; // dollars -> 1 cent
+  ok(!$("map-panel").hidden, "column picker shown after upload");
+  ok($("col-body").children.length === 7, "a row per CSV column, got " + $("col-body").children.length);
+  // The picker auto-guesses kinds; assert the conserved Amount was detected and
+  // chosen as primary, then run with the auto-built default plan (editor blank).
+  ok($("kind-4").value === "amount", "Amount column guessed as amount: " + $("kind-4").value);
+  ok($("prim-4").checked, "Amount chosen as conserved primary");
+  ok(!$("plan-json").value, "plan editor blank -> default plan");
   $("run-recon").dispatchEvent(new window.Event("click"));
   await tick(600);
   ok($("setup-err").textContent === "", "no error: " + $("setup-err").textContent);
@@ -101,8 +100,8 @@ const tick = (ms) => new Promise((r) => setTimeout(r, ms));
     gid: tr.dataset.gid,
     no: tr.children[1]?.textContent.trim(),
     origin: tr.children[2]?.textContent.trim(),
-    size: tr.children[3]?.textContent.trim(),
-    net: tr.children[5]?.textContent.trim(),
+    size: tr.children[4]?.textContent.trim(),
+    net: tr.children[6]?.textContent.trim(),
   }));
   const before = groupRows();
   ok(before.length >= 2, "upload rendered matched groups");

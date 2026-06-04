@@ -10,7 +10,7 @@ import wasmtime
 from .data import KEY, NUMBER, TOKENS, cat
 
 # Must equal the engine's abi_version() export (plan::CONTRACT_VERSION).
-CONTRACT_VERSION = 10
+CONTRACT_VERSION = 13
 
 
 class ContractMismatch(RuntimeError):
@@ -214,20 +214,22 @@ class Workspace:
         self.last = self.fe.dispatch({"op": "breakup", "group_id": group_id})
         return _ok(self.last)
 
-    def group(self, ids, net: int = 0, origin: str = "manual") -> dict:
+    def group(self, ids, net: int = 0, origin: str = "manual", reason=None) -> dict:
         """Manually assert a frozen group over all live allocation mass for `ids`.
         `net` is used only when no allocation amounts are known yet."""
-        self.last = self.fe.dispatch(
-            {"op": "group", "ids": list(ids), "net": int(net), "origin": origin}
-        )
+        cmd = {"op": "group", "ids": list(ids), "net": int(net), "origin": origin}
+        if reason is not None:
+            cmd["reason"] = str(reason)
+        self.last = self.fe.dispatch(cmd)
         return _ok(self.last)
 
-    def group_allocations(self, allocations, origin: str = "manual") -> dict:
+    def group_allocations(self, allocations, origin: str = "manual", reason=None) -> dict:
         """Manually assert a frozen group over exact allocation amounts.
         `allocations` is an iterable of {"id": ..., "amount": ...}."""
-        self.last = self.fe.dispatch(
-            {"op": "group_allocations", "allocations": list(allocations), "origin": origin}
-        )
+        cmd = {"op": "group_allocations", "allocations": list(allocations), "origin": origin}
+        if reason is not None:
+            cmd["reason"] = str(reason)
+        self.last = self.fe.dispatch(cmd)
         return _ok(self.last)
 
     def remove_allocations(self, group_id: int, ids) -> dict:

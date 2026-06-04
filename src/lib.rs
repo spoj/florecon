@@ -53,6 +53,7 @@
 pub mod engine;
 pub mod error;
 pub mod arrow;
+pub mod sel;
 
 pub mod flow;
 

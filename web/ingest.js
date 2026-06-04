@@ -60,6 +60,20 @@ export function toInt(raw) {
   return Number.isFinite(n) ? Math.round(n) : 0;
 }
 
+// A free-form numeric column for *display only* (extra columns the engine does
+// not reconcile): strips symbols/separators/parenthesised negatives but keeps
+// the natural magnitude (NOT scaled to cents). Blank/unparseable -> 0.
+export function toNum(raw) {
+  let s = String(raw ?? "").trim();
+  if (!s) return 0;
+  let neg = false;
+  if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1); }
+  s = s.replace(/[^0-9.\-]/g, "");
+  const n = Number(s);
+  if (!Number.isFinite(n)) return 0;
+  return neg ? -n : n;
+}
+
 // Date string -> epoch day (days since 1970-01-01, UTC). Unparseable -> 0.
 export function toEpochDay(raw) {
   const s = String(raw ?? "").trim();
@@ -70,106 +84,196 @@ export function toEpochDay(raw) {
 }
 
 // ---- dataset builder ------------------------------------------------------
-// mapping: {
-//   amount:     <colIndex>,              // required, the conserved value
-//   gkey:       <colIndex> | null,       // net-to-zero aggregation key
-//   date:       <colIndex> | null,       // for the time-windowed flow
-//   tokens:     <colIndex>[] | <colIndex> | null,  // free-text columns, concatenated
-//   partitions: [<colIndex>, ...],       // independent sub-books (0..n)
-//   tol:        <integer minor units>,   // net tolerance for "clean"
-//   name:       <string>,                // dataset label
-// }
+// buildDataset({ header, rows, columns, plan, name, derive }):
+//   columns: [{ ci, name, kind }]  - see the column-spec note below.
+//   plan:    {primary, root}       - the strategy; defaults to planFromCols.
+//   name:    <string>              - dataset label.
+//   derive:  [{ name, value(rawRow, display) }] - extra Int64 lanes a Sel can
+//            branch/partition on (materialized; opt-in memory ~ rows x lanes).
 //
 // Returns { pair, plan, fields, display, netKey, arrowBytes } — exactly the
-// shape the workbench consumes. Column identity is NOT shipped
-// separately: the engine derives it from the Arrow IPC batch schema (column 0
-// is the row id; Int64 columns are integer lanes, Utf8 columns are free text
-// the engine tokenizes).
-export function buildDataset({ header, rows, mapping }) {
-  const tol = Number.isFinite(mapping.tol) ? mapping.tol : 0;
-  const parts = mapping.partitions || [];
+// shape the workbench consumes. Column identity is NOT shipped separately: the
+// engine derives it from the Arrow IPC batch schema (column 0 is the row id;
+// Int64 columns are integer lanes, Utf8 columns are free text it tokenizes).
+// A column spec is a list of { ci, name, kind } where kind is one of:
+//   amount  - conserved money lane (Int64 cents). The plan's `primary` picks
+//             which amount column is the conserved value.
+//   number  - free integer lane (Int64, natural magnitude).
+//   date    - epoch-day lane (Int64), enables time-windowed flow.
+//   key     - hashed equality key (Int64 FNV); use for partition/agg_net keys.
+//   text    - free-text lane (Utf8) mined for shared tokens by signal/flow.
+//   display - JS-only column shown in the detail table; never enters the Arrow
+//             batch, so it costs zero engine memory and cannot perturb a solve.
+// Names are sanitised to engine identifiers and de-duplicated; the plan editor
+// references columns by these names.
+export function sanitizeName(s) {
+  let n = String(s ?? "").trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
+  if (/^[0-9]/.test(n)) n = "_" + n;
+  return n;
+}
 
-  // The Arrow columns, in the order they are emitted. Each carries the source
-  // CSV column index and the role flags the descriptor/coercion need.
-  const cols = [];
-  parts.forEach((ci, i) =>
-    cols.push({ name: `p${i}`, kind: "key", ci, label: header[ci], dim: true }));
-  if (mapping.gkey != null)
-    cols.push({ name: "gkey", kind: "key", ci: mapping.gkey, label: header[mapping.gkey], dim: true });
-  if (mapping.date != null)
-    cols.push({ name: "date", kind: "number", ci: mapping.date, label: header[mapping.date], date: true });
-  cols.push({ name: "amount", kind: "number", ci: mapping.amount, label: header[mapping.amount], amount: true });
-  // Reference text may span several CSV columns; they are concatenated into one
-  // free-text tokens column (invoice nos, refs, memos mined for shared tokens).
-  const tok = mapping.tokens;
-  const tokCis = (Array.isArray(tok) ? tok : tok != null ? [tok] : []).filter((i) => i != null);
-  if (tokCis.length)
-    cols.push({ name: "tokens", kind: "tokens", cis: tokCis, label: tokCis.map((i) => header[i]).join(" + "), text: true });
-
-  // Plan: only the steps whose columns exist. Cheap/strict leaves first, the
-  // expensive min-cost flow last (and only when it has signals + time to use).
-  const steps = [];
-  if (mapping.gkey != null) steps.push({ op: "agg_net", key: "gkey", tol });
-  steps.push({ op: "exact" });
-  if (tokCis.length)
-    steps.push({ op: "signal", signals: "tokens", tol, cap: 256 });
-  if (tokCis.length && mapping.date != null)
-    steps.push({
-      op: "flow", day: "date",
-      tokens: "tokens", penalty: 1000.0, window: -1,
-    });
-  let plan = { op: "seq", steps };
-  for (let i = parts.length - 1; i >= 0; i--) plan = { op: "partition", by: `p${i}`, inner: plan };
-
-  // Arrow columns (one typed lane per `cols` entry) + display (human view,
-  // joined by id). `native` mirrors the engine amount so manual-group
-  const display = [];
-  const arrowCols = { id: makeVector({data: new BigInt64Array(rows.length), type: new Uint64()}) };
-  for (const c of cols) {
-    if (c.text) arrowCols[c.name] = new Array(rows.length).fill("");
-    else arrowCols[c.name] = makeVector({data: new BigInt64Array(rows.length), type: new Int64()});
+export function normalizeColumns(columns, header = []) {
+  const seen = new Set();
+  const out = [];
+  for (const c of columns || []) {
+    if (!c || c.ci == null || c.kind === "ignore" || c.include === false) continue;
+    let name = sanitizeName(c.name || header[c.ci] || `col${c.ci}`) || `col${c.ci}`;
+    let base = name, k = 2;
+    while (seen.has(name)) name = `${base}_${k++}`;
+    seen.add(name);
+    out.push({ ci: c.ci, name, kind: c.kind || "display", label: header[c.ci] || name });
   }
-  rows.forEach((r, id) => {
+  return out;
+}
 
+// The conserved column name for a normalized spec + optional explicit primary:
+// the explicit choice if valid, else the first amount column, else the first
+// number column.
+function pickPrimary(cols, primary) {
+  if (primary && cols.some((c) => c.name === primary)) return primary;
+  return (cols.find((c) => c.kind === "amount")
+    || cols.find((c) => c.kind === "number") || { name: "amount" }).name;
+}
+
+// The auto-built strategy from a normalized column spec: cheap/strict leaves
+// first (key net, exact, reference signal), the min-cost flow last and only
+// when it has both a text signal and a date to use. No auto-partitioning — that
+// is a plan-editor choice. Single source of the default, shared by buildDataset
+// and the setup screen's "Default" template so the two can never drift.
+function planFromCols(cols, { primary, tol = 0 } = {}) {
+  const keys = cols.filter((c) => c.kind === "key");
+  const texts = cols.filter((c) => c.kind === "text");
+  const dates = cols.filter((c) => c.kind === "date");
+  const steps = [];
+  if (keys.length) steps.push({ op: "agg_net", key: keys[0].name, tol });
+  steps.push({ op: "exact" });
+  if (texts.length) steps.push({ op: "signal", signals: texts[0].name, tol, cap: 256 });
+  if (texts.length && dates.length)
+    steps.push({ op: "flow", day: dates[0].name, tokens: texts[0].name, penalty: 1000.0, window: -1 });
+  return { primary: pickPrimary(cols, primary), root: { op: "seq", steps } };
+}
+
+/// The default `{primary, root}` plan for a column spec, without building the
+/// Arrow batch — cheap enough for a live template preview on the setup screen.
+export function defaultPlan(columns, { header = [], primary, tol = 0 } = {}) {
+  return planFromCols(normalizeColumns(columns, header), { primary, tol });
+}
+
+/// The engine Int64 column names a plan `Sel` may reference for this spec.
+/// `text` columns are excluded (Utf8 signal lanes, usable by signal/flow but not
+/// as a `Sel` integer); `display` columns never reach the engine.
+export function intColumns(columns, header = []) {
+  return normalizeColumns(columns, header)
+    .filter((c) => c.kind === "amount" || c.kind === "number" || c.kind === "date" || c.kind === "key")
+    .map((c) => c.name);
+}
+
+export function buildDataset({ header, rows, columns, plan, name, derive }) {
+  const N = rows.length;
+  const cols = normalizeColumns(columns, header);
+  const engineCols = cols.filter((c) => c.kind !== "display"); // typed Arrow lanes
+  const displayCols = cols.filter((c) => c.kind === "display"); // JS-only columns
+  const prim = pickPrimary(cols, plan && plan.primary);
+  const dateCol = cols.find((c) => c.kind === "date"); // alias for the month slicer
+
+  // Derived Int64 lanes: full-JS columns computed at ingest and shipped in the
+  // batch so a plan `Sel` can branch/partition on them by name. Materialized
+  // (memory ~ rows x lanes), so opt-in. `value(rawRow, display)` returns a number.
+  const derived = (derive || []).filter((d) => d && d.name && typeof d.value === "function");
+
+  // Display-only column kind detection (numeric / low-card dim / free text).
+  const numRe = /^[\s$()+\-]*[\d,]+\.?\d*%?$/;
+  const extras = displayCols.map((c) => {
+    const sample = rows.slice(0, 200).map((r) => String(r[c.ci] ?? "").trim()).filter(Boolean);
+    const numeric = sample.length > 0 && sample.every((s) => numRe.test(s) && /\d/.test(s));
+    let kind = "text", slicer = false;
+    if (numeric) kind = "num";
+    else {
+      const distinct = new Set(rows.map((r) => String(r[c.ci] ?? ""))).size;
+      if (distinct <= Math.min(200, Math.max(20, N * 0.05))) { kind = "dim"; slicer = true; }
+    }
+    return { ci: c.ci, key: c.name, label: c.label, kind, slicer, numeric };
+  });
+
+  // Arrow lanes: one typed column per engine col (Int64, or Utf8 for text) +
+  // any derived Int64 lanes. Column 0 is the row id.
+  const arrowCols = { id: makeVector({ data: new BigInt64Array(N), type: new Uint64() }) };
+  for (const c of engineCols)
+    arrowCols[c.name] = c.kind === "text"
+      ? new Array(N).fill("")
+      : makeVector({ data: new BigInt64Array(N), type: new Int64() });
+  for (const dv of derived)
+    arrowCols[dv.name] = makeVector({ data: new BigInt64Array(N), type: new Int64() });
+
+  const display = [];
+  rows.forEach((r, id) => {
     arrowCols.id.data[0].values[id] = BigInt(id);
-    for (const c of cols) {
-      if (c.amount) arrowCols[c.name].data[0].values[id] = BigInt(toCents(r[c.ci]));
-      else if (c.date) arrowCols[c.name].data[0].values[id] = BigInt(toEpochDay(r[c.ci]));
-      else if (c.text) arrowCols[c.name][id] = c.cis.map((i) => String(r[i] ?? "")).filter(Boolean).join(" ");
-      else if (c.kind === "number") arrowCols[c.name].data[0].values[id] = BigInt(toInt(r[c.ci]));
-      else arrowCols[c.name].data[0].values[id] = BigInt(fnv1a(String(r[c.ci] ?? "")));
+    for (const c of engineCols) {
+      const v = r[c.ci];
+      if (c.kind === "amount") arrowCols[c.name].data[0].values[id] = BigInt(toCents(v));
+      else if (c.kind === "number") arrowCols[c.name].data[0].values[id] = BigInt(toInt(v));
+      else if (c.kind === "date") arrowCols[c.name].data[0].values[id] = BigInt(toEpochDay(v));
+      else if (c.kind === "text") arrowCols[c.name][id] = String(v ?? "");
+      else arrowCols[c.name].data[0].values[id] = BigInt(fnv1a(String(v ?? ""))); // key
     }
 
     const d = { id };
-    for (const c of cols) {
-      if (c.amount) d.amount = toCents(r[c.ci]);
-      else if (c.date) d.date = String(r[c.ci] ?? "");
-      else if (c.text) d[c.name] = c.cis.map((i) => String(r[i] ?? "")).filter(Boolean).join(" ");
+    for (const c of engineCols) {
+      if (c.kind === "amount") d[c.name] = toCents(r[c.ci]);
+      else if (c.kind === "number") d[c.name] = toInt(r[c.ci]);
       else d[c.name] = String(r[c.ci] ?? "");
     }
-    d.native = d.amount; // engine-conserved column, for manual-group net
+    for (const e of extras) d[e.key] = e.numeric ? toNum(r[e.ci]) : String(r[e.ci] ?? "");
+    for (const dv of derived)
+      arrowCols[dv.name].data[0].values[id] = BigInt(Math.round(Number(dv.value(r, d)) || 0));
+    // Canonical aliases the data-driven workbench relies on: `native` is the
+    // conserved value (cents) for manual-group net math; `date` feeds the month
+    // slicer regardless of the date column's chosen name.
+    d.native = Number(d[prim] || 0);
+    d.date = dateCol ? String(r[dateCol.ci] ?? "") : "";
     display.push(d);
   });
 
-  // Field descriptor: dims become slicers, the amount is the value column.
+  // Field descriptor: amounts are money (cents) columns; the primary is the
+  // value column; numbers are natural-magnitude; keys become slicers.
   const fields = [];
-  for (const c of cols) {
-    if (c.dim) fields.push({ key: c.name, label: c.label, kind: "dim", slicer: true, detail: true });
-    else if (c.date) fields.push({ key: "date", label: c.label, kind: "date", slicer: false, detail: true });
-    else if (c.amount) fields.push({ key: "amount", label: c.label, kind: "amount", amt: "amount", ccy: null, detail: true, value: true });
-    else if (c.text) fields.push({ key: c.name, label: c.label, kind: "text", slicer: false, detail: true });
+  for (const c of engineCols) {
+    if (c.kind === "amount")
+      fields.push(c.name === prim
+        ? { key: c.name, label: c.label, kind: "amount", amt: c.name, ccy: null, detail: true, value: true }
+        : { key: c.name, label: c.label, kind: "amount", amt: c.name, ccy: null, detail: true });
+    else if (c.kind === "number")
+      fields.push({ key: c.name, label: c.label, kind: "num", amt: c.name, detail: true, value: c.name === prim });
+    else if (c.kind === "date")
+      fields.push({ key: c.name, label: c.label, kind: "date", slicer: false, detail: true });
+    else if (c.kind === "key")
+      fields.push({ key: c.name, label: c.label, kind: "dim", slicer: true, detail: true });
+    else if (c.kind === "text")
+      fields.push({ key: c.name, label: c.label, kind: "text", slicer: false, detail: true, wide: true });
+  }
+  for (const e of extras) {
+    if (e.kind === "num") fields.push({ key: e.key, label: e.label, kind: "num", amt: e.key, detail: true });
+    else if (e.kind === "dim") fields.push({ key: e.key, label: e.label, kind: "dim", slicer: true, detail: true });
+    else fields.push({ key: e.key, label: e.label, kind: "text", slicer: false, detail: true, wide: true });
   }
 
-  for (const c of cols) {
-    if (c.text) {
-      arrowCols[c.name] = vectorFromArray(arrowCols[c.name], new Utf8());
-    }
-  }
+  for (const c of engineCols)
+    if (c.kind === "text") arrowCols[c.name] = vectorFromArray(arrowCols[c.name], new Utf8());
+
+  // The plan is just data: the editor's plan if given (its primary defaulted in
+  // when omitted), else the one auto-built from the column kinds.
+  const finalPlan = plan && plan.root
+    ? (plan.primary ? plan : { ...plan, primary: prim })
+    : planFromCols(cols, { primary: prim, tol: 0 });
 
   return {
-    pair: mapping.name || "uploaded",
-    plan: {primary: "amount", root: plan}, fields, display, netKey: "amount",
+    pair: name || "uploaded",
+    plan: finalPlan, fields, display, netKey: finalPlan.primary || prim,
     arrowBytes: tableToIPC(tableFromArrays(arrowCols), "stream"),
+    // Self-describing echo of the inputs, so the workspace can be serialized and
+    // rebuilt later (predictable reload) without re-uploading the CSV. `derive`
+    // is intentionally omitted (functions don't serialize); reload uses plan + cols.
+    source: { name: name || "uploaded", header, rows, columns, plan: finalPlan },
   };
 }
 

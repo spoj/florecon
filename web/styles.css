@@ -100,6 +100,8 @@ main {
 .facet-val:hover { background: var(--panel2); }
 .facet-val.active { background: var(--accent-soft); }
 .facet-val.muted { cursor: default; }
+.facet-val.zero { opacity: 0.4; }
+.facet-val.zero.active { opacity: 0.7; }
 .facet-val .bar {
   position: absolute; left: 0; bottom: 0; height: 2px; background: var(--accent); opacity: .35;
 }
@@ -163,9 +165,39 @@ button.ghost { border: none; background: none; color: var(--accent); padding: 5p
 }
 
 /* detail */
-.detail-actions { display: flex; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; align-items: center; }
-.detail-actions .gmeta { color: var(--dim); font-size: 11px; margin-left: auto; font-family: var(--mono); }
+.detail-actions {
+  display: flex; gap: 6px; padding: 5px 10px; border-bottom: 1px solid var(--line);
+  align-items: center; flex-wrap: nowrap; overflow-x: auto;
+  /* Reserve a stable height so the bar (and the table below it) does not jerk
+     when selection-dependent buttons appear/disappear. One compact row tall. */
+  min-height: 34px;
+}
+.detail-actions::-webkit-scrollbar { height: 6px; }
+.detail-actions button.mini { padding: 3px 8px; font-size: 11px; border-radius: 4px; white-space: nowrap; }
+.detail-actions .gmeta { color: var(--dim); font-size: 11px; margin-left: auto; font-family: var(--mono); white-space: nowrap; }
+.tagbox { display: inline-flex; align-items: center; gap: 4px; }
+.tagbox input {
+  font: inherit; font-size: 11px; padding: 3px 6px; width: 130px;
+  border: 1px solid var(--accent); border-radius: 4px; color: var(--text); background: var(--panel);
+}
 #detail-head { white-space: normal; text-transform: none; letter-spacing: 0; font-weight: 700; color: var(--text); }
+
+/* detail totals row (sticky at the bottom of the detail table) */
+#detail-table tfoot td {
+  position: sticky; bottom: 0; z-index: 2; background: var(--panel2);
+  border-top: 2px solid var(--line); padding: 3px 6px; white-space: nowrap;
+  font-family: var(--mono); font-weight: 600;
+}
+#detail-table tfoot td.tot-lbl { color: var(--dim); font-family: var(--sans); font-weight: 600; }
+
+/* slicer recompute indicator: a small spinner while the cancellable filter runs */
+#facets .panel-head.busy { color: var(--accent); }
+#facets .panel-head.busy::after {
+  content: ""; width: 9px; height: 9px; margin-left: auto; display: inline-block;
+  border: 2px solid var(--accent); border-right-color: transparent; border-radius: 50%;
+  animation: spin .6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .status { padding: 3px 14px; background: var(--panel); border-top: 1px solid var(--line); color: var(--dim); font-size: 11px; font-family: var(--mono); }
 .status.err { color: var(--bad); }
@@ -181,6 +213,13 @@ button.ghost { border: none; background: none; color: var(--accent); padding: 5p
 .map-panel { margin-top: 20px; }
 .map-panel .panel-head { font-weight: 700; color: var(--text); border-bottom: 1px solid var(--line); padding: 8px 0 6px; margin-bottom: 8px; text-transform: none; }
 .map-body { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.col-head { margin: 2px 0 6px; }
+.col-body { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.col-row { display: grid; grid-template-columns: 22px 160px 210px 110px 1fr; align-items: center; gap: 10px; }
+.col-row input[type=text].col-name { font: inherit; font-size: 12px; font-family: var(--mono, ui-monospace, monospace); padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text); width: 100%; }
+.col-row select { font: inherit; font-size: 12px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text); width: 100%; }
+.col-row .col-prim { font-size: 11px; color: var(--dim); display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+.col-row .hint.mono { font-family: var(--mono, ui-monospace, monospace); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .map-row { display: grid; grid-template-columns: 130px 240px 1fr; align-items: center; gap: 10px; }
 .map-row label { font-size: 12px; color: var(--text); font-weight: 600; }
 .map-row label.req::after { content: " *"; color: var(--bad); }
@@ -191,5 +230,30 @@ button.ghost { border: none; background: none; color: var(--accent); padding: 5p
 #preview { width: 100%; }
 #preview th { position: sticky; top: 0; background: var(--panel2); }
 #preview td, #preview th { white-space: nowrap; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+td.why { max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); font-size: 11px; }
+.why-head { color: var(--dim); font-weight: 500; }
 #run-recon { margin-top: 14px; }
+.adv-panel { margin-top: 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel2); }
+.adv-panel > summary { cursor: pointer; padding: 8px 10px; font-size: 12px; font-weight: 600; color: var(--text); user-select: none; }
+.adv-panel[open] > summary { border-bottom: 1px solid var(--line); }
+.adv-body { display: flex; flex-direction: column; gap: 8px; padding: 10px; }
+.adv-templates { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.adv-templates .adv-tlabel { font-size: 11px; color: var(--dim); font-weight: 600; margin-right: 2px; }
+.adv-templates .adv-tlabel:not(:first-child) { margin-left: 8px; }
+.adv-templates button.mini.snip { font-family: var(--mono, ui-monospace, monospace); border-style: dashed; }
+.adv-templates button.mini { font: inherit; font-size: 11px; padding: 3px 9px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text); cursor: pointer; white-space: nowrap; }
+.adv-templates button.mini:hover { border-color: var(--accent); }
+.adv-templates button.mini.link { border-color: transparent; color: var(--dim); }
+.plan-json { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.4; padding: 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--text); width: 100%; resize: vertical; white-space: pre; }
+#plan-cols { font-family: var(--mono, ui-monospace, monospace); }
+.plan-guide > summary { font-size: 12px; color: var(--dim); cursor: pointer; user-select: none; }
+.plan-guide .guide-body { font-size: 12px; line-height: 1.5; color: var(--text); padding: 6px 2px 2px; }
+.plan-guide .guide-body p { margin: 6px 0; }
+.plan-guide .guide-h { font-weight: 600; color: var(--dim); margin-top: 12px; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+.plan-guide .guide-foot { color: var(--dim); }
+.plan-guide code { font-family: var(--mono, ui-monospace, monospace); font-size: 11px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: 0 3px; white-space: nowrap; }
+.plan-guide .guide-tbl { border-collapse: collapse; width: 100%; margin: 4px 0; }
+.plan-guide .guide-tbl td { border-top: 1px solid var(--line); padding: 4px 8px 4px 0; vertical-align: top; }
+.plan-guide .guide-tbl td:first-child { white-space: nowrap; width: 1%; }
+.plan-guide .guide-tbl td:nth-child(2) code { white-space: normal; }
 .setup-err { color: var(--bad); font-size: 12px; margin-top: 10px; min-height: 16px; }

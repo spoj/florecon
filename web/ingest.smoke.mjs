@@ -39,13 +39,20 @@ const csv = [
 const parsed = parseCsv(csv);
 parsed.name = "smoke";
 const H = parsed.header;
-const col = (n) => H.indexOf(n);
-const mapping = {
-  amount: col("Amount"), gkey: col("Account"), date: col("Date"),
-  tokens: [col("Ref"), col("Memo")], partitions: [col("Entity"), col("Currency")],
-  tol: 0, name: "smoke",
-};
-const data = buildDataset({ header: H, rows: parsed.rows, mapping });
+const ci = (n) => H.indexOf(n);
+// New column-spec contract: each column is a typed lane with an engine name;
+// keys/partitions/signals are expressed in the plan, not as roles. Here we let
+// buildDataset auto-build the default plan from the column kinds.
+const columns = [
+  { ci: ci("Entity"), name: "entity", kind: "key" },
+  { ci: ci("Currency"), name: "currency", kind: "key" },
+  { ci: ci("Account"), name: "account", kind: "key" },
+  { ci: ci("Date"), name: "date", kind: "date" },
+  { ci: ci("Amount"), name: "amount", kind: "amount" },
+  { ci: ci("Ref"), name: "ref", kind: "text" },
+  { ci: ci("Memo"), name: "memo", kind: "display" },
+];
+const data = buildDataset({ header: H, rows: parsed.rows, columns, name: "smoke" });
 
 ok(data.arrowBytes.length > 0, "arrow built");
 ok(data.netKey === "amount", "netKey");
@@ -54,10 +61,10 @@ ok(data.netKey === "amount", "netKey");
 ok(data.map === undefined, "no redundant wire map");
 ok(data.schema === undefined, "no vestigial wire schema");
 ok(data.plan.primary === "amount", "plan primary numeraire");
-ok(data.plan.root.op === "partition" && data.plan.root.by === "p0", "outer partition");
-// cells positional: [p0,p1,gkey,date,amount,tokens]
-ok(data.display[0].amount === 10000, "amount cents in cell");
-ok(data.display[0].amount === 10000, "display amount cents");
+ok(data.plan.root.op === "seq", "default plan is a seq cascade");
+ok(data.display[0].amount === 10000, "amount cents in display");
+ok(data.display[0].native === 10000, "native mirrors conserved amount");
+ok(data.display[0].date === "2024-01-02", "date alias for month slicer");
 
 let r = fe.dispatch({ op: "init", plan: data.plan }, data.arrowBytes);
 ok(r.ok, "init: " + r.error);

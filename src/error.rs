@@ -9,11 +9,15 @@ pub enum ApiError {
         expected: usize,
         got: usize,
     },
-    /// The pipeline did not partition the input: some id was lost or assigned
-    /// to more than one group. Should be impossible — a bug guard.
+    /// Amount conservation failed: some input id's allocations do not sum to
+    /// its original amount (a row was partly/fully lost, or split incorrectly).
+    /// In the allocation-native (lot hypergraph) model this is the conserved
+    /// invariant — row *presence* is not, since a zero-amount row legitimately
+    /// produces no allocation. Should be impossible — a bug guard.
     ConservationViolated {
-        input: usize,
-        accounted: usize,
+        id: ExtId,
+        original: i64,
+        accounted: i64,
     },
     /// A group id referenced by an interactive op does not exist.
     UnknownGroup(u64),
@@ -51,9 +55,14 @@ impl std::fmt::Display for ApiError {
             ApiError::SchemaArity { expected, got } => {
                 write!(f, "row arity {got} != schema arity {expected}")
             }
-            ApiError::ConservationViolated { input, accounted } => {
-                write!(f, "conservation violated: {accounted} accounted of {input}")
-            }
+            ApiError::ConservationViolated {
+                id,
+                original,
+                accounted,
+            } => write!(
+                f,
+                "conservation violated: row {id} allocations sum to {accounted}, expected {original}"
+            ),
             ApiError::UnknownGroup(g) => write!(f, "unknown group id: {g}"),
             ApiError::UnknownId(id) => write!(f, "unknown row id: {id}"),
             ApiError::FrozenMember(id) => {

@@ -36,11 +36,54 @@
       </div>
 
       <div id="map-panel" class="map-panel" hidden>
-        <div class="panel-head">Map columns to recon roles</div>
-        <div id="map-body" class="map-body"></div>
+        <div class="panel-head">Columns</div>
+        <div class="col-head hint">include · engine name · type · conserved · source</div>
+        <div id="col-body" class="col-body"></div>
         <div class="panel-head">Preview</div>
         <div class="preview-wrap"><table id="preview" class="dense"></table></div>
         <div id="preview-foot" class="foot"></div>
+        <details id="adv-panel" class="adv-panel" open>
+          <summary>Plan (works on the column names above)</summary>
+          <div class="adv-body">
+            <div class="hint">Leave blank to use the default plan built from your column types. Pick a sample plan or insert nodes, then edit. The engine validates column names on run.</div>
+            <div id="plan-cols" class="hint mono"></div>
+            <div id="plan-templates" class="adv-templates"></div>
+            <textarea id="plan-json" class="plan-json" rows="12" spellcheck="false" placeholder='Blank = default plan. Or e.g. {"primary":"amount","root":{"op":"exact"}}'></textarea>
+            <div id="plan-err" class="setup-err"></div>
+            <details class="plan-guide">
+              <summary>Plan node reference</summary>
+              <div class="guide-body">
+                <p>A plan is <code>{"primary":"&lt;amount col&gt;", "root":&lt;node&gt;}</code>.
+                <b>primary</b> is the conserved column reconciled to zero. Every <b>node</b> is
+                <code>{"op":"…", …}</code>. <b>Matchers</b> form groups; <b>combinators</b> route rows into sub-nodes.
+                A <b>Sel</b> is an int expression: a bare <code>"col"</code>, a bare number, or
+                <code>{"gt":["amount",0]}</code>, <code>{"abs":"amount"}</code>,
+                <code>{"in":["account",[4000,5000]]}</code>, <code>{"if":[cond,a,b]}</code>.
+                A <b>Tol</b> is a bare number (absolute) or <code>{"bps":10,"floor":1}</code> (relative).</p>
+
+                <p class="guide-h">Matchers (leaves)</p>
+                <table class="guide-tbl">
+                  <tr><td><code>exact</code></td><td><code>{"op":"exact"}</code></td><td>Pair equal-and-opposite amounts 1:1.</td></tr>
+                  <tr><td><code>agg_net</code></td><td><code>{"op":"agg_net","key":&lt;Sel&gt;,"tol":&lt;Tol&gt;}</code></td><td>Group rows sharing <code>key</code> if they net to within <code>tol</code>.</td></tr>
+                  <tr><td><code>signal</code></td><td><code>{"op":"signal","signals":"ref","tol":0,"cap":256}</code></td><td>Bind rows that share a reference/text token and net out.</td></tr>
+                  <tr><td><code>flow</code></td><td><code>{"op":"flow","day":"date","tokens":"ref","penalty":1000,"window":-1}</code></td><td>Min-cost flow over near date/token; arbiter of last resort.</td></tr>
+                </table>
+
+                <p class="guide-h">Combinators (route &amp; label)</p>
+                <table class="guide-tbl">
+                  <tr><td><code>seq</code></td><td><code>{"op":"seq","steps":[…]}</code></td><td>Run nodes in order; each works on what's left.</td></tr>
+                  <tr><td><code>partition</code></td><td><code>{"op":"partition","by":&lt;Sel&gt;,"inner":&lt;node&gt;}</code></td><td>Split rows by <code>by</code>, run <code>inner</code> within each bucket independently.</td></tr>
+                  <tr><td><code>branch</code></td><td><code>{"op":"branch","pred":&lt;Sel&gt;,"and_then":&lt;node&gt;,"or_else":&lt;node&gt;}</code></td><td>Send rows where <code>pred</code>≠0 one way, the rest the other.</td></tr>
+                  <tr><td><code>windowed</code></td><td><code>{"op":"windowed","order":&lt;Sel&gt;,"width":7,"inner":&lt;node&gt;}</code></td><td>Sliding window over <code>order</code> (e.g. date) before <code>inner</code>.</td></tr>
+                  <tr><td><code>pivot</code></td><td><code>{"op":"pivot","amount":&lt;Sel&gt;,"inner":&lt;node&gt;}</code></td><td>Reconcile on a different numeraire under a conserving projection.</td></tr>
+                  <tr><td><code>label</code></td><td><code>{"op":"label","tag":"stage 3","inner":&lt;node&gt;}</code></td><td>Stamp a <i>why</i> reason on every group <code>inner</code> forms.</td></tr>
+                </table>
+
+                <p class="guide-foot">Use the <b>Insert node</b> buttons above to drop a correct skeleton at the cursor, then edit the column names. Column names must match the <b>engine name</b> column you set; the engine validates them on Run.</p>
+              </div>
+            </details>
+          </div>
+        </details>
         <button id="run-recon" class="primary">Run recon</button>
       </div>
 
@@ -52,6 +95,15 @@
     <div class="brand">florecon <span class="sub">reconciliation workbench</span></div>
     <div id="metrics" class="metrics"></div>
     <div class="actions">
+      <button id="edit-plan" title="Back to columns &amp; plan; change and re-run">Edit plan</button>
+      <button id="save-ws" title="Save the workspace (dataset + frozen decisions + tags) to a file">Save</button>
+      <button id="load-ws" title="Load a saved workspace file">Load</button>
+      <select id="export-fmt" title="Export the reconciliation result">
+        <option value="">Export…</option>
+        <option value="rows">Rows CSV</option>
+        <option value="groups">Groups CSV</option>
+        <option value="json">Report JSON</option>
+      </select>
       <button id="recalc" title="Re-solve the unfrozen pool">Recalc</button>
       <button id="freeze-clean" title="Freeze every clean (net≈0) live group">Freeze clean</button>
       <button id="reset" title="Reload and re-solve from scratch">Reset</button>
@@ -77,6 +129,7 @@
               <th data-sort="status">st</th>
               <th data-sort="group_id">#</th>
               <th data-sort="origin">strat</th>
+              <th data-sort="reason">why</th>
               <th data-sort="size" class="num">n</th>
               <th data-sort="value" class="num">value</th>
               <th data-sort="net" class="num">net</th>
@@ -95,6 +148,7 @@
         <table id="detail-table" class="dense">
           <thead id="detail-head-row"></thead>
           <tbody id="detail-body"></tbody>
+          <tfoot id="detail-foot-row"></tfoot>
         </table>
       </div>
       <div id="detail-foot" class="foot"></div>
