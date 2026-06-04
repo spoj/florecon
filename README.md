@@ -21,10 +21,13 @@ Each block below is a complete, runnable program against the Python host.
 ```python
 from florecon import Workspace, schema, col, NUMBER, plan as P
 
+sch = schema([col("amount", NUMBER)])
+data = [(1, [500]), (2, [-500]), (3, [250]), (4, [-250])]
+
 plan = P.exact()
 
-ws = Workspace(schema([col("amount", NUMBER)]), plan, primary="amount")
-ws.upsert_many([(1, [500]), (2, [-500]), (3, [250]), (4, [-250])])
+ws = Workspace(sch, plan, primary="amount")
+ws.upsert_many(data)
 rep = ws.solve()
 # two groups, each net 0: rows {1,2} and {3,4}
 ```
@@ -38,16 +41,17 @@ a tolerance; `partition` shards the book first, here by company pair.
 from florecon import Workspace, schema, col, key, KEY, NUMBER, plan as P
 
 sch = schema([col("pair", KEY), col("account", KEY), col("amount", NUMBER)])
-
-plan = P.partition("pair", P.agg_net("account", tol=100))   # tol = 100 cents = $1.00
-
-ws = Workspace(sch, plan, primary="amount")
-ws.upsert_many([
+data = [
     (1, [key("HK01", "CN02"), "61500",  10_000]),
     (2, [key("HK01", "CN02"), "61500",  -9_950]),   # nets to 0.50 -> accepted within $1
     (3, [key("HK01", "CN02"), "72000",   5_000]),
     (4, [key("HK01", "CN02"), "72000",  -5_000]),   # nets to 0.00
-])
+]
+
+plan = P.partition("pair", P.agg_net("account", tol=100))   # tol = 100 cents = $1.00
+
+ws = Workspace(sch, plan, primary="amount")
+ws.upsert_many(data)
 rep = ws.solve()
 ```
 
@@ -60,14 +64,15 @@ invoice number that appears in both a payment memo and an invoice description.
 from florecon import Workspace, schema, col, NUMBER, TOKENS, plan as P
 
 sch = schema([col("amount", NUMBER), col("memo", TOKENS)])
+data = [
+    (1, [ 100, "payment ref INV0042"]),
+    (2, [-100, "INV0042 widgets"]),
+]
 
 plan = P.signal("memo", tol=0)
 
 ws = Workspace(sch, plan, primary="amount")
-ws.upsert_many([
-    (1, [ 100, "payment ref INV0042"]),
-    (2, [-100, "INV0042 widgets"]),
-])
+ws.upsert_many(data)
 rep = ws.solve()   # one net-zero group, bridged by the shared INV0042 token
 ```
 
@@ -82,15 +87,16 @@ from florecon import Workspace, schema, col, NUMBER, TOKENS, plan as P
 from florecon import strict_assignments
 
 sch = schema([col("amount", NUMBER), col("day", NUMBER), col("ref", TOKENS)])
+data = [
+    (1, [ 100,  1, ""]),    # an open item
+    (2, [-100,  2, ""]),    # a settlement one day later  (closer)
+    (3, [-100, 20, ""]),    # another candidate, far out
+]
 
 plan = P.flow(order_by="day", tokens="ref", window=30)
 
 ws = Workspace(sch, plan, primary="amount")
-ws.upsert_many([
-    (1, [ 100,  1, ""]),    # an open item
-    (2, [-100,  2, ""]),    # a settlement one day later  (closer)
-    (3, [-100, 20, ""]),    # another candidate, far out
-])
+ws.upsert_many(data)
 rep = ws.solve()
 strict_assignments(rep)     # rows 1 & 2 grouped; row 3 left as a residual singleton
 ```
@@ -106,6 +112,10 @@ from florecon import Workspace, schema, col, key, KEY, NUMBER, TOKENS, plan as P
 
 sch = schema([col("account", KEY), col("amount", NUMBER),
               col("day", NUMBER), col("memo", TOKENS)])
+data = [
+    (1, ["61500",  100, 1, "INV1"]),
+    (2, ["61500", -100, 2, "INV1"]),
+]
 
 plan = P.seq(
     P.agg_net("account", tol=0),                       # net clean buckets
@@ -117,6 +127,52 @@ plan = P.seq(
 )
 
 ws = Workspace(sch, plan, primary="amount")
+ws.upsert_many(data)
+rep = ws.solve()
+```
+
+### Shape the strategy: `partition` and `branch`
+
+The combinators compose into the whole strategy. These snippets highlight just
+the plan; bind one to a `Workspace` the same way as above.
+
+`partition` shards the book and runs the inner plan independently per shard.
+Nest them to shard on several dimensions at once:
+
+```python
+plan = P.partition("pair", P.partition("ccy", P.seq(
+    P.agg_net("account", tol=100),
+    P.exact(),
+    P.flow(order_by="day", tokens="memo", window=30),
+)))
+```
+
+`branch` routes rows to different sub-plans by a `Sel` predicate — e.g. arbitrate
+big-ticket items carefully, but just net and write off the immaterial ones:
+
+```python
+plan = P.branch(
+    P.ge(P.abs_(P.col("amount")), 100_000),            # >= $1,000 (cents)
+    P.flow(order_by="day", tokens="memo", window=7),   # large: arbitrate carefully
+    P.seq(                                             # small: net then write off
+        P.agg_net("account", tol=0),
+        P.soak_all("immaterial"),
+    ),
+)
+```
+
+They nest freely — here a materiality `branch` runs inside every counterparty
+shard, and a `fixed_point` repeats a netting pass until nothing more groups:
+
+```python
+plan = P.partition("pair", P.seq(
+    P.fixed_point(P.agg_net("account", tol=100)),      # net buckets to convergence
+    P.branch(
+        P.ge(P.abs_(P.col("amount")), 100_000),
+        P.flow(order_by="day", tokens="memo", window=7),
+        P.soak_all("immaterial"),
+    ),
+))
 ```
 
 ### Adjudicate interactively
