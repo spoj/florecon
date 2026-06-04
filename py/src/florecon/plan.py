@@ -1,11 +1,20 @@
-"""A Pythonic builder for the serializable Plan. 
-This module allows Polars/Pandas expressions or simple callables inside the plan, 
-which are resolved dynamically into virtual columns by `solve()`.
+"""A Pythonic builder for the serializable Plan.
 
-It mirrors the JS builder (web/core/plan.js): the same plan nodes, the `label`
-reason combinator, relative tolerance (`rel_tol`), and a `Sel` integer-expression
-helper set (`col`, `lit`, `abs_`, `gt`, `is_in`, `iff`, ...) for authoring the
-`by` / `key` / `pred` / `order` / `amount` selectors of the combinator nodes.
+Selectors (`by` / `key` / `pred` / `order` / `amount`) are authored as `Sel`
+integer expressions over a row's integer columns — build them with the helpers
+below (`col`, `lit`, `abs_`, `gt`, `is_in`, `iff`, ...). Sel is evaluated by the
+engine itself, per row, on every (warm) solve, so it is the only selector form
+that is serializable, portable across the Rust/Python/JS hosts, and recomputed
+as rows stream in.
+
+It has no host-side expression magic: a Polars/pandas expression or a Python
+callable is *not* accepted inside a plan. If you need a derived quantity Sel
+cannot express (string/date/float work, joins), compute it host-side as an
+integer column and `upsert` it as an ordinary cell, then reference it by name in
+the plan — that is data-prep, kept out of plan authoring on purpose.
+
+Mirrors the JS builder (web/core/plan.js): the same plan nodes, the `label`
+reason combinator, relative tolerance (`rel_tol`), and the `Sel` helper set.
 Note: `plan.col` is a *Sel column reference* ({"col": name}); the top-level
 `florecon.col` is the unrelated *schema* column declaration.
 """
