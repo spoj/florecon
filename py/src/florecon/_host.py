@@ -28,7 +28,7 @@ class Florecon:
     """Low-level handle around the WASM engine. The wire is a single concept:
     one :meth:`dispatch` entry point driving a persistent workspace via the
     ``Cmd`` protocol. A stateless batch solve is just ``init`` + ``solve`` over a
-    workspace the caller discards (see :func:`florecon.api.solve`)."""
+    workspace the caller discards."""
 
     def __init__(self, wasm_path=None):
         engine = wasmtime.Engine()

@@ -1232,8 +1232,8 @@ where
 /// and the id set currently loaded into it (`present`). Each `run` applies only
 /// the membership delta — upsert new ids, remove departed ones — then re-solves,
 /// reusing the cached simplex basis, so a no-op recalc costs microseconds rather
-/// than a full cold solve. A *fresh* leaf (first run, or one rebuilt per solve
-/// by the batch [`Session`](crate::plan::Session) path) simply has an empty
+/// than a full cold solve. A *fresh* leaf (first run, or one rebuilt when the
+/// compiled strategy is replaced) simply has an empty
 /// `present`, so its first solve *is* the cold solve — warm vs cold is decided
 /// purely by whether the caller keeps the compiled strategy alive. Sharding is
 /// the caller's job: [`partition_by`] gives each shard its own `Flow`, so this

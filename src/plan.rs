@@ -11,7 +11,7 @@
 //!   interpreter runs it.
 //! - [`Recon`] — the one generic stateful facade (`upsert` / `remove` / `solve`
 //!   / `freeze` / `breakup` / …); [`Workspace`] is its [`PhysicalRow`] + [`Plan`]
-//!   specialization and [`Session`] is the stateless one-shot form.
+//!   specialization, the schema-aware surface the WASM `dispatch` drives.
 //! - [`Report`] — the allocation hypergraph result (`groups` + `allocations`).
 //!
 //! Conservation is enforced at the boundary: a solve verifies that every input
@@ -336,155 +336,6 @@ fn conservation_airlock(
         }
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Session
-// ---------------------------------------------------------------------------
-
-/// A long-lived reconciliation handle. Owns the rows natively; hosts cross the
-/// boundary only with coarse deltas and plan submissions.
-#[derive(Default)]
-pub struct Session {
-    map: ColumnMap,
-    rows: BTreeMap<ExtId, PhysicalRow>,
-}
-
-impl Session {
-    pub fn new(map: ColumnMap) -> Self {
-        Session {
-            map,
-            rows: BTreeMap::new(),
-        }
-    }
-
-    /// Build a session from a schema and a batch of business rows (the batch
-    /// boundary mode: the whole shard crosses once, e.g. from a WASM host).
-    /// Rows are lowered against the schema.
-    pub fn from_rows<I>(map: ColumnMap, rows: I) -> Result<Self, ApiError>
-    where
-        I: IntoIterator<Item = (ExtId, PhysicalRow)>,
-    {
-        let mut s = Session::new(map);
-        for (id, row) in rows {
-            s.upsert(id, row)?;
-        }
-        Ok(s)
-    }
-
-    pub fn map(&self) -> &ColumnMap {
-        &self.map
-    }
-
-    pub fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    /// Insert or replace a row. Takes a business [`Row`] (bare cells) and lowers
-    /// it against the schema's per-column [`Kind`]s; one boundary crossing per
-    /// edit. Lowering arity-checks against the schema.
-    pub fn upsert(&mut self, id: ExtId, row: PhysicalRow) -> Result<(), ApiError> {
-        self.rows.insert(id, row);
-        Ok(())
-    }
-
-    /// Remove a row if present.
-    pub fn remove(&mut self, id: ExtId) {
-        self.rows.remove(&id);
-    }
-
-    fn run_strategy(
-        &self,
-        plan: &Plan,
-    ) -> Result<(BTreeMap<ExtId, i64>, crate::strategy::Resolution<PhysicalRow>), ApiError> {
-        // Session is a stateless one-shot: compile the cold flow leaf.
-        let compiled = compile(plan, &self.map)?;
-        let mut strategy = compiled.strategy;
-        // Materialize in id order for deterministic candidate generation, with
-        // the plan's primary amount already stamped on every item.
-        let bag: Vec<Item<PhysicalRow>> = self
-            .rows
-            .iter()
-            .map(|(id, row)| Item::new(*id, row.int(compiled.primary), row.clone()))
-            .collect();
-        let originals: BTreeMap<ExtId, i64> = bag.iter().map(|i| (i.id, i.original)).collect();
-        Ok((originals, strategy.run(bag)))
-    }
-
-    /// Run a plan over the current rows and return the allocation hypergraph.
-    /// `allocations` is the single source of truth; row/group views are client
-    /// projections over the report.
-    pub fn solve(&self, plan: &Plan) -> Result<Report, ApiError> {
-        let (originals, res) = self.run_strategy(plan)?;
-        report_from_resolution(&originals, res)
-    }
-}
-
-fn report_from_resolution(
-    originals: &BTreeMap<ExtId, i64>,
-    res: crate::strategy::Resolution<PhysicalRow>,
-) -> Result<Report, ApiError> {
-    let mut groups = res.groups;
-    groups.sort_by_key(|g| g.members.iter().map(|a| a.id).min().unwrap_or(0));
-
-    let mut allocations = Vec::new();
-    let mut group_out = Vec::with_capacity(groups.len() + res.residual.len());
-    let mut next_gid = 0u64;
-    for g in groups {
-        let gid = next_gid;
-        next_gid += 1;
-        for m in &g.members {
-            allocations.push(AllocationOut {
-                id: m.id,
-                group_id: gid,
-                amount: m.amount,
-            });
-        }
-        group_out.push(GroupOut {
-            group_id: gid,
-            origin: g.origin,
-            net: g.net,
-            size: g.members.len(),
-            status: Status::Live,
-            reason: g.reason,
-        });
-    }
-
-    let mut residual = res.residual;
-    residual.sort_by_key(|i| i.id);
-    for i in residual {
-        let gid = next_gid;
-        next_gid += 1;
-        allocations.push(AllocationOut {
-            id: i.id,
-            group_id: gid,
-            amount: i.amount,
-        });
-        group_out.push(GroupOut {
-            group_id: gid,
-            origin: "unmatched".to_string(),
-            net: i.amount,
-            size: 1,
-            status: Status::Live,
-            reason: None,
-        });
-    }
-    allocations.sort_by_key(|a| (a.id, a.group_id));
-
-    let allocated: BTreeMap<ExtId, i64> = allocations.iter().fold(BTreeMap::new(), |mut m, a| {
-        *m.entry(a.id).or_insert(0) += a.amount;
-        m
-    });
-    conservation_airlock(originals, &allocated)?;
-
-    Ok(Report {
-        groups: group_out,
-        allocations,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,10 +1191,11 @@ mod tests {
         }
 
         // exact_1to1 forms a single clean pair (min_side == 1) -> rejected.
-        let mut s = Session::new(map());
-        s.upsert(1, row(100, 1, 0, 999, &[])).unwrap();
-        s.upsert(2, row(-100, 2, 0, -999, &[])).unwrap();
-        let rep = s.solve(&plan(node)).unwrap();
+        let mut ws = Workspace::new(map(), plan(node)).unwrap();
+        ws.upsert(1, row(100, 1, 0, 999, &[]));
+        ws.upsert(2, row(-100, 2, 0, -999, &[]));
+        ws.solve().unwrap();
+        let rep = ws.report();
         // Rejected back to residual: two unmatched singleton groups, no pair.
         assert!(rep.groups.iter().all(|g| g.origin == "unmatched"));
         assert_eq!(rep.groups.len(), 2);
@@ -1370,14 +1222,15 @@ mod tests {
                 },
             ],
         });
-        let mut s = Session::new(map());
+        let mut ws = Workspace::new(map(), plan).unwrap();
         // Five rows sharing objsub=7 that net to zero (40, -10, -10, -10, -10).
-        s.upsert(1, row(40, 1, 7, 0, &[])).unwrap();
-        s.upsert(2, row(-10, 1, 7, 0, &[])).unwrap();
-        s.upsert(3, row(-10, 1, 7, 0, &[])).unwrap();
-        s.upsert(4, row(-10, 1, 7, 0, &[])).unwrap();
-        s.upsert(5, row(-10, 1, 7, 0, &[])).unwrap();
-        let rep = s.solve(&plan).unwrap();
+        ws.upsert(1, row(40, 1, 7, 0, &[]));
+        ws.upsert(2, row(-10, 1, 7, 0, &[]));
+        ws.upsert(3, row(-10, 1, 7, 0, &[]));
+        ws.upsert(4, row(-10, 1, 7, 0, &[]));
+        ws.upsert(5, row(-10, 1, 7, 0, &[]));
+        ws.solve().unwrap();
+        let rep = ws.report();
         // The oversized net is rejected; every row lands in a `leftover` group.
         assert!(rep.groups.iter().all(|g| g.origin == "leftover"));
         assert_eq!(rep.allocations.len(), 5);
@@ -1398,13 +1251,14 @@ mod tests {
                 cost: CostSpec::default(),
             }),
         });
-        let mut s = Session::new(map());
-        s.upsert(1, row(100, 1, 0, 0, &[42])).unwrap();
-        s.upsert(2, row(-25, 1, 0, 0, &[42])).unwrap();
-        s.upsert(3, row(-25, 1, 0, 0, &[42])).unwrap();
-        s.upsert(4, row(-25, 1, 0, 0, &[42])).unwrap();
-        s.upsert(5, row(-25, 1, 0, 0, &[42])).unwrap();
-        let rep = s.solve(&plan).unwrap();
+        let mut ws = Workspace::new(map(), plan).unwrap();
+        ws.upsert(1, row(100, 1, 0, 0, &[42]));
+        ws.upsert(2, row(-25, 1, 0, 0, &[42]));
+        ws.upsert(3, row(-25, 1, 0, 0, &[42]));
+        ws.upsert(4, row(-25, 1, 0, 0, &[42]));
+        ws.upsert(5, row(-25, 1, 0, 0, &[42]));
+        ws.solve().unwrap();
+        let rep = ws.report();
         // Whatever the matcher's internal edge split, the matched rows end up in
         // a single coalesced cluster (plus any unmatched singletons).
         let clusters: Vec<&GroupOut> =
@@ -1418,10 +1272,11 @@ mod tests {
 
     #[test]
     fn exact_pair_matches() {
-        let mut s = Session::new(map());
-        s.upsert(1, row(100, 1, 0, 999, &[])).unwrap();
-        s.upsert(2, row(-100, 2, 0, -999, &[])).unwrap();
-        let rep = s.solve(&full_pipeline()).unwrap();
+        let mut ws = Workspace::new(map(), full_pipeline()).unwrap();
+        ws.upsert(1, row(100, 1, 0, 999, &[]));
+        ws.upsert(2, row(-100, 2, 0, -999, &[]));
+        ws.solve().unwrap();
+        let rep = ws.report();
         assert_eq!(rep.allocations.len(), 2);
     }
 
@@ -1453,11 +1308,12 @@ mod tests {
         // A zero-amount row legitimately yields no allocation in the lot
         // hypergraph. Conservation is by amount, not row presence, so this must
         // NOT trip the airlock. (Regression: real files carry blank/$0 rows.)
-        let mut s = Session::new(map());
-        s.upsert(1, row(100, 1, 0, 999, &[])).unwrap();
-        s.upsert(2, row(-100, 2, 0, -999, &[])).unwrap();
-        s.upsert(3, row(0, 3, 0, 0, &[])).unwrap(); // blank amount -> 0
-        let rep = s.solve(&full_pipeline()).unwrap();
+        let mut ws = Workspace::new(map(), full_pipeline()).unwrap();
+        ws.upsert(1, row(100, 1, 0, 999, &[]));
+        ws.upsert(2, row(-100, 2, 0, -999, &[]));
+        ws.upsert(3, row(0, 3, 0, 0, &[])); // blank amount -> 0
+        ws.solve().unwrap();
+        let rep = ws.report();
         // The pair nets; the zero row simply has no lot. Amounts conserve.
         assert!(rep.allocations.iter().all(|a| a.id != 3) || rep.allocations.iter().any(|a| a.id == 3 && a.amount == 0));
         assert!(rep.allocations.iter().any(|a| a.id == 1));
