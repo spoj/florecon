@@ -44,7 +44,10 @@ use crate::plan_compile::compile;
 /// v15 adds [`PlanNode::Coalesce`]: collapse an inner subtree's allocation
 /// hyperedges into connected-component clusters (groups sharing a row merge into
 /// one). Also additive — every v14 plan is a valid v15 plan.
-pub const CONTRACT_VERSION: u32 = 15;
+/// v16 adds `coalesce.absorb`: fold a partially-allocated row's residual tail
+/// into the cluster that already holds it (a dual-graph walk). Additive — the
+/// field defaults to `false`.
+pub const CONTRACT_VERSION: u32 = 16;
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use crate::row::{PhysicalRow, ColumnMap};
@@ -146,10 +149,18 @@ pub enum PlanNode {
     /// or more groups) below this magnitude is cut and leaked back to the
     /// residual, so a cluster splits along an immaterial overlap instead of
     /// fusing two real settlements. `0` (the default) disables leaking.
+    ///
+    /// `absorb` walks the dual graph into the residual: a residual lot whose id
+    /// already lives in a cluster (the dangling tail of a partially-allocated
+    /// row) is folded into that cluster, so the cluster shows the whole row and
+    /// nets the leftover instead of leaving an orphan singleton. `false`
+    /// (default) leaves residual remainders untouched.
     Coalesce {
         origin: String,
         #[cfg_attr(feature = "serde", serde(default))]
         min_link: i64,
+        #[cfg_attr(feature = "serde", serde(default))]
+        absorb: bool,
         inner: Box<PlanNode>,
     },
     /// Accept an aggregation bucket (a [`Sel`] `key`) that nets to zero within
@@ -1271,6 +1282,7 @@ mod tests {
         let plan = plan(PlanNode::Coalesce {
             origin: "settlement".into(),
             min_link: 0,
+            absorb: false,
             inner: Box::new(PlanNode::Flow {
                 day: "day".into(),
                 tokens: "tokens".into(),

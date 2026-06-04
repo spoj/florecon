@@ -212,8 +212,8 @@ fn compile_node(
                 compile_node(inner, map)?,
             )
         }
-        PlanNode::Coalesce { origin, min_link, inner } => {
-            coalesce(origin.clone(), *min_link, compile_node(inner, map)?)
+        PlanNode::Coalesce { origin, min_link, absorb, inner } => {
+            coalesce(origin.clone(), *min_link, *absorb, compile_node(inner, map)?)
         }
         PlanNode::AggNet { key, tol } => {
             let k = key.compile(map)?;

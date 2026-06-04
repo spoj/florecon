@@ -96,9 +96,13 @@ export const acceptIf = filter;
 // `minLink` gives up weak ties: a bridging allocation (a row shared by 2+
 // groups) below this magnitude is cut and leaked back to the residual, so a
 // cluster splits along an immaterial overlap. 0 (default) disables leaking.
-//   coalesce("settlement", flow("day", "tokens"), { minLink: 100 })
-export const coalesce = (origin, inner, { minLink = 0 } = {}) =>
-  ({ op: "coalesce", origin, inner, ...(minLink ? { min_link: minLink } : {}) });
+// `absorb` walks the dual graph into the residual: a residual lot whose id
+// already lives in a cluster (a partial row's tail) is folded into it.
+//   coalesce("settlement", flow("day", "tokens"), { minLink: 100, absorb: true })
+export const coalesce = (origin, inner, { minLink = 0, absorb = false } = {}) =>
+  ({ op: "coalesce", origin, inner,
+     ...(minLink ? { min_link: minLink } : {}),
+     ...(absorb ? { absorb: true } : {}) });
 
 // `tol` is absolute (a number) or relative (`relTol(bps, floor)`).
 export const aggNet = (key, tol = 0) => ({ op: "agg_net", key, tol });

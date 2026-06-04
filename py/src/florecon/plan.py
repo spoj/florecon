@@ -116,7 +116,7 @@ def filter(keep, inner: dict) -> dict:
 # `accept_if` reads more naturally for a keep-if-true predicate.
 accept_if = filter
 
-def coalesce(origin: str, inner: dict, min_link: int = 0) -> dict:
+def coalesce(origin: str, inner: dict, min_link: int = 0, absorb: bool = False) -> dict:
     """Collapse ``inner``'s allocation-hyperedge groups into connected-component
     clusters: groups sharing any member id merge into one coarse group (each
     row's allocations summed to a single clean edge), uniformly stamped with
@@ -127,10 +127,18 @@ def coalesce(origin: str, inner: dict, min_link: int = 0) -> dict:
     or more groups) below this magnitude is cut and leaked back to the residual,
     so a cluster splits along an immaterial overlap instead of fusing two real
     settlements. ``0`` (default) disables leaking.
+
+    ``absorb`` walks the dual graph into the residual: a residual lot whose id
+    already lives in a cluster (the dangling tail of a partially-allocated row)
+    is folded into that cluster, so the cluster shows the whole row and nets the
+    leftover instead of leaving an orphan singleton. ``False`` (default) leaves
+    residual remainders untouched.
     """
     node = {"op": "coalesce", "origin": origin, "inner": inner}
     if min_link:
         node["min_link"] = int(min_link)
+    if absorb:
+        node["absorb"] = True
     return node
 
 def soak_small(origin: str, max_bps: int = None, max_abs: int = None, by = None) -> dict:

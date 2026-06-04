@@ -2,8 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd protocol that drives a persistent workspace, and the allocation-native Report. Contract version 15 (see plan::CONTRACT_VERSION / the abi_version wasm export). There is a single `dispatch` entry point and a single Cmd protocol; a stateless batch solve is just `init` + `solve`. Rows and column identity cross out-of-band as an Arrow IPC batch whose schema is the column map; no schema/map rides this JSON.",
-  "x-contract-version": 15,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd protocol that drives a persistent workspace, and the allocation-native Report. Contract version 16 (see plan::CONTRACT_VERSION / the abi_version wasm export). There is a single `dispatch` entry point and a single Cmd protocol; a stateless batch solve is just `init` + `solve`. Rows and column identity cross out-of-band as an Arrow IPC batch whose schema is the column map; no schema/map rides this JSON.",
+  "x-contract-version": 16,
   "$defs": {
     "Cond": {
       "description": "A predicate on a candidate pair used by the flow cost model.",
@@ -626,7 +626,7 @@
         },
         {
           "title": "coalesce",
-          "description": "Collapse `inner`'s allocation-hyperedge groups into connected-component clusters: groups sharing any member id merge into one coarse group (each row's allocations summed to one edge), uniformly stamped with `origin`. The residual passes through. `min_link` gives up weak ties: a bridging allocation (a row shared by 2+ groups) below this magnitude is cut and leaked back to the residual, so a cluster splits along an immaterial overlap. 0 (default) disables leaking.",
+          "description": "Collapse `inner`'s allocation-hyperedge groups into connected-component clusters: groups sharing any member id merge into one coarse group (each row's allocations summed to one edge), uniformly stamped with `origin`. The residual passes through. `min_link` gives up weak ties: a bridging allocation (a row shared by 2+ groups) below this magnitude is cut and leaked back to the residual, so a cluster splits along an immaterial overlap. 0 (default) disables leaking. `absorb` walks the dual graph into the residual: a residual lot whose id already lives in a cluster (a partial row's tail) is folded into that cluster. false (default) leaves residual remainders untouched.",
           "type": "object",
           "properties": {
             "op": {
@@ -638,6 +638,10 @@
             "min_link": {
               "type": "integer",
               "default": 0
+            },
+            "absorb": {
+              "type": "boolean",
+              "default": false
             },
             "inner": {
               "$ref": "#/$defs/PlanNode"
