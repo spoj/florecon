@@ -11,6 +11,6 @@
   },
   "files": ["florecon.js", "index.d.ts", "engine.wasm"],
   "license": "MIT",
-  "repository": "github:florecon/florecon",
+  "repository": "github:spoj/florecon",
   "keywords": ["reconciliation", "wasm", "finance", "min-cost-flow"]
 }

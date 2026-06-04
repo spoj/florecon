@@ -149,7 +149,7 @@ function planFromCols(cols, { primary, tol = 0 } = {}) {
   steps.push({ op: "exact" });
   if (texts.length) steps.push({ op: "signal", signals: texts[0].name, tol, cap: 256 });
   if (texts.length && dates.length)
-    steps.push({ op: "flow", day: dates[0].name, tokens: texts[0].name, penalty: 1000.0, window: -1 });
+    steps.push({ op: "flow", order_by: dates[0].name, tokens: texts[0].name, penalty: 1000.0, window: -1 });
   return { primary: pickPrimary(cols, primary), root: { op: "seq", steps } };
 }
 
