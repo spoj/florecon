@@ -21,7 +21,9 @@ Each block below is a complete, runnable program against the Python host.
 ```python
 from florecon import Workspace, schema, col, NUMBER, plan as P
 
-ws = Workspace(schema([col("amount", NUMBER)]), P.exact(), primary="amount")
+plan = P.exact()
+
+ws = Workspace(schema([col("amount", NUMBER)]), plan, primary="amount")
 ws.upsert_many([(1, [500]), (2, [-500]), (3, [250]), (4, [-250])])
 rep = ws.solve()
 # two groups, each net 0: rows {1,2} and {3,4}
@@ -36,8 +38,10 @@ a tolerance; `partition` shards the book first, here by company pair.
 from florecon import Workspace, schema, col, key, KEY, NUMBER, plan as P
 
 sch = schema([col("pair", KEY), col("account", KEY), col("amount", NUMBER)])
-root = P.partition("pair", P.agg_net("account", tol=100))   # tol = 100 cents = $1.00
-ws = Workspace(sch, root, primary="amount")
+
+plan = P.partition("pair", P.agg_net("account", tol=100))   # tol = 100 cents = $1.00
+
+ws = Workspace(sch, plan, primary="amount")
 ws.upsert_many([
     (1, [key("HK01", "CN02"), "61500",  10_000]),
     (2, [key("HK01", "CN02"), "61500",  -9_950]),   # nets to 0.50 -> accepted within $1
@@ -56,7 +60,10 @@ invoice number that appears in both a payment memo and an invoice description.
 from florecon import Workspace, schema, col, NUMBER, TOKENS, plan as P
 
 sch = schema([col("amount", NUMBER), col("memo", TOKENS)])
-ws = Workspace(sch, P.signal("memo", tol=0), primary="amount")
+
+plan = P.signal("memo", tol=0)
+
+ws = Workspace(sch, plan, primary="amount")
 ws.upsert_many([
     (1, [ 100, "payment ref INV0042"]),
     (2, [-100, "INV0042 widgets"]),
@@ -75,7 +82,10 @@ from florecon import Workspace, schema, col, NUMBER, TOKENS, plan as P
 from florecon import strict_assignments
 
 sch = schema([col("amount", NUMBER), col("day", NUMBER), col("ref", TOKENS)])
-ws = Workspace(sch, P.flow(order_by="day", tokens="ref", window=30), primary="amount")
+
+plan = P.flow(order_by="day", tokens="ref", window=30)
+
+ws = Workspace(sch, plan, primary="amount")
 ws.upsert_many([
     (1, [ 100,  1, ""]),    # an open item
     (2, [-100,  2, ""]),    # a settlement one day later  (closer)
@@ -96,7 +106,8 @@ from florecon import Workspace, schema, col, key, KEY, NUMBER, TOKENS, plan as P
 
 sch = schema([col("account", KEY), col("amount", NUMBER),
               col("day", NUMBER), col("memo", TOKENS)])
-root = P.seq(
+
+plan = P.seq(
     P.agg_net("account", tol=0),                       # net clean buckets
     P.exact(),                                         # pair leftovers
     P.signal("memo", tol=0),                           # bridge on references
@@ -104,7 +115,8 @@ root = P.seq(
     P.soak_small("rounding", max_abs=50),              # <= $0.50 -> variance bucket
     P.soak_all("unmatched"),                           # classify whatever is left
 )
-ws = Workspace(sch, root, primary="amount")
+
+ws = Workspace(sch, plan, primary="amount")
 ```
 
 ### Adjudicate interactively
