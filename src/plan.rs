@@ -37,7 +37,14 @@ use crate::plan_compile::compile;
 /// [`Sel`](crate::sel::Sel) integer expression. Backward compatible on the
 /// wire: a bare JSON string still parses as a column reference, so every v10
 /// plan is a valid v11 plan.
-pub const CONTRACT_VERSION: u32 = 13;
+/// v14 adds [`PlanNode::Filter`]: gate an inner subtree's output by a [`Sel`]
+/// predicate over *group metrics* (`size`, `min_side`, `abs_net`, …), dissolving
+/// rejected groups back into the residual. Purely additive — every v13 plan is a
+/// valid v14 plan.
+/// v15 adds [`PlanNode::Coalesce`]: collapse an inner subtree's allocation
+/// hyperedges into connected-component clusters (groups sharing a row merge into
+/// one). Also additive — every v14 plan is a valid v15 plan.
+pub const CONTRACT_VERSION: u32 = 15;
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use crate::row::{PhysicalRow, ColumnMap};
@@ -113,6 +120,36 @@ pub enum PlanNode {
     /// safe: it sets apportionment ratios, never the conserved total.
     Pivot {
         amount: Sel,
+        inner: Box<PlanNode>,
+    },
+    /// Gate `inner`'s output: keep only the groups for which the `keep`
+    /// selector evaluates non-zero, dissolving every rejected group back into
+    /// the residual so a later stage (or the [`flow`](PlanNode::Flow) arbiter)
+    /// can reconsider those lots. Conservation is preserved.
+    ///
+    /// Unlike every other selector, `keep` is a [`Sel`] over *group metrics*,
+    /// not row columns — the named integer lanes are `size` (member count),
+    /// `pos` / `neg` (per-sign counts), `min_side` / `max_side`
+    /// (`min`/`max` of the two), `net`, `abs_net`, and `max_abs` / `min_abs`
+    /// (largest/smallest member magnitude). So "reject graphs over 12 lots whose
+    /// smaller side is <= 2" is
+    /// `{"and":[{"le":["size",12]},{"gt":["min_side",2]}]}`.
+    Filter { keep: Sel, inner: Box<PlanNode> },
+    /// Collapse `inner`'s allocation-hyperedge groups into their connected
+    /// components: groups that share any member id merge into one coarse group
+    /// (each member id's allocations summed to a single clean edge), `origin`
+    /// stamped on every merged cluster. The residual passes through. This turns
+    /// the matcher's interlocking partial-allocation view into the "settlement
+    /// cluster" view a human actions against. Conservation is preserved.
+    ///
+    /// `min_link` gives up weak ties: a bridging allocation (a row shared by two
+    /// or more groups) below this magnitude is cut and leaked back to the
+    /// residual, so a cluster splits along an immaterial overlap instead of
+    /// fusing two real settlements. `0` (the default) disables leaking.
+    Coalesce {
+        origin: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        min_link: i64,
         inner: Box<PlanNode>,
     },
     /// Accept an aggregation bucket (a [`Sel`] `key`) that nets to zero within
@@ -1156,6 +1193,108 @@ mod tests {
             PlanNode::Signal { signals: "tokens".into(), tol: 0, cap: 256 },
             PlanNode::Flow { day: "day".into(), tokens: "tokens".into(), penalty: 1000.0, window: 30, cost: CostSpec::default() },
         ]})
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn filter_node_serde_and_group_metric_predicate() {
+        // `keep` is a Sel over group metrics: keep only pairs whose smaller side
+        // exceeds 1 lot AND whose size is <= 3. A clean 1:1 pair has min_side==1,
+        // so it is rejected back to residual; a 2-vs-2 net survives.
+        let node: PlanNode = serde_json::from_str(
+            r#"{"op":"filter",
+                "keep":{"and":[{"gt":["min_side",1]},{"le":["size",3]}]},
+                "inner":{"op":"exact"}}"#,
+        )
+        .unwrap();
+        match &node {
+            PlanNode::Filter { keep, inner } => {
+                assert!(matches!(**inner, PlanNode::Exact {}));
+                // round-trips
+                let back: PlanNode =
+                    serde_json::from_str(&serde_json::to_string(&node).unwrap()).unwrap();
+                assert_eq!(back, node);
+                let _ = keep;
+            }
+            _ => panic!("expected filter"),
+        }
+
+        // exact_1to1 forms a single clean pair (min_side == 1) -> rejected.
+        let mut s = Session::new(map());
+        s.upsert(1, row(100, 1, 0, 999, &[])).unwrap();
+        s.upsert(2, row(-100, 2, 0, -999, &[])).unwrap();
+        let rep = s.solve(&plan(node)).unwrap();
+        // Rejected back to residual: two unmatched singleton groups, no pair.
+        assert!(rep.groups.iter().all(|g| g.origin == "unmatched"));
+        assert_eq!(rep.groups.len(), 2);
+        // Conservation still holds (the solve airlock would have errored otherwise).
+        assert_eq!(rep.allocations.len(), 2);
+    }
+
+    #[test]
+    fn filter_size_cap_dissolves_oversized_group_in_plan() {
+        // agg_net nets a 5-lot bucket; a size cap of 4 rejects it back to the
+        // residual, where soak_all then classifies the leftovers.
+        let plan = plan(PlanNode::Seq {
+            steps: vec![
+                PlanNode::Filter {
+                    keep: Sel::Le(Box::new("size".into()), Box::new(4i64.into())),
+                    inner: Box::new(PlanNode::AggNet {
+                        key: "objsub".into(),
+                        tol: Tol::Abs(0),
+                    }),
+                },
+                PlanNode::SoakAll {
+                    origin: "leftover".into(),
+                    by: None,
+                },
+            ],
+        });
+        let mut s = Session::new(map());
+        // Five rows sharing objsub=7 that net to zero (40, -10, -10, -10, -10).
+        s.upsert(1, row(40, 1, 7, 0, &[])).unwrap();
+        s.upsert(2, row(-10, 1, 7, 0, &[])).unwrap();
+        s.upsert(3, row(-10, 1, 7, 0, &[])).unwrap();
+        s.upsert(4, row(-10, 1, 7, 0, &[])).unwrap();
+        s.upsert(5, row(-10, 1, 7, 0, &[])).unwrap();
+        let rep = s.solve(&plan).unwrap();
+        // The oversized net is rejected; every row lands in a `leftover` group.
+        assert!(rep.groups.iter().all(|g| g.origin == "leftover"));
+        assert_eq!(rep.allocations.len(), 5);
+    }
+
+    #[test]
+    fn coalesce_node_clusters_flow_allocations_in_plan() {
+        // A 1-to-many settlement: row 1 (+100) clears rows 2,3,4,5 (-25 each) by
+        // shared token. The flow leaf may emit these as interlocking partial
+        // allocations; `coalesce` collapses them into one settlement cluster.
+        let plan = plan(PlanNode::Coalesce {
+            origin: "settlement".into(),
+            min_link: 0,
+            inner: Box::new(PlanNode::Flow {
+                day: "day".into(),
+                tokens: "tokens".into(),
+                penalty: 1000.0,
+                window: -1,
+                cost: CostSpec::default(),
+            }),
+        });
+        let mut s = Session::new(map());
+        s.upsert(1, row(100, 1, 0, 0, &[42])).unwrap();
+        s.upsert(2, row(-25, 1, 0, 0, &[42])).unwrap();
+        s.upsert(3, row(-25, 1, 0, 0, &[42])).unwrap();
+        s.upsert(4, row(-25, 1, 0, 0, &[42])).unwrap();
+        s.upsert(5, row(-25, 1, 0, 0, &[42])).unwrap();
+        let rep = s.solve(&plan).unwrap();
+        // Whatever the matcher's internal edge split, the matched rows end up in
+        // a single coalesced cluster (plus any unmatched singletons).
+        let clusters: Vec<&GroupOut> =
+            rep.groups.iter().filter(|g| g.origin == "settlement").collect();
+        assert_eq!(clusters.len(), 1, "one settlement cluster");
+        assert_eq!(clusters[0].size, 5, "all five rows in the cluster");
+        assert_eq!(clusters[0].net, 0);
+        // Conservation airlock passed (solve would have errored otherwise).
+        assert_eq!(rep.allocations.iter().filter(|a| a.amount != 0).count(), 5);
     }
 
     #[test]

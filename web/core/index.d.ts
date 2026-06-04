@@ -72,6 +72,8 @@ export type PlanNode =
   | { op: "branch"; pred: string; and_then: PlanNode; or_else: PlanNode }
   | { op: "windowed"; order: string; width: number; inner: PlanNode }
   | { op: "pivot"; amount: string; inner: PlanNode }
+  | { op: "filter"; keep: string | number | object; inner: PlanNode }
+  | { op: "coalesce"; origin: string; min_link?: number; inner: PlanNode }
   | { op: "soak_small"; max_bps?: number | null; max_abs?: number | null; origin: string; by?: string | null }
   | { op: "soak_all"; origin: string; by?: string | null }
   | { op: "agg_net"; key: string; tol: number }

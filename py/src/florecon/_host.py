@@ -10,7 +10,7 @@ import wasmtime
 from .data import KEY, NUMBER, TOKENS, cat
 
 # Must equal the engine's abi_version() export (plan::CONTRACT_VERSION).
-CONTRACT_VERSION = 13
+CONTRACT_VERSION = 15
 
 
 class ContractMismatch(RuntimeError):

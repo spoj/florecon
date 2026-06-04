@@ -69,6 +69,37 @@ export const branch = (pred, andThen, orElse) => ({ op: "branch", pred, and_then
 export const windowed = (order, width, inner) => ({ op: "windowed", order, width, inner });
 export const pivot = (amount, inner) => ({ op: "pivot", amount, inner });
 
+// Group-metric lanes a `filter`/`acceptIf` `keep` selector reads. Unlike every
+// other selector these name *group* metrics, not row columns:
+//   SIZE      member count
+//   POS, NEG  per-sign member counts
+//   MIN_SIDE  min(POS, NEG) — the "smaller side"
+//   MAX_SIDE  max(POS, NEG)
+//   NET       signed group net;  ABS_NET its magnitude
+//   MAX_ABS, MIN_ABS  largest / smallest member magnitude
+export const SIZE = col("size"), POS = col("pos"), NEG = col("neg");
+export const MIN_SIDE = col("min_side"), MAX_SIDE = col("max_side");
+export const NET = col("net"), ABS_NET = col("abs_net");
+export const MAX_ABS = col("max_abs"), MIN_ABS = col("min_abs");
+
+// Gate `inner`'s output: keep only the groups for which the `keep` selector (a
+// Sel over the group metrics above, non-zero = keep) holds; dissolve the rest
+// back into the residual for a later stage.
+//   filter(and(le(SIZE, 12), gt(MIN_SIDE, 2)), flow("day", "tokens"))
+export const filter = (keep, inner) => ({ op: "filter", keep, inner });
+// `acceptIf` reads more naturally for a keep-if-true predicate.
+export const acceptIf = filter;
+
+// Collapse `inner`'s allocation-hyperedge groups into connected-component
+// clusters: groups sharing any member id merge into one coarse group (each
+// row's allocations summed to one clean edge), uniformly stamped with `origin`.
+// `minLink` gives up weak ties: a bridging allocation (a row shared by 2+
+// groups) below this magnitude is cut and leaked back to the residual, so a
+// cluster splits along an immaterial overlap. 0 (default) disables leaking.
+//   coalesce("settlement", flow("day", "tokens"), { minLink: 100 })
+export const coalesce = (origin, inner, { minLink = 0 } = {}) =>
+  ({ op: "coalesce", origin, inner, ...(minLink ? { min_link: minLink } : {}) });
+
 // `tol` is absolute (a number) or relative (`relTol(bps, floor)`).
 export const aggNet = (key, tol = 0) => ({ op: "agg_net", key, tol });
 export const exact = () => ({ op: "exact" });

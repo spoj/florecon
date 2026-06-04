@@ -2,10 +2,59 @@ use crate::error::ApiError;
 use crate::flow::Model;
 use crate::plan::{Cond, CostSpec, Plan, PlanNode};
 use crate::row::{PhysicalRow, ColumnMap};
+use crate::sel::Sel;
 use crate::strategy::{
-    SoakMode, Strategy, agg_net, branch, exact_1to1_any, fixed_point, flow, labeled, partition_by,
-    pivot, seq, signal_group, soak_all, soak_small, windowed,
+    Group, SoakMode, Strategy, accept_if, agg_net, branch, coalesce, exact_1to1_any, fixed_point,
+    flow, labeled, partition_by, pivot, seq, signal_group, soak_all, soak_small, windowed,
 };
+use std::collections::HashMap;
+
+/// The named integer lanes a [`PlanNode::Filter`] `keep` selector reads, in lane
+/// order. A group is projected onto these metrics ([`group_metrics`]) and the
+/// selector — an ordinary [`Sel`] — is evaluated over that synthetic row, so the
+/// whole `Sel` operator set (arithmetic, comparisons, `and`/`or`, `in`, `if`)
+/// composes over group shape for free.
+const GROUP_METRIC_LANES: [&str; 9] = [
+    "size", "pos", "neg", "min_side", "max_side", "net", "abs_net", "max_abs", "min_abs",
+];
+
+/// The [`ColumnMap`] naming the group-metric lanes for a filter `keep`
+/// selector. Token columns are empty: group metrics are integer-only.
+fn group_metric_map() -> ColumnMap {
+    ColumnMap {
+        int_cols: GROUP_METRIC_LANES
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| (name.to_string(), i))
+            .collect(),
+        token_cols: HashMap::new(),
+    }
+}
+
+/// Project a resolved [`Group`] onto the integer metric lanes in
+/// [`GROUP_METRIC_LANES`] order, as a synthetic [`PhysicalRow`] a filter `keep`
+/// [`Sel`] evaluates against.
+fn group_metrics(g: &Group) -> PhysicalRow {
+    let pos = g.members.iter().filter(|a| a.amount > 0).count() as i64;
+    let neg = g.members.iter().filter(|a| a.amount < 0).count() as i64;
+    let mags = || g.members.iter().map(|a| a.amount.abs());
+    let max_abs = mags().max().unwrap_or(0);
+    let min_abs = mags().min().unwrap_or(0);
+    PhysicalRow {
+        ints: vec![
+            g.members.len() as i64, // size
+            pos,
+            neg,
+            pos.min(neg), // min_side
+            pos.max(neg), // max_side
+            g.net,
+            g.net.abs(), // abs_net
+            max_abs,
+            min_abs,
+        ],
+        tokens: Vec::new(),
+    }
+}
 
 #[derive(Clone)]
 struct PlanModel {
@@ -150,6 +199,21 @@ fn compile_node(
                 move |r: &PhysicalRow| a(r),
                 compile_node(inner, map)?,
             )
+        }
+        PlanNode::Filter { keep, inner } => {
+            // `keep` reads group metrics, not row columns, so it compiles
+            // against the fixed metric map and is evaluated over each group's
+            // projected metric row. Non-zero keeps the group.
+            let metric_map = group_metric_map();
+            let pred: Sel = keep.clone();
+            let f = pred.compile(&metric_map)?;
+            accept_if(
+                move |g: &Group| f(&group_metrics(g)) != 0,
+                compile_node(inner, map)?,
+            )
+        }
+        PlanNode::Coalesce { origin, min_link, inner } => {
+            coalesce(origin.clone(), *min_link, compile_node(inner, map)?)
         }
         PlanNode::AggNet { key, tol } => {
             let k = key.compile(map)?;

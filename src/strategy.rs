@@ -221,6 +221,303 @@ pub fn labeled<E: 'static>(
     })
 }
 
+struct Filter<E, FP> {
+    pred: FP,
+    inner: Box<dyn Strategy<E>>,
+}
+
+impl<E, FP> Strategy<E> for Filter<E, FP>
+where
+    E: Clone,
+    FP: Fn(&Group) -> bool,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        // Snapshot the input so a rejected group can be dissolved back into the
+        // residual: a group only carries `Allocation { id, amount }`, having
+        // shed the payload `E`, so reconstructing a residual lot needs the
+        // original row's data (and `original`, for downstream materiality).
+        let src: HashMap<ExtId, Item<E>> = bag.iter().map(|i| (i.id, i.clone())).collect();
+        let mut r = self.inner.run(bag);
+
+        let mut kept = Vec::with_capacity(r.groups.len());
+        // Restored lots are merged into the residual by id (a partial match can
+        // leave an id in *both* a group and the residual); index the existing
+        // residual so a rejected portion folds back onto its surviving sibling
+        // rather than appearing as a duplicate lot.
+        let mut residual_ix: HashMap<ExtId, usize> = r
+            .residual
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| (item.id, ix))
+            .collect();
+        for g in r.groups.drain(..) {
+            if (self.pred)(&g) {
+                kept.push(g);
+                continue;
+            }
+            // Reject: return every member's allocated portion to the residual,
+            // so `kept ⊎ residual = input` still holds in summed (id, amount).
+            for a in &g.members {
+                match residual_ix.get(&a.id) {
+                    Some(&ix) => r.residual[ix].amount += a.amount,
+                    None => {
+                        if let Some(orig) = src.get(&a.id) {
+                            residual_ix.insert(a.id, r.residual.len());
+                            r.residual.push(Item {
+                                id: a.id,
+                                original: orig.original,
+                                amount: a.amount,
+                                data: orig.data.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Resolution {
+            groups: kept,
+            residual: r.residual,
+        }
+    }
+}
+
+/// Gate an inner strategy's output: keep ("accept") only the groups for which
+/// `pred` returns `true`, and dissolve every rejected group back into the
+/// residual so downstream stages (or the [`flow`] arbiter) can reconsider those
+/// lots. Conservation is preserved — a rejected group's member allocations are
+/// returned as residual (merged onto any surviving same-id lot) rather than
+/// dropped.
+///
+/// This is the knob for *shaping* what a subtree is allowed to commit: reject
+/// over-large groups (`g.members.len() <= cap`), require both sides to be
+/// substantial (the minority-sign side must exceed a count), bound the net, and
+/// so on. The predicate sees the whole [`Group`] (its member allocations,
+/// `origin`, and `net`), so any structural test is expressible.
+///
+/// ```ignore
+/// // Accept only groups <= 12 lots whose smaller side exceeds 2; reject the
+/// // rest back to residual for a later stage.
+/// accept_if(
+///     |g| {
+///         let pos = g.members.iter().filter(|a| a.amount > 0).count();
+///         let neg = g.members.len() - pos;
+///         g.members.len() <= 12 && pos.min(neg) > 2
+///     },
+///     flow(model),
+/// )
+/// ```
+pub fn accept_if<E: Clone + 'static, FP>(
+    pred: FP,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>>
+where
+    FP: Fn(&Group) -> bool + 'static,
+{
+    Box::new(Filter { pred, inner })
+}
+
+/// Alias for [`accept_if`]: keep the groups matching `pred`, dissolve the rest
+/// back into the residual.
+pub fn filter<E: Clone + 'static, FP>(pred: FP, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>>
+where
+    FP: Fn(&Group) -> bool + 'static,
+{
+    accept_if(pred, inner)
+}
+
+struct Coalesce<E> {
+    origin: String,
+    min_link: i64,
+    inner: Box<dyn Strategy<E>>,
+}
+
+/// Union-find over `n` group indices: link two groups whenever they share a
+/// member id, then read off connected components in first-seen order.
+fn group_components(groups: &[Group]) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..groups.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]]; // path-halving
+            x = parent[x];
+        }
+        x
+    }
+    // First group index seen for each member id; subsequent sightings union.
+    let mut first: HashMap<ExtId, usize> = HashMap::new();
+    for (gi, g) in groups.iter().enumerate() {
+        for a in &g.members {
+            match first.get(&a.id) {
+                Some(&fj) => {
+                    let (ra, rb) = (find(&mut parent, gi), find(&mut parent, fj));
+                    if ra != rb {
+                        parent[ra] = rb;
+                    }
+                }
+                None => {
+                    first.insert(a.id, gi);
+                }
+            }
+        }
+    }
+    // Bucket indices by root, preserving the order roots first appear so the
+    // output is deterministic and independent of HashMap iteration order.
+    let mut order: Vec<usize> = Vec::new();
+    let mut buckets: HashMap<usize, Vec<usize>> = HashMap::new();
+    for gi in 0..groups.len() {
+        let r = find(&mut parent, gi);
+        if !buckets.contains_key(&r) {
+            order.push(r);
+        }
+        buckets.entry(r).or_default().push(gi);
+    }
+    order.into_iter().map(|r| buckets.remove(&r).unwrap()).collect()
+}
+
+impl<E: Clone> Strategy<E> for Coalesce<E> {
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        // Snapshot the input only when we might leak: a leaked edge returns to
+        // the residual as an `Item<E>`, which needs the row's payload (a group
+        // allocation has shed it). The common `min_link == 0` path never leaks
+        // and so never pays for the snapshot.
+        let src: HashMap<ExtId, Item<E>> = if self.min_link > 0 {
+            bag.iter().map(|i| (i.id, i.clone())).collect()
+        } else {
+            HashMap::new()
+        };
+        let mut r = self.inner.run(bag);
+
+        // Leak weak *linkages*: a row only binds groups together when it sits in
+        // >= 2 of them, so cutting its sub-`min_link` edges (returning that small
+        // bridging amount to the residual) lets a coarse cluster fall apart along
+        // an immaterial tie, while material ties still merge. Edges of a row that
+        // belongs to a single group are never linkages and are left intact.
+        if self.min_link > 0 {
+            let mut incidence: HashMap<ExtId, usize> = HashMap::new();
+            for g in &r.groups {
+                for a in &g.members {
+                    *incidence.entry(a.id).or_default() += 1;
+                }
+            }
+            let mut leaks: Vec<(ExtId, i64)> = Vec::new();
+            for g in &mut r.groups {
+                let mut kept = Vec::with_capacity(g.members.len());
+                for a in g.members.drain(..) {
+                    let bridging = incidence.get(&a.id).copied().unwrap_or(0) >= 2;
+                    if bridging && a.amount.abs() < self.min_link {
+                        leaks.push((a.id, a.amount));
+                    } else {
+                        kept.push(a);
+                    }
+                }
+                g.members = kept;
+            }
+            // A group emptied by leaking carries nothing into the components.
+            r.groups.retain(|g| !g.members.is_empty());
+            // Fold leaked amounts back into the residual, merging onto any
+            // surviving same-id lot so a partly-leaked row is one residual entry.
+            let mut residual_ix: HashMap<ExtId, usize> = r
+                .residual
+                .iter()
+                .enumerate()
+                .map(|(ix, it)| (it.id, ix))
+                .collect();
+            for (id, amount) in leaks {
+                match residual_ix.get(&id) {
+                    Some(&ix) => r.residual[ix].amount += amount,
+                    None => {
+                        if let Some(orig) = src.get(&id) {
+                            residual_ix.insert(id, r.residual.len());
+                            r.residual.push(Item {
+                                id,
+                                original: orig.original,
+                                amount,
+                                data: orig.data.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            r.residual.retain(|i| i.amount != 0);
+        }
+
+        let comps = group_components(&r.groups);
+        let mut groups = Vec::with_capacity(comps.len());
+        for comp in comps {
+            // Sum every member id's allocations across the component into one
+            // allocation per id, so the coarse group is a clean one-edge-per-row
+            // view. Deterministic by id order. (For a lone group this is the
+            // identity on its distinct-id allocations.)
+            let mut by_id: BTreeMap<ExtId, i64> = BTreeMap::new();
+            for &gi in &comp {
+                for a in &r.groups[gi].members {
+                    *by_id.entry(a.id).or_insert(0) += a.amount;
+                }
+            }
+            let members: Vec<Allocation> = by_id
+                .into_iter()
+                .map(|(id, amount)| Allocation { id, amount })
+                .collect();
+            let net = members.iter().map(|a| a.amount).sum();
+            // Every emitted cluster carries the coalesce `origin` uniformly. A
+            // lone group keeps its inner `reason` (nothing was merged); a merged
+            // cluster gets a synthesized one.
+            let reason = if comp.len() == 1 {
+                r.groups[comp[0]].reason.clone()
+            } else {
+                Some(format!("coalesced {} groups", comp.len()))
+            };
+            groups.push(Group {
+                members,
+                origin: self.origin.clone(),
+                net,
+                reason,
+            });
+        }
+        Resolution {
+            groups,
+            residual: r.residual,
+        }
+    }
+}
+
+/// Collapse an inner strategy's allocation-hyperedge groups into their
+/// **connected components**: groups that share any member id are merged into a
+/// single coarse group, with each member id's allocations summed so the result
+/// is one clean edge per row. The residual passes through (plus any leaked
+/// linkages, below).
+///
+/// The [`flow`] arbiter (and partial matchers in general) produce an allocation
+/// *hypergraph* — a row can be split across several groups, and groups interlock
+/// through shared rows. That is the right representation for conservation and
+/// for the optimizer, but it is awkward to action by hand. `coalesce` turns it
+/// into the coarser "settlement cluster" view a human reconciles against: every
+/// set of rows transitively tied together by the matcher becomes one group,
+/// uniformly stamped with `origin`.
+///
+/// `min_link` gives up **weak linkages**: a row binds groups together only when
+/// it appears in two or more of them, so any such bridging allocation whose
+/// magnitude is below `min_link` is cut and leaked back to the residual,
+/// letting a cluster fall apart along an immaterial tie instead of fusing two
+/// real settlements through a rounding-sized overlap. `0` disables leaking (pure
+/// connected components). Edges of a row that belongs to a single group are
+/// never linkages and are kept regardless.
+///
+/// Conservation holds: merging regroups the same allocations (summing only
+/// same-id edges within a component) and a leaked edge moves intact from its
+/// group to the residual, so `groups ⊎ residual = input` still holds in summed
+/// `(id, amount)`. A lone group keeps its inner `reason`.
+pub fn coalesce<E: Clone + 'static>(
+    origin: impl Into<String>,
+    min_link: i64,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>> {
+    Box::new(Coalesce {
+        origin: origin.into(),
+        min_link,
+        inner,
+    })
+}
+
 struct FixedPoint<E> {
     inner: Box<dyn Strategy<E>>,
     max_passes: usize,
@@ -1601,6 +1898,168 @@ mod tests {
         let r = pipeline.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 2);
+    }
+
+    #[test]
+    fn accept_if_rejects_groups_back_to_residual() {
+        // exact_1to1 forms two equal-magnitude pairs; accept only the pair whose
+        // magnitude is 5. The rejected pair (magnitude 7) must reappear in the
+        // residual, fully intact, so nothing is lost.
+        let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
+        let mut s = accept_if(
+            |g: &Group| g.members.iter().all(|a| a.amount.abs() == 5),
+            exact_1to1_any(),
+        );
+        let r = s.run(b);
+        conserves(4, &r);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(ids(&r.groups[0]), vec![1, 2]);
+        let mut left: Vec<ExtId> = r.residual.iter().map(|i| i.id).collect();
+        left.sort();
+        assert_eq!(left, vec![3, 4]);
+        // The rejected lots keep their amounts, so a downstream stage sees them
+        // exactly as the inner strategy received them.
+        for i in &r.residual {
+            assert_eq!(i.amount.abs(), 7);
+        }
+    }
+
+    #[test]
+    fn accept_if_size_cap_and_minority_side() {
+        // A big one-to-many group (1 vs 4) and a clean small pair. Reject groups
+        // bigger than 3 lots; the small pair survives, the big group dissolves.
+        let b = bag(&[(1, 40), (2, -10), (3, -10), (4, -10), (5, -10), (6, 8), (7, -8)]);
+        let mut s = accept_if(
+            |g: &Group| g.members.len() <= 3,
+            agg_net(|a: &i64| if a.unsigned_abs() == 8 { 1u64 } else { 0u64 }, 0),
+        );
+        let r = s.run(b);
+        conserves(7, &r);
+        assert_eq!(r.groups.len(), 1, "only the small pair is accepted");
+        assert_eq!(ids(&r.groups[0]), vec![6, 7]);
+        assert_eq!(r.residual.len(), 5, "the over-large group is dissolved");
+    }
+
+    #[test]
+    fn filter_is_an_alias_for_accept_if() {
+        let b = bag(&[(1, 5), (2, -5)]);
+        let mut s = filter(|_g: &Group| false, exact_1to1_any());
+        let r = s.run(b);
+        conserves(2, &r);
+        assert_eq!(r.groups.len(), 0, "rejecting everything leaves only residual");
+        assert_eq!(r.residual.len(), 2);
+    }
+
+    /// A leaf that emits a fixed, possibly-interlocking set of groups (members
+    /// referenced by id), passing everything else to residual. Lets us drive
+    /// `coalesce` with a known hypergraph regardless of any matcher's heuristics.
+    struct EmitGroups(Vec<Vec<(ExtId, i64)>>);
+    impl Strategy<i64> for EmitGroups {
+        fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+            let claimed: BTreeSet<ExtId> =
+                self.0.iter().flatten().map(|&(id, _)| id).collect();
+            let groups = self
+                .0
+                .iter()
+                .map(|m| Group {
+                    members: m
+                        .iter()
+                        .map(|&(id, amount)| Allocation { id, amount })
+                        .collect(),
+                    origin: "emit".into(),
+                    net: m.iter().map(|&(_, a)| a).sum(),
+                    reason: None,
+                })
+                .collect();
+            let residual = bag.into_iter().filter(|i| !claimed.contains(&i.id)).collect();
+            Resolution { groups, residual }
+        }
+    }
+
+    #[test]
+    fn coalesce_merges_groups_that_share_a_row() {
+        // Two groups interlock through row 2 (split 60/40): coalesce unions them
+        // into one cluster and sums row 2's allocations back to 100.
+        let inner = EmitGroups(vec![
+            vec![(1, 100), (2, -60)],
+            vec![(2, -40), (3, 100), (4, -100)],
+        ]);
+        let b = bag(&[(1, 100), (2, -100), (3, 100), (4, -100), (9, 7)]);
+        let mut s = coalesce("settlement", 0, Box::new(inner));
+        let r = s.run(b);
+        conserves(5, &r);
+        assert_eq!(r.groups.len(), 1, "the two interlocking groups merge");
+        let g = &r.groups[0];
+        assert_eq!(g.origin, "settlement");
+        assert_eq!(ids(g), vec![1, 2, 3, 4]);
+        // Row 2's split allocations are summed into a single clean edge.
+        let two = g.members.iter().find(|a| a.id == 2).unwrap();
+        assert_eq!(two.amount, -100);
+        assert_eq!(g.net, 0);
+        // The untouched row stays in residual.
+        assert_eq!(r.residual.len(), 1);
+        assert_eq!(r.residual[0].id, 9);
+    }
+
+    #[test]
+    fn coalesce_keeps_disjoint_groups_separate() {
+        // Two groups with no shared row remain two distinct clusters, each
+        // uniformly stamped with the coalesce origin.
+        let inner = EmitGroups(vec![vec![(1, 5), (2, -5)], vec![(3, 7), (4, -7)]]);
+        let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
+        let mut s = coalesce("settlement", 0, Box::new(inner));
+        let r = s.run(b);
+        conserves(4, &r);
+        assert_eq!(r.groups.len(), 2, "disjoint components stay separate");
+        assert!(r.groups.iter().all(|g| g.origin == "settlement"));
+    }
+
+    #[test]
+    fn coalesce_leaks_weak_linkage_and_splits_the_cluster() {
+        // Row 2 bridges two otherwise-separate settlements, but only by a tiny
+        // 3-unit overlap (it is split -97 / -3). With min_link=10 that weak tie
+        // is cut: the 3 leaks to residual and the cluster falls into two groups.
+        let inner = EmitGroups(vec![
+            vec![(1, 100), (2, -97)],
+            vec![(2, -3), (3, 100), (4, -100)],
+        ]);
+        let b = bag(&[(1, 100), (2, -100), (3, 100), (4, -100)]);
+        let mut s = coalesce("settlement", 10, Box::new(inner));
+        let r = s.run(b);
+        // Amount conservation per id (count conservation does not hold once a
+        // row is split between a kept edge and a leaked residual).
+        let mut acc: BTreeMap<ExtId, i64> = BTreeMap::new();
+        for g in &r.groups {
+            for a in &g.members {
+                *acc.entry(a.id).or_default() += a.amount;
+            }
+        }
+        for i in &r.residual {
+            *acc.entry(i.id).or_default() += i.amount;
+        }
+        assert_eq!(acc.get(&2), Some(&-100), "row 2's mass is preserved");
+
+        assert_eq!(r.groups.len(), 2, "weak tie cut -> two clusters");
+        // Row 2 keeps its material -97 edge; its weak -3 edge leaked.
+        assert_eq!(r.residual.len(), 1);
+        assert_eq!(r.residual[0].id, 2);
+        assert_eq!(r.residual[0].amount, -3);
+    }
+
+    #[test]
+    fn coalesce_keeps_strong_linkage_even_with_threshold() {
+        // The same shape but a *material* overlap (-60 / -40): both bridging
+        // edges clear min_link=10, so the cluster still merges as one.
+        let inner = EmitGroups(vec![
+            vec![(1, 100), (2, -60)],
+            vec![(2, -40), (3, 100), (4, -100)],
+        ]);
+        let b = bag(&[(1, 100), (2, -100), (3, 100), (4, -100)]);
+        let mut s = coalesce("settlement", 10, Box::new(inner));
+        let r = s.run(b);
+        assert_eq!(r.groups.len(), 1, "strong tie survives -> one cluster");
+        assert!(r.residual.is_empty(), "nothing leaked");
+        assert_eq!(ids(&r.groups[0]), vec![1, 2, 3, 4]);
     }
 
     #[test]

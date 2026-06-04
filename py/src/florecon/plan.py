@@ -90,6 +90,49 @@ def pivot(amount, inner: dict) -> dict:
     """Temporarily match inner in another numeraire."""
     return {"op": "pivot", "amount": amount, "inner": inner}
 
+# Group-metric lanes a `filter` `keep` selector reads (Sel column references).
+# Unlike every other selector these are *group* metrics, not row columns:
+#   SIZE      member count
+#   POS, NEG  per-sign member counts
+#   MIN_SIDE  min(POS, NEG) -- the "smaller side"
+#   MAX_SIDE  max(POS, NEG)
+#   NET       signed group net; ABS_NET its magnitude
+#   MAX_ABS, MIN_ABS  largest / smallest member magnitude
+SIZE, POS, NEG = col("size"), col("pos"), col("neg")
+MIN_SIDE, MAX_SIDE = col("min_side"), col("max_side")
+NET, ABS_NET = col("net"), col("abs_net")
+MAX_ABS, MIN_ABS = col("max_abs"), col("min_abs")
+
+def filter(keep, inner: dict) -> dict:
+    """Gate ``inner``'s output: keep only the groups for which the ``keep``
+    selector evaluates non-zero, dissolving every rejected group back into the
+    residual for a later stage. ``keep`` is a Sel over *group metrics* (``SIZE``,
+    ``MIN_SIDE``, ``ABS_NET``, ...), e.g.::
+
+        filter(and_(le(SIZE, 12), gt(MIN_SIDE, 2)), flow(...))
+    """
+    return {"op": "filter", "keep": keep, "inner": inner}
+
+# `accept_if` reads more naturally for a keep-if-true predicate.
+accept_if = filter
+
+def coalesce(origin: str, inner: dict, min_link: int = 0) -> dict:
+    """Collapse ``inner``'s allocation-hyperedge groups into connected-component
+    clusters: groups sharing any member id merge into one coarse group (each
+    row's allocations summed to a single clean edge), uniformly stamped with
+    ``origin``. Turns the matcher's interlocking partial-allocation view into the
+    settlement-cluster view a human actions against.
+
+    ``min_link`` gives up weak ties: a bridging allocation (a row shared by two
+    or more groups) below this magnitude is cut and leaked back to the residual,
+    so a cluster splits along an immaterial overlap instead of fusing two real
+    settlements. ``0`` (default) disables leaking.
+    """
+    node = {"op": "coalesce", "origin": origin, "inner": inner}
+    if min_link:
+        node["min_link"] = int(min_link)
+    return node
+
 def soak_small(origin: str, max_bps: int = None, max_abs: int = None, by = None) -> dict:
     """Consume residual lots that are small versus their original line amount
     and/or an absolute threshold. If `by` is supplied, bucket by that class;
