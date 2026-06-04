@@ -1,225 +1,262 @@
 # florecon
 
-**Reconciliation by flow. Nothing created, nothing lost.**
+florecon reconciles financial ledgers. You describe a matching strategy as a
+small plan, run it over your rows, and get back groups plus the signed amount
+each row contributes to each group. It ships as one WebAssembly core with thin
+Rust, Python, and JavaScript hosts.
 
-`florecon` (flow-recon) reconciles financial ledgers as a **conserving
-combinator algebra over a min-cost-flow core**. Cheap deterministic rules
-(exact match, aggregate netting, reference-token bridges) cascade ahead of a
-network-simplex arbiter that resolves the ambiguous remainder. Every stage
-preserves signed amount: reported `allocations` are the source of truth, and a
-row/lot may contribute to more than one group when partial matching is enabled.
+Conventions used throughout: money is integer **minor units** (cents). A
+`number` column is an integer, a `key` column is a categorical string (hashed
+host-side), a `tokens` column is free text (tokenized by the engine). A row id
+is a caller-owned integer.
 
-The mental model is a **conserved allocation hypergraph you adjudicate, not a
-search you run**. Groups are hyperedges; allocation rows say which business row
-contributes what signed amount to each group. The machine *proposes* (a
-confidence cascade from exact matches down to flow), and you *adjudicate*:
-**freeze** what you trust, **break up** what you don't, **recalc** to retry.
-Frozen groups are signed-off allocation edges. Row-level groupings are explicit
-client projections (strict assignment, connected components, primary group, or
-your own), not core engine truth.
+## Recon problems, in Python
 
-## One core, every skin
+Each block below is a complete, runnable program against the Python host.
 
-The engine is one WASM module driven over linear memory; every distributable is
-a thin skin over the same bytes and the same JSON wire contract. The bindings
-cannot drift, because all they do is marshal `Plan` / `Cmd` / `Report` JSON to
-one binary.
+### Pair equal-and-opposite entries
 
-| Distributable | Path | What it is |
-|---|---|---|
-| Rust crate | `/` (`florecon`) | The engine + algebra + plan API, source of truth. |
-| Python wheel | `py/` (`florecon`) | `py3-none-any` wheel bundling the wasm + a wasmtime host + a Plan builder. One artifact, every OS — no native extension to compile. |
-| npm package | `web/core/` (`@florecon/core`) | The browser/Node host + TypeScript types + bundled wasm. |
-| Workbench | `web/` | A no-framework analytical UI; all compute runs in the wasm in the browser, data never leaves the client. |
-| **Contract** | `schema/plan.schema.json` | The versioned JSON Schema for `Plan` / `Cmd` / `Report`. The actual product. |
-
-## Architecture
-
-Four layers, each a thin lowering of the one above:
-
-| Layer | Module | Role |
-|---|---|---|
-| Engine | `engine` | Network-simplex transportation solver. Stable node/arc handles, warm-started re-solves with incremental potentials, snapshot/restore. Domain-agnostic, no FX, no Arrow. |
-| Flow | `flow` | The incremental min-cost-flow matcher: describe a domain once via the `Model` trait, then `upsert` / `remove` / `solve`. Generates candidate arcs (sorted, deterministic), reads back netted groups. The engine behind the `flow` leaf. |
-| Algebra | `strategy` | `Strategy: Bag -> (Groups, residual)`, conserving by construction. Primitives `exact_1to1`, `agg_net`, `signal_group`, `running_zero`, `flow`; combinators `seq`, `partition_by`, `windowed`. |
-| Plan | `plan` | Serializable `Plan` (the strategy tree as data, pricing included via `CostSpec`), one generic stateful facade `Recon<E>` (with `Workspace` its `Row` specialization), allocation-native `Report`. Conservation enforced at the boundary. |
-
-The `wasm` feature compiles the `plan` API into a single C-ABI module (`alloc` /
-`dealloc` / `dispatch` over linear memory, no wasm-bindgen) that any
-runtime can drive — the same artifact targets the browser, Databricks, or a
-wasmtime wheel. There is one entry point: `dispatch` drives a persistent
-workspace via the `Cmd` protocol, and a stateless batch solve is just `init`
-followed by `solve` on a workspace the caller discards.
-
-## The vocabulary is the brand
-
-The same words name the same things in the crate, the wheel, the UI, and the
-code: `Plan`, `Workspace`, `Group`, and the verbs `freeze` / `breakup` /
-`recalc`. A `Plan` is the strategy as data; a `Workspace` is the conserved pile
-you adjudicate; a `Group` is a reconciliation hyperedge with a `net`; an
-`Allocation` is the signed incidence from a row/lot into a group. "Residual"
-survives only as a human word for unmatched/variance allocation groups, not as a
-separate engine data structure.
-
-## Design notes
-
-These are the load-bearing decisions and the non-obvious ones — the things that
-stay true as the code moves. (Implementation walk-throughs are deliberately
-*not* kept as prose; they rot. Read the code.)
-
-- **Conservation is the correctness property.** It is structural, not a runtime
-  check you can forget: the combinators conserve by construction, and the
-  boundary materializes every residual lot as an allocation before returning. A
-  bad plan becomes a bad *proposal* (mass left in unmatched/variance groups),
-  never a broken ledger.
-- **The report is an allocation hypergraph.** `Report { groups, allocations }`
-  is the core wire shape. There is deliberately no canonical row assignment in
-  the report because split lots make that lossy: clients choose a projection
-  (`strict_assignments`, connected components, primary group, or custom).
-- **Everything reportable is a group; `live | frozen` is the only recalc axis.**
-  There is no separate residual bucket. `Status` is the sole recalc axis and
-  **only an operator flips it**: `live` is the machine's current opinion
-  (re-pooled on every recalc), `frozen` is your decision (inviolable). Matched
-  vs unmatched is a client projection over group origin/arity/net, not a third
-  status. Live group ids are **ephemeral** (re-minted each solve); only frozen
-  group ids are stable, so never reference a live group id across a solve.
-- **Review/attention is a second axis, never a third status.** Staging and tags
-  are a host-owned, many-to-many overlay keyed by the **stable row id**,
-  orthogonal to the engine partition and never crossing into the conservation
-  engine (so they survive recalc for free). A tagged set is promoted to a match
-  or an exception through the existing verbs; the engine never learns the word
-  "staging".
-- **Warm-start must equal cold.** The flow simplex dominates solve time, so its
-  matcher is kept alive per shard and re-solved incrementally across recalc.
-  Warm and cold solves must agree: guaranteed by deterministic arc ordering and
-  a deterministic *scrambled* node order (a monotone id order is a pathological
-  network-simplex pivot sequence), and cross-checked on the objective in debug.
-- **Strategy nodes may hold state.** `Strategy::run` takes `&mut self`;
-  statefulness is an opt-in *capability*, not a mandate (only the flow leaf uses
-  it). Any node that holds state owes the warm-equals-cold guarantee above.
-- **Numeraire per shard.** `partition_by(currency)` makes the native amount the
-  conserved quantity within each shard, so FX never enters the flow.
-- **Money is `i64` minor units.** Integral flows, exact net-zero.
-- **Cost is data.** The flow arbiter prices candidate pairs with a serializable
-  `CostSpec` (ordered confidence tiers; first satisfied tier wins, no tier means
-  forbidden). The default reproduces the reference-bridge > exact-amount
-  cascade; the whole strategy, pricing included, is one JSON `Plan`.
-- **Lot capability is explicit and scoped.** A `lots(amount, inner)` plan node
-  turns a row into a lot with two amounts: the original line value and the
-  current residual left after upstream allocations. `seq` forwards residual lots
-  to the next step; `partition` is the hard reach boundary, so put
-  `lots(seq(...))` inside the partition whose residuals must not escape. The
-  report shape is unchanged: allocations always expose the maximum information,
-  and simple clients project them back to groups when appropriate.
-- **Residual classifiers are strategies.** `soak_small` consumes residual lots
-  whose current amount is immaterial versus the original line amount (basis
-  points and/or absolute minor units), optionally bucketed by a variance class;
-  `soak_all` materializes whatever remains into unmatched/writeoff buckets.
-- **Predicates and derived columns belong upstream.** The DSL expresses the
-  *structure* of reconciliation (group / net / shard / cascade / window); which
-  rows and what keys are a data-prep concern, computed before the table is
-  handed in.
-- **Versioned wire contract.** `Plan` / `Cmd` / `Report` are a published schema
-  (`schema/plan.schema.json`). The engine exports `abi_version`; every host
-  refuses to run against a mismatched binary, so the bindings cannot silently
-  drift.
-
-## Running
-
-### Rust — the combinator pipeline on a parquet file
-
-```bash
-cargo run --release --example interco [path.parquet]
-# 279k rows: 87.7% by count, 85.2% by value, conservation OK, ~0.4s
-```
-
-### Build the WASM core
-
-```bash
-./scripts/build_wasm.sh
-# builds target/.../florecon.wasm and stages it into the wheel and npm package
-```
-
-### Python — the wheel
-
-```bash
-python -m build --wheel py/        # -> py/dist/florecon-0.1.0-py3-none-any.whl
-pip install py/dist/florecon-0.1.0-py3-none-any.whl
-```
+`exact` pairs each row with an equal-and-opposite one.
 
 ```python
-from florecon import Workspace, plan as P, schema, col, key, KEY, NUMBER, TOKENS
+from florecon import Workspace, schema, col, NUMBER, plan as P
 
-sch = schema([
-    col("unit", KEY), col("ccy", KEY), col("day", NUMBER),
-    col("objsub", KEY), col("native", NUMBER), col("tokens", TOKENS),
+ws = Workspace(schema([col("amount", NUMBER)]), P.exact(), primary="amount")
+ws.upsert_many([(1, [500]), (2, [-500]), (3, [250]), (4, [-250])])
+rep = ws.solve()
+# two groups, each net 0: rows {1,2} and {3,4}
+```
+
+### Net a bucket within a tolerance
+
+`agg_net` accepts a bucket (keyed by a column) whose members net to zero within
+a tolerance; `partition` shards the book first, here by company pair.
+
+```python
+from florecon import Workspace, schema, col, key, KEY, NUMBER, plan as P
+
+sch = schema([col("pair", KEY), col("account", KEY), col("amount", NUMBER)])
+root = P.partition("pair", P.agg_net("account", tol=100))   # tol = 100 cents = $1.00
+ws = Workspace(sch, root, primary="amount")
+ws.upsert_many([
+    (1, [key("HK01", "CN02"), "61500",  10_000]),
+    (2, [key("HK01", "CN02"), "61500",  -9_950]),   # nets to 0.50 -> accepted within $1
+    (3, [key("HK01", "CN02"), "72000",   5_000]),
+    (4, [key("HK01", "CN02"), "72000",  -5_000]),   # nets to 0.00
 ])
-pln = P.partition("unit", P.partition("ccy", P.seq(
-    P.agg_net("objsub", tol=100),
-    P.exact(),
-    P.signal("tokens", tol=100, cap=256),
-    P.flow(order_by="day", tokens="tokens"),
-)))
-
-ws = Workspace(sch, pln, primary="native")
-# Bare cells: a string for key/tokens columns, an int for number columns. You
-# ship business values, not hashes — the host hashes key columns and the engine
-# tokenizes free text; the Arrow batch schema is the engine's column map.
-ws.upsert(1, [key("00492", "00288"), "USD", 1, "61500", 100, "INV1"])
-ws.upsert(2, [key("00492", "00288"), "USD", 2, "61500", -100, "INV1"])
-ws.solve()                      # one clean group; ws.freeze(0) signs it off
+rep = ws.solve()
 ```
 
-The full interco pipeline through the wasm (exact match to native):
+### Bridge on a shared reference
+
+`signal` groups rows that share a free-text token and net to zero — e.g. an
+invoice number that appears in both a payment memo and an invoice description.
+
+```python
+from florecon import Workspace, schema, col, NUMBER, TOKENS, plan as P
+
+sch = schema([col("amount", NUMBER), col("memo", TOKENS)])
+ws = Workspace(sch, P.signal("memo", tol=0), primary="amount")
+ws.upsert_many([
+    (1, [ 100, "payment ref INV0042"]),
+    (2, [-100, "INV0042 widgets"]),
+])
+rep = ws.solve()   # one net-zero group, bridged by the shared INV0042 token
+```
+
+### Let the solver choose among candidates
+
+`flow` is a min-cost-flow matcher: it pairs opposite-sign rows by proximity in
+an ordering (here `day`) and a cost model, picking the most plausible
+counterparty when several compete.
+
+```python
+from florecon import Workspace, schema, col, NUMBER, TOKENS, plan as P
+from florecon import strict_assignments
+
+sch = schema([col("amount", NUMBER), col("day", NUMBER), col("ref", TOKENS)])
+ws = Workspace(sch, P.flow(order_by="day", tokens="ref", window=30), primary="amount")
+ws.upsert_many([
+    (1, [ 100,  1, ""]),    # an open item
+    (2, [-100,  2, ""]),    # a settlement one day later  (closer)
+    (3, [-100, 20, ""]),    # another candidate, far out
+])
+rep = ws.solve()
+strict_assignments(rep)     # rows 1 & 2 grouped; row 3 left as a residual singleton
+```
+
+### Cascade several rules
+
+`seq` runs steps in order; each step only sees what the previous one left over.
+Put cheap deterministic rules first and the flow arbiter last, then sweep
+immaterial leftovers.
+
+```python
+from florecon import Workspace, schema, col, key, KEY, NUMBER, TOKENS, plan as P
+
+sch = schema([col("account", KEY), col("amount", NUMBER),
+              col("day", NUMBER), col("memo", TOKENS)])
+root = P.seq(
+    P.agg_net("account", tol=0),                       # net clean buckets
+    P.exact(),                                         # pair leftovers
+    P.signal("memo", tol=0),                           # bridge on references
+    P.flow(order_by="day", tokens="memo", window=30),  # arbitrate the remainder
+    P.soak_small("rounding", max_abs=50),              # <= $0.50 -> variance bucket
+    P.soak_all("unmatched"),                           # classify whatever is left
+)
+ws = Workspace(sch, root, primary="amount")
+```
+
+### Adjudicate interactively
+
+A `Workspace` is stateful: stream rows in, solve, then sign off what you trust.
+Frozen groups survive later solves untouched; rows can be added or removed and
+re-solved incrementally.
+
+```python
+ws.solve()
+ws.freeze_clean(tol=0)            # sign off every clean net-zero match
+ws.upsert_many([(5, [...]), (6, [...])])   # tomorrow's rows arrive
+ws.solve()                       # warm re-solve; frozen groups are kept as-is
+ws.breakup(group_id)             # changed your mind about a live group
+ws.solve()
+```
+
+## Reading the result
+
+`solve()` returns a report with two lists:
+
+- `groups` — each has `group_id`, `status` (`live` or `frozen`), `net`, `size`,
+  `origin` (which rule formed it), and `reason`.
+- `allocations` — each is one row's signed contribution to one group:
+  `id` (row), `group_id`, `amount`.
+
+A row can contribute to more than one group, so the allocations are the source
+of truth and a single row-to-group assignment is a projection you pick:
+
+```python
+from florecon import strict_assignments, connected_components
+
+strict_assignments(rep)    # [(row_id, group_id), ...] — errors if a row is split
+connected_components(rep)  # settlement clusters: [{"rows": [...], "groups": [...]}, ...]
+```
+
+## Getting started
+
+### Python
+
+The wheel is `py3-none-any` — it bundles the wasm and a wasmtime host, so there
+is no native extension to compile.
 
 ```bash
-python python/run_interco.py [path.parquet] [--pair COMPANY ICP] [--max N]
+python -m build --wheel py/                 # -> py/dist/florecon-0.1.0-py3-none-any.whl
+pip install py/dist/florecon-*.whl
 ```
 
-### Workbench — browser + WASM
-
-An interactive reconciliation UI: cross-filtering slicers, a groups table, a
-line-level detail pane, and the verbs (freeze / break up / recalc) driven by the
-stateful `Workspace`. Slicers and detail columns are rendered from a portable
-`fields` descriptor built during ingest, so a differently-shaped book ports by
-building a different descriptor — no UI code changes. The groups table is itself
-a slicer (multi-select to union groups into the detail pane); with nothing
-selected the detail pane is a faithful, unfiltered timeline of every line in
-view, so nothing is ever "matched away" and hidden while groupings are still
-volatile. All computation runs in the wasm in the browser — the data never
-leaves the client.
+Or run straight from the source tree:
 
 ```bash
-python -m http.server 8000        # serve from the repo root
-# open http://localhost:8000/web/index.html  — upload a CSV, map columns, solve
-node web/smoke.mjs                # headless check of the browser host ABI
+pip install pyarrow wasmtime
+PYTHONPATH=py/src python your_script.py
 ```
 
-The browser host (`@florecon/core`) is the exact analog of the Python host:
-allocate, write a JSON command, call `dispatch`, read the JSON report. The
-workbench owns only display records, filter state, and its chosen projection;
-the engine owns the rows and the conserved allocation hypergraph.
+### Rust
 
-## The contract
+The crate is the source of truth (engine + plan API). Build a `Plan` and drive a
+`Workspace` (`upsert` / `solve` / `freeze` / `breakup`).
+
+```bash
+cargo test
+cargo run --release --example interco [path.parquet]   # the cascade on a real ledger
+```
+
+### JavaScript / Node
+
+The browser/Node host is a thin wrapper over the wasm: you marshal an Arrow IPC
+batch plus JSON commands and call `dispatch`.
+
+```bash
+./scripts/build_wasm.sh        # builds the wasm and stages web/core/engine.wasm
+node web/smoke.mjs             # headless host check
+```
+
+```js
+import { Florecon } from "@florecon/core";
+
+const fe = await Florecon.load("./engine.wasm");
+fe.dispatch({ op: "init", plan }, arrowBytes);   // rows ride in the Arrow batch
+fe.dispatch({ op: "solve" });
+```
+
+### Web demo
+
+`web/` is a demo that runs in the browser with an interactive UI.
+
+```bash
+python -m http.server 8000     # then open http://localhost:8000/web/index.html
+```
+
+## How it works
+
+A plan is a tree of **strategies**. A strategy takes a bag of rows and returns
+the groups it formed plus the rows it left over. Every strategy preserves signed
+amount: what goes in equals the grouped allocations plus the leftovers. A plan
+therefore cannot create or lose money — only decide how it is grouped — so a bad
+plan yields a bad *proposal* (mass sitting in unmatched/variance groups), never a
+broken ledger.
+
+Leaves form groups:
+
+- `exact` — pair a row with an equal-and-opposite row.
+- `agg_net` — accept a bucket (by a key column) that nets to zero within a tolerance.
+- `signal` — group rows sharing a free-text token that net to zero.
+- `flow` — a min-cost-flow matcher that pairs opposite-sign rows by proximity in
+  an ordering and a cost model, choosing among competing candidates; it can split
+  a row's amount across counterparties.
+- `soak_small` / `soak_all` — sweep leftover rows into variance or write-off buckets.
+
+Combinators arrange leaves:
+
+- `seq` — run steps in order; each sees only the previous step's leftovers (a cascade).
+- `partition` — shard by a column and run the inner plan independently per shard
+  (e.g. per company pair, per currency).
+- `windowed` — restrict matching to a sliding window over an ordering.
+- `branch` — route rows to different sub-plans by a predicate.
+- `filter` — keep only groups meeting a condition (size, net, ...), dissolving the
+  rest back to leftovers.
+- `pivot` — run a sub-plan in a different amount column, translating results back.
+- `fixed_point` — repeat a sub-plan on its own leftovers until nothing more groups.
+
+The `by` / `key` / `order` / `pred` fields of these nodes accept a column name or
+a small integer expression over the row's columns (`col`, `lit`, comparisons,
+`and_`/`or_`, `iff`, ...).
+
+A `Workspace` is the same plan made interactive. You `upsert` and `remove` rows,
+call `solve` to (re)compute groups, and `freeze` groups you trust or `breakup`
+ones you don't. Frozen groups are kept as fixed constraints and survive later
+solves; live groups are recomputed every solve, so their ids are re-minted each
+time — reference rows by their stable id, not a live group id. Re-solving is
+incremental and warm-started. You can also swap the plan itself with `replan` to
+retune the rules without reloading rows — frozen decisions are kept.
+
+Money is `i64` minor units, so netting is exact.
+
+## The wire contract
+
+`Plan`, `Cmd`, and `Report` are a versioned JSON contract
+(`schema/plan.schema.json`, `additionalProperties: false` throughout). The engine
+exports `abi_version`; every host refuses to run against a mismatched binary, so
+the bindings cannot silently drift.
 
 ```bash
 pip install jsonschema
-python schema/validate.py          # validate the built-in canonical commands
+python schema/validate.py        # validate the canonical commands against the schema
 ```
-
-`schema/plan.schema.json` is the single source of truth for what crosses the
-boundary. `additionalProperties: false` throughout, so typos and stray fields
-are rejected, not silently ignored.
-
-## Features
-
-- `serde` — serialize snapshots and `Plan`s.
-- `wasm` — the C-ABI consumption surface (implies `serde`).
 
 ## Tests
 
 ```bash
-cargo test --features serde       # lib tests + doctest
-cargo clippy --all-targets --features wasm
-node web/smoke.mjs                # browser-host ABI on real data
+cargo test                       # Rust lib + doctests
+node web/smoke.mjs               # browser-host ABI
+PYTHONPATH=py/src python py/smoke_stateful.py   # stateful Python host
 ```
