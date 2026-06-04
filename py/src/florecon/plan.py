@@ -116,30 +116,33 @@ def filter(keep, inner: dict) -> dict:
 # `accept_if` reads more naturally for a keep-if-true predicate.
 accept_if = filter
 
-def coalesce(origin: str, inner: dict, min_link: int = 0, absorb: bool = False) -> dict:
+def coalesce(origin: str, inner: dict) -> dict:
     """Collapse ``inner``'s allocation-hyperedge groups into connected-component
     clusters: groups sharing any member id merge into one coarse group (each
     row's allocations summed to a single clean edge), uniformly stamped with
     ``origin``. Turns the matcher's interlocking partial-allocation view into the
     settlement-cluster view a human actions against.
 
-    ``min_link`` gives up weak ties: a bridging allocation (a row shared by two
-    or more groups) below this magnitude is cut and leaked back to the residual,
-    so a cluster splits along an immaterial overlap instead of fusing two real
-    settlements. ``0`` (default) disables leaking.
-
-    ``absorb`` walks the dual graph into the residual: a residual lot whose id
-    already lives in a cluster (the dangling tail of a partially-allocated row)
-    is folded into that cluster, so the cluster shows the whole row and nets the
-    leftover instead of leaving an orphan singleton. ``False`` (default) leaves
-    residual remainders untouched.
+    Pure group->group transform: the residual is never touched. Compose with
+    ``trim`` / ``snap`` to move material to/from the residual.
     """
-    node = {"op": "coalesce", "origin": origin, "inner": inner}
-    if min_link:
-        node["min_link"] = int(min_link)
-    if absorb:
-        node["absorb"] = True
-    return node
+    return {"op": "coalesce", "origin": origin, "inner": inner}
+
+def trim(tol, inner: dict) -> dict:
+    """Cut every group edge within ``tol`` (of its row's ``original``) to the
+    residual — matched -> residual, one-directional. ``tol`` is an absolute int
+    or ``rel_tol(bps, floor)``. Trimming a bridging edge splits a cluster, so
+    ``trim`` before ``coalesce`` yields smaller islands and more residual."""
+    return {"op": "trim", "tol": tol, "inner": inner}
+
+def snap(tol, inner: dict) -> dict:
+    """Fold every sub-``tol`` edge onto its row's dominant edge instead of the
+    floor. The residual edge is eligible both ways, so a small tail absorbs into
+    its group while a small match leaks to residual — whichever side is the
+    minority. The dominant edge never folds into itself, so a clean match is
+    never silently un-matched. ``tol`` is an absolute int or ``rel_tol(bps,
+    floor)``."""
+    return {"op": "snap", "tol": tol, "inner": inner}
 
 def soak_small(origin: str, max_bps: int = None, max_abs: int = None, by = None) -> dict:
     """Consume residual lots that are small versus their original line amount
@@ -174,9 +177,12 @@ def signal(signals, tol: int = 0, cap: int = 256) -> dict:
     """Group rows sharing an out-of-band token signal that net to zero."""
     return {"op": "signal", "signals": signals, "tol": tol, "cap": cap}
 
-def flow(day, tokens, penalty: float = 1000.0, window: int = -1, cost: dict = None) -> dict:
-    """The min-cost-flow arbiter over the residual."""
-    node = {"op": "flow", "day": day, "tokens": tokens, "penalty": penalty, "window": window}
+def flow(order_by, tokens, penalty: float = 1000.0, window: int = -1, cost: dict = None) -> dict:
+    """The min-cost-flow arbiter over the residual. ``order_by`` is a 1-D
+    ordering expression; ``window`` is the proximity radius in those units (the
+    trust bound for weak candidates). Flow is domain-agnostic — it knows an
+    ordering and a window, not "days"."""
+    node = {"op": "flow", "order_by": order_by, "tokens": tokens, "penalty": penalty, "window": window}
     if cost is not None:
         node["cost"] = cost
     return node
@@ -195,13 +201,13 @@ def label(tag: str, inner: dict) -> dict:
     ``reason``), naming a stage without changing what forms the group."""
     return {"op": "label", "tag": tag, "inner": inner}
 
-def tier(when, base: float, day_slope: float = 0.0, max_day: int = None,
-         amount_bps: int = None) -> dict:
-    t = {"when": list(when), "base": base, "day_slope": day_slope}
-    if max_day is not None:
-        t["max_day"] = max_day
-    if amount_bps is not None:
-        t["amount_bps"] = int(amount_bps)
+def tier(when, base: float, slope: float = 0.0, amount_tol=None) -> dict:
+    """One confidence tier: cost is ``base + slope * |Δorder_by|``. ``amount_tol``
+    relaxes ``AMOUNT_EQUAL`` against the smaller leg (absolute int or
+    ``rel_tol(bps, floor)``); ``None`` keeps strict equality."""
+    t = {"when": list(when), "base": base, "slope": slope}
+    if amount_tol is not None:
+        t["amount_tol"] = amount_tol
     return t
 
 def cost_spec(*tiers) -> dict:

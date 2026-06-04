@@ -2,14 +2,38 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://florecon.dev/schema/plan-1.json",
   "title": "florecon wire contract",
-  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd protocol that drives a persistent workspace, and the allocation-native Report. Contract version 16 (see plan::CONTRACT_VERSION / the abi_version wasm export). There is a single `dispatch` entry point and a single Cmd protocol; a stateless batch solve is just `init` + `solve`. Rows and column identity cross out-of-band as an Arrow IPC batch whose schema is the column map; no schema/map rides this JSON.",
-  "x-contract-version": 16,
+  "description": "The shapes that cross the florecon boundary: a Plan (the strategy tree as data), the interactive Cmd protocol that drives a persistent workspace, and the allocation-native Report. Contract version 17 (see plan::CONTRACT_VERSION / the abi_version wasm export). There is a single `dispatch` entry point and a single Cmd protocol; a stateless batch solve is just `init` + `solve`. Rows and column identity cross out-of-band as an Arrow IPC batch whose schema is the column map; no schema/map rides this JSON.",
+  "x-contract-version": 17,
   "$defs": {
     "Cond": {
       "description": "A predicate on a candidate pair used by the flow cost model.",
       "enum": [
         "token_shared",
         "amount_equal"
+      ]
+    },
+    "Tol": {
+      "description": "Absolute slack (an integer) or relative: { bps, floor? } against a context scale.",
+      "oneOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bps": {
+              "type": "integer"
+            },
+            "floor": {
+              "type": "integer",
+              "default": 0
+            }
+          },
+          "required": [
+            "bps"
+          ],
+          "additionalProperties": false
+        }
       ]
     },
     "CostTier": {
@@ -24,14 +48,18 @@
         "base": {
           "type": "number"
         },
-        "day_slope": {
+        "slope": {
           "type": "number",
           "default": 0
         },
-        "max_day": {
-          "type": [
-            "integer",
-            "null"
+        "amount_tol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tol"
+            },
+            {
+              "type": "null"
+            }
           ],
           "default": null
         }
@@ -626,7 +654,7 @@
         },
         {
           "title": "coalesce",
-          "description": "Collapse `inner`'s allocation-hyperedge groups into connected-component clusters: groups sharing any member id merge into one coarse group (each row's allocations summed to one edge), uniformly stamped with `origin`. The residual passes through. `min_link` gives up weak ties: a bridging allocation (a row shared by 2+ groups) below this magnitude is cut and leaked back to the residual, so a cluster splits along an immaterial overlap. 0 (default) disables leaking. `absorb` walks the dual graph into the residual: a residual lot whose id already lives in a cluster (a partial row's tail) is folded into that cluster. false (default) leaves residual remainders untouched.",
+          "description": "Collapse `inner`'s allocation-hyperedge groups into connected-component clusters: groups sharing any member id merge into one coarse group (each row's allocations summed to one edge), uniformly stamped with `origin`. Pure group->group transform: the residual is never touched. Compose with `trim`/`snap` to move material to/from the residual.",
           "type": "object",
           "properties": {
             "op": {
@@ -635,14 +663,6 @@
             "origin": {
               "type": "string"
             },
-            "min_link": {
-              "type": "integer",
-              "default": 0
-            },
-            "absorb": {
-              "type": "boolean",
-              "default": false
-            },
             "inner": {
               "$ref": "#/$defs/PlanNode"
             }
@@ -650,6 +670,50 @@
           "required": [
             "op",
             "origin",
+            "inner"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "trim",
+          "description": "Cut every group edge within `tol` (of its row's `original`) to the residual — matched -> residual, one-directional. Trimming a bridging edge splits a cluster, so `trim` before `coalesce` yields smaller islands and more residual. Post-condition: every surviving group edge is material.",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "trim"
+            },
+            "tol": {
+              "$ref": "#/$defs/Tol"
+            },
+            "inner": {
+              "$ref": "#/$defs/PlanNode"
+            }
+          },
+          "required": [
+            "op",
+            "tol",
+            "inner"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "title": "snap",
+          "description": "Fold every sub-`tol` edge onto its row's dominant edge instead of the floor. The residual edge is eligible both ways, so a small tail absorbs into its group while a small match leaks to residual — whichever side is the minority. The dominant edge never folds into itself, so a clean match is never silently un-matched.",
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "snap"
+            },
+            "tol": {
+              "$ref": "#/$defs/Tol"
+            },
+            "inner": {
+              "$ref": "#/$defs/PlanNode"
+            }
+          },
+          "required": [
+            "op",
+            "tol",
             "inner"
           ],
           "additionalProperties": false
@@ -787,7 +851,7 @@
             "op": {
               "const": "flow"
             },
-            "day": {
+            "order_by": {
               "$ref": "#/$defs/ScalarRef"
             },
             "tokens": {
@@ -805,7 +869,7 @@
           },
           "required": [
             "op",
-            "day",
+            "order_by",
             "tokens",
             "penalty",
             "window"

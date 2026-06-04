@@ -22,7 +22,7 @@ SAMPLES = [
     {"op": "init", "plan": {"primary": "native", "root": {"op": "seq", "steps": [
         {"op": "exact"},
         {"op": "fixed_point", "inner": {"op": "agg_net", "key": "objsub", "tol": 0}},
-        {"op": "flow", "day": "day", "tokens": "tokens", "penalty": 1000.0, "window": -1},
+        {"op": "flow", "order_by": "day", "tokens": "tokens", "penalty": 1000.0, "window": -1},
     ]}}},
     {"op": "solve"},
     {"op": "freeze_clean", "tol": 0},

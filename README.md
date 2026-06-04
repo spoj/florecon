@@ -158,7 +158,7 @@ pln = P.partition("unit", P.partition("ccy", P.seq(
     P.agg_net("objsub", tol=100),
     P.exact(),
     P.signal("tokens", tol=100, cap=256),
-    P.flow(day="day", tokens="tokens"),
+    P.flow(order_by="day", tokens="tokens"),
 )))
 
 ws = Workspace(sch, pln, primary="native")

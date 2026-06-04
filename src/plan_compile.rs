@@ -5,7 +5,8 @@ use crate::row::{PhysicalRow, ColumnMap};
 use crate::sel::Sel;
 use crate::strategy::{
     Group, SoakMode, Strategy, accept_if, agg_net, branch, coalesce, exact_1to1_any, fixed_point,
-    flow, labeled, partition_by, pivot, seq, signal_group, soak_all, soak_small, windowed,
+    flow, labeled, partition_by, pivot, seq, signal_group, snap, soak_all, soak_small, trim,
+    windowed,
 };
 use std::collections::HashMap;
 
@@ -58,7 +59,7 @@ fn group_metrics(g: &Group) -> PhysicalRow {
 
 #[derive(Clone)]
 struct PlanModel {
-    day: usize,
+    order_by: usize,
     tokens: usize,
     penalty: f64,
     window: i64,
@@ -75,7 +76,7 @@ impl Model for PlanModel {
         self.penalty
     }
     fn block_key(&self, tx: &PhysicalRow) -> i64 {
-        tx.int(self.day)
+        tx.int(self.order_by)
     }
     fn window(&self) -> i64 {
         self.window
@@ -102,17 +103,17 @@ impl Model for PlanModel {
             a.tokens(self.tokens).iter().any(|t| bt.contains(t))
         };
         let amount_equal = a_amount != 0 && a_amount.abs() == b_amount.abs();
-        let dd = (a.int(self.day) - b.int(self.day)).abs();
+        let dd = (a.int(self.order_by) - b.int(self.order_by)).abs();
         for tier in &self.cost.tiers {
-            // A tier may relax AmountEqual to a relative tolerance in bps of the
+            // A tier may relax AmountEqual to a tolerance measured against the
             // smaller leg; `None` keeps strict equality.
-            let amount_ok = match tier.amount_bps {
+            let amount_ok = match tier.amount_tol {
                 None => amount_equal,
-                Some(bps) => {
-                    a_amount != 0
-                        && b_amount != 0
-                        && (a_amount.abs() - b_amount.abs()).abs()
-                            <= a_amount.abs().min(b_amount.abs()) * bps.max(0) / 10_000
+                Some(tol) => {
+                    a_amount != 0 && b_amount != 0 && {
+                        let scale = a_amount.abs().min(b_amount.abs());
+                        (a_amount.abs() - b_amount.abs()).abs() <= tol.slack(scale)
+                    }
                 }
             };
             let holds = tier.when.iter().all(|c| match c {
@@ -122,12 +123,7 @@ impl Model for PlanModel {
             if !holds {
                 continue;
             }
-            if let Some(md) = tier.max_day {
-                if dd > md {
-                    continue;
-                }
-            }
-            return Some(tier.base + tier.day_slope * dd as f64);
+            return Some(tier.base + tier.slope * dd as f64);
         }
         None
     }
@@ -212,9 +208,11 @@ fn compile_node(
                 compile_node(inner, map)?,
             )
         }
-        PlanNode::Coalesce { origin, min_link, absorb, inner } => {
-            coalesce(origin.clone(), *min_link, *absorb, compile_node(inner, map)?)
+        PlanNode::Coalesce { origin, inner } => {
+            coalesce(origin.clone(), compile_node(inner, map)?)
         }
+        PlanNode::Trim { tol, inner } => trim(*tol, compile_node(inner, map)?),
+        PlanNode::Snap { tol, inner } => snap(*tol, compile_node(inner, map)?),
         PlanNode::AggNet { key, tol } => {
             let k = key.compile(map)?;
             agg_net(move |r: &PhysicalRow| k(r) as u64, *tol)
@@ -266,14 +264,14 @@ fn compile_node(
             }
         }
         PlanNode::Flow {
-            day,
+            order_by,
             tokens,
             penalty,
             window,
             cost,
         } => {
             let model = PlanModel {
-                day: map.int_index(day)?,
+                order_by: map.int_index(order_by)?,
                 tokens: map.token_index(tokens)?,
                 penalty: *penalty,
                 window: *window,

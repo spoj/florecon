@@ -44,10 +44,12 @@ use crate::plan_compile::compile;
 /// v15 adds [`PlanNode::Coalesce`]: collapse an inner subtree's allocation
 /// hyperedges into connected-component clusters (groups sharing a row merge into
 /// one). Also additive — every v14 plan is a valid v15 plan.
-/// v16 adds `coalesce.absorb`: fold a partially-allocated row's residual tail
-/// into the cluster that already holds it (a dual-graph walk). Additive — the
-/// field defaults to `false`.
-pub const CONTRACT_VERSION: u32 = 16;
+/// v17 reworks the output-shaping algebra: `coalesce` becomes a pure
+/// group→group merge (residual untouched); new [`PlanNode::Trim`] and
+/// [`PlanNode::Snap`] move sub-`Tol` edges to/onto the residual/dominant edge;
+/// and `flow` is generalized (`day` → `order_by`, `max_day` dropped,
+/// `day_slope` → `slope`, `amount_bps` → `amount_tol: Tol`). Breaking.
+pub const CONTRACT_VERSION: u32 = 17;
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use crate::row::{PhysicalRow, ColumnMap};
@@ -145,22 +147,27 @@ pub enum PlanNode {
     /// the matcher's interlocking partial-allocation view into the "settlement
     /// cluster" view a human actions against. Conservation is preserved.
     ///
-    /// `min_link` gives up weak ties: a bridging allocation (a row shared by two
-    /// or more groups) below this magnitude is cut and leaked back to the
-    /// residual, so a cluster splits along an immaterial overlap instead of
-    /// fusing two real settlements. `0` (the default) disables leaking.
-    ///
-    /// `absorb` walks the dual graph into the residual: a residual lot whose id
-    /// already lives in a cluster (the dangling tail of a partially-allocated
-    /// row) is folded into that cluster, so the cluster shows the whole row and
-    /// nets the leftover instead of leaving an orphan singleton. `false`
-    /// (default) leaves residual remainders untouched.
+    /// Collapse the inner subtree's allocation hyperedges into
+    /// connected-component clusters (groups sharing a row merge into one). Pure
+    /// group→group transform: the residual is never touched. Compose with
+    /// [`PlanNode::Trim`] / [`PlanNode::Snap`] to move material to/from residual.
     Coalesce {
         origin: String,
-        #[cfg_attr(feature = "serde", serde(default))]
-        min_link: i64,
-        #[cfg_attr(feature = "serde", serde(default))]
-        absorb: bool,
+        inner: Box<PlanNode>,
+    },
+    /// Cut every group edge within `tol` (of its row's `original`) to the
+    /// residual. One-directional: matched → residual. Post-condition: every
+    /// surviving group edge is material.
+    Trim {
+        tol: Tol,
+        inner: Box<PlanNode>,
+    },
+    /// Fold every sub-`tol` edge onto its row's dominant edge instead of the
+    /// floor. The residual edge is eligible both ways, so this absorbs a small
+    /// tail into its group or leaks a small match to residual, whichever side is
+    /// the minority.
+    Snap {
+        tol: Tol,
         inner: Box<PlanNode>,
     },
     /// Accept an aggregation bucket (a [`Sel`] `key`) that nets to zero within
@@ -197,8 +204,10 @@ pub enum PlanNode {
     },
     /// The min-cost-flow arbiter over the residual.
     Flow {
-        /// Date/order expression (days) for proximity candidate generation.
-        day: String,
+        /// 1-D ordering expression for proximity candidate generation. Flow is
+        /// domain-agnostic: this is just "sort by X"; the `window` is a radius in
+        /// these units.
+        order_by: String,
         /// Token-signal column used for reference-bridge candidates and cost.
         tokens: String,
         penalty: f64,
@@ -234,22 +243,23 @@ pub enum Cond {
 }
 
 /// One confidence tier. A candidate pair takes the first tier whose `when`
-/// conditions all hold and whose `|Δday|` is within `max_day`; its cost is
-/// `base + day_slope * |Δday|`. A pair matched by no tier is forbidden.
+/// conditions all hold; its cost is `base + slope * |Δorder|`, where `Δorder` is
+/// the distance on the flow's `order_by` key. A pair matched by no tier is
+/// forbidden. The candidate's order distance is already bounded by the flow
+/// `window`, so a tier carries no distance cutoff of its own.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CostTier {
     pub when: Vec<Cond>,
     pub base: f64,
+    /// Cost added per unit of `order_by` distance between the pair.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub day_slope: f64,
+    pub slope: f64,
+    /// Tolerance for this tier's [`Cond::AmountEqual`], measured against the
+    /// smaller leg. `None` means strict equality; `Some(Tol::Rel { bps: 10, .. })`
+    /// accepts amounts within 0.1% of each other (the relative-tolerance idiom).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub max_day: Option<i64>,
-    /// Tolerance, in basis points of the smaller leg, for this tier's
-    /// [`Cond::AmountEqual`]. `None` means strict equality; `Some(10)` accepts
-    /// amounts within 0.1% of each other (the relative-tolerance idiom).
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub amount_bps: Option<i64>,
+    pub amount_tol: Option<Tol>,
 }
 
 /// The flow arbiter's cost model as ordered confidence tiers. This is the last
@@ -263,31 +273,28 @@ pub struct CostSpec {
 
 impl Default for CostSpec {
     /// The interco cascade: a shared reference token (cheapest, then cheaper
-    /// still if the amount also matches) outranks an exact native amount, which
-    /// is only trusted within a 92-day window.
+    /// still if the amount also matches) outranks an exact native amount. Order
+    /// distance is bounded by the flow `window`, not per tier.
     fn default() -> Self {
         CostSpec {
             tiers: vec![
                 CostTier {
                     when: vec![Cond::TokenShared, Cond::AmountEqual],
                     base: 1.5,
-                    day_slope: 0.002,
-                    max_day: None,
-                    amount_bps: None,
+                    slope: 0.002,
+                    amount_tol: None,
                 },
                 CostTier {
                     when: vec![Cond::TokenShared],
                     base: 2.0,
-                    day_slope: 0.002,
-                    max_day: None,
-                    amount_bps: None,
+                    slope: 0.002,
+                    amount_tol: None,
                 },
                 CostTier {
                     when: vec![Cond::AmountEqual],
                     base: 4.5,
-                    day_slope: 0.02,
-                    max_day: Some(92),
-                    amount_bps: None,
+                    slope: 0.02,
+                    amount_tol: None,
                 },
             ],
         }
@@ -1202,7 +1209,7 @@ mod tests {
             PlanNode::AggNet { key: "objsub".into(), tol: Tol::Abs(0) },
             PlanNode::Exact {},
             PlanNode::Signal { signals: "tokens".into(), tol: 0, cap: 256 },
-            PlanNode::Flow { day: "day".into(), tokens: "tokens".into(), penalty: 1000.0, window: 30, cost: CostSpec::default() },
+            PlanNode::Flow { order_by: "day".into(), tokens: "tokens".into(), penalty: 1000.0, window: 30, cost: CostSpec::default() },
         ]})
     }
 
@@ -1281,10 +1288,8 @@ mod tests {
         // allocations; `coalesce` collapses them into one settlement cluster.
         let plan = plan(PlanNode::Coalesce {
             origin: "settlement".into(),
-            min_link: 0,
-            absorb: false,
             inner: Box::new(PlanNode::Flow {
-                day: "day".into(),
+                order_by: "day".into(),
                 tokens: "tokens".into(),
                 penalty: 1000.0,
                 window: -1,

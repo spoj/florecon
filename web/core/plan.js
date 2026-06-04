@@ -93,16 +93,19 @@ export const acceptIf = filter;
 // Collapse `inner`'s allocation-hyperedge groups into connected-component
 // clusters: groups sharing any member id merge into one coarse group (each
 // row's allocations summed to one clean edge), uniformly stamped with `origin`.
-// `minLink` gives up weak ties: a bridging allocation (a row shared by 2+
-// groups) below this magnitude is cut and leaked back to the residual, so a
-// cluster splits along an immaterial overlap. 0 (default) disables leaking.
-// `absorb` walks the dual graph into the residual: a residual lot whose id
-// already lives in a cluster (a partial row's tail) is folded into it.
-//   coalesce("settlement", flow("day", "tokens"), { minLink: 100, absorb: true })
-export const coalesce = (origin, inner, { minLink = 0, absorb = false } = {}) =>
-  ({ op: "coalesce", origin, inner,
-     ...(minLink ? { min_link: minLink } : {}),
-     ...(absorb ? { absorb: true } : {}) });
+// Pure group->group transform: the residual is never touched. Compose with
+// `trim`/`snap` to move material to/from the residual.
+//   coalesce("settlement", flow("day", "tokens"))
+export const coalesce = (origin, inner) => ({ op: "coalesce", origin, inner });
+
+// `trim` cuts every group edge within `tol` (of its row's `original`) to the
+// residual — matched -> residual. Trimming a bridging edge splits a cluster.
+// `snap` instead folds every sub-`tol` edge onto its row's dominant edge: a
+// small tail absorbs into its group, a small match leaks to residual — whichever
+// side is the minority; a clean match is never silently un-matched. `tol` is a
+// number (absolute) or `relTol(bps, floor)`.
+export const trim = (tol, inner) => ({ op: "trim", tol, inner });
+export const snap = (tol, inner) => ({ op: "snap", tol, inner });
 
 // `tol` is absolute (a number) or relative (`relTol(bps, floor)`).
 export const aggNet = (key, tol = 0) => ({ op: "agg_net", key, tol });
@@ -111,14 +114,15 @@ export const signal = (signals, { tol = 0, cap = 256 } = {}) => ({ op: "signal",
 export const soakSmall = (origin, { maxBps = null, maxAbs = null, by = null } = {}) =>
   ({ op: "soak_small", origin, max_bps: maxBps, max_abs: maxAbs, by });
 export const soakAll = (origin, by = null) => ({ op: "soak_all", origin, by });
-export const flow = (day, tokens, { penalty = 1000, window = -1, cost = null } = {}) =>
-  ({ op: "flow", day, tokens, penalty, window, ...(cost ? { cost } : {}) });
+export const flow = (orderBy, tokens, { penalty = 1000, window = -1, cost = null } = {}) =>
+  ({ op: "flow", order_by: orderBy, tokens, penalty, window, ...(cost ? { cost } : {}) });
 
 // Flow cost model as ordered confidence tiers (first matching tier wins).
 //   cost(tier(["token_shared","amount_equal"], 1.5), tier(["token_shared"], 2.0))
-// `amountBps` relaxes this tier's `amount_equal` to a relative tolerance.
-export const tier = (when, base, { daySlope = 0, maxDay = null, amountBps = null } = {}) =>
-  ({ when, base, day_slope: daySlope, max_day: maxDay, ...(amountBps != null ? { amount_bps: amountBps } : {}) });
+// `amountTol` relaxes this tier's `amount_equal` against the smaller leg
+// (a number, or `relTol(bps, floor)`). Cost is `base + slope * |Δorder_by|`.
+export const tier = (when, base, { slope = 0, amountTol = null } = {}) =>
+  ({ when, base, slope, ...(amountTol != null ? { amount_tol: amountTol } : {}) });
 export const cost = (...tiers) => ({ tiers });
 
 // A full plan: the conserved numeraire column + the root node.

@@ -57,11 +57,13 @@ export interface Envelope {
 // Mirrors schema/plan.schema.json.
 
 export type Cond = "token_shared" | "amount_equal";
+/** Absolute slack, or relative (bps of a context scale) with an optional floor. */
+export type Tol = number | { bps: number; floor?: number };
 export interface CostTier {
   when: Cond[];
   base: number;
-  day_slope?: number;
-  max_day?: number | null;
+  slope?: number;
+  amount_tol?: Tol | null;
 }
 export interface CostSpec { tiers: CostTier[]; }
 
@@ -73,13 +75,15 @@ export type PlanNode =
   | { op: "windowed"; order: string; width: number; inner: PlanNode }
   | { op: "pivot"; amount: string; inner: PlanNode }
   | { op: "filter"; keep: string | number | object; inner: PlanNode }
-  | { op: "coalesce"; origin: string; min_link?: number; absorb?: boolean; inner: PlanNode }
+  | { op: "coalesce"; origin: string; inner: PlanNode }
+  | { op: "trim"; tol: Tol; inner: PlanNode }
+  | { op: "snap"; tol: Tol; inner: PlanNode }
   | { op: "soak_small"; max_bps?: number | null; max_abs?: number | null; origin: string; by?: string | null }
   | { op: "soak_all"; origin: string; by?: string | null }
   | { op: "agg_net"; key: string; tol: number }
   | { op: "exact" }
   | { op: "signal"; signals: string; tol: number; cap: number }
-  | { op: "flow"; day: string; tokens: string; penalty: number; window: number; cost?: CostSpec };
+  | { op: "flow"; order_by: string; tokens: string; penalty: number; window: number; cost?: CostSpec };
 
 export interface Plan {
   /** The report/conservation numeraire column; every primitive operates on it
