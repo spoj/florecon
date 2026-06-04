@@ -1,8 +1,71 @@
 """A Pythonic builder for the serializable Plan. 
 This module allows Polars/Pandas expressions or simple callables inside the plan, 
 which are resolved dynamically into virtual columns by `solve()`.
+
+It mirrors the JS builder (web/core/plan.js): the same plan nodes, the `label`
+reason combinator, relative tolerance (`rel_tol`), and a `Sel` integer-expression
+helper set (`col`, `lit`, `abs_`, `gt`, `is_in`, `iff`, ...) for authoring the
+`by` / `key` / `pred` / `order` / `amount` selectors of the combinator nodes.
+Note: `plan.col` is a *Sel column reference* ({"col": name}); the top-level
+`florecon.col` is the unrelated *schema* column declaration.
 """
 
+# ── Selectors (`Sel`) ───────────────────────────────────────────────────────
+# An integer-valued expression over a row's integer columns, used by the
+# combinators below. The wire accepts a bare string as a column reference and a
+# bare number as a literal, so `"amount"` and `0` work directly; these helpers
+# build the operator forms. Booleans are non-zero; comparisons/logic yield 1/0;
+# selectors are total (div/mod by zero -> 0, arithmetic wraps).
+def col(name: str) -> dict:
+    """A Sel column reference, e.g. ``col("amount")``."""
+    return {"col": name}
+
+def lit(n: int) -> dict:
+    """A Sel integer literal."""
+    return {"lit": int(n)}
+
+def _un(op):
+    return lambda a: {op: a}
+
+def _bin(op):
+    return lambda a, b: {op: [a, b]}
+
+neg = _un("neg")
+abs_ = _un("abs")
+not_ = _un("not")
+
+add = _bin("add")
+sub = _bin("sub")
+mul = _bin("mul")
+div = _bin("div")
+mod_ = _bin("mod")
+min_ = _bin("min")
+max_ = _bin("max")
+eq = _bin("eq")
+ne = _bin("ne")
+lt = _bin("lt")
+le = _bin("le")
+gt = _bin("gt")
+ge = _bin("ge")
+and_ = _bin("and")
+or_ = _bin("or")
+
+def is_in(a, members) -> dict:
+    """``a in {members}`` -> 1/0."""
+    return {"in": [a, list(members)]}
+
+def iff(cond, then, otherwise) -> dict:
+    """``cond ? then : otherwise`` (cond is non-zero)."""
+    return {"if": [cond, then, otherwise]}
+
+# ── Tolerance (`Tol`) ───────────────────────────────────────────────────────
+def rel_tol(bps: int, floor: int = 0) -> dict:
+    """Relative netting tolerance: ``bps`` basis points of the bucket's smallest
+    non-zero leg, never below ``floor``. Pass to ``agg_net(tol=...)``. A bare int
+    tolerance is still absolute slack in the numeraire."""
+    return {"bps": int(bps), "floor": int(floor)}
+
+# ── Plan nodes ──────────────────────────────────────────────────────────────
 def seq(*steps) -> dict:
     """Cascade: each step runs on the previous step's residual."""
     return {"op": "seq", "steps": list(steps)}
@@ -47,8 +110,9 @@ def soak_all(origin: str = "unmatched", by = None) -> dict:
         node["by"] = by
     return node
 
-def agg_net(key, tol: int = 0) -> dict:
-    """Accept an aggregation bucket (`key`) that nets to zero within `tol`."""
+def agg_net(key, tol=0) -> dict:
+    """Accept an aggregation bucket (`key`) that nets to zero within `tol`.
+    `tol` is an absolute int (numeraire slack) or ``rel_tol(bps, floor)``."""
     return {"op": "agg_net", "key": key, "tol": tol}
 
 def exact() -> dict:
@@ -71,12 +135,22 @@ TOKEN_SHARED = "token_shared"
 AMOUNT_EQUAL = "amount_equal"
 
 def branch(pred, and_then: dict, or_else: dict) -> dict:
+    """Route rows where ``pred`` is non-zero to ``and_then``, the rest to
+    ``or_else``. ``pred`` is a Sel (e.g. ``ge(abs_(col("amount")), 100000)``)."""
     return {"op": "branch", "pred": pred, "and_then": and_then, "or_else": or_else}
 
-def tier(when, base: float, day_slope: float = 0.0, max_day: int = None) -> dict:
+def label(tag: str, inner: dict) -> dict:
+    """Stamp an author tag onto every group ``inner`` produces (the report
+    ``reason``), naming a stage without changing what forms the group."""
+    return {"op": "label", "tag": tag, "inner": inner}
+
+def tier(when, base: float, day_slope: float = 0.0, max_day: int = None,
+         amount_bps: int = None) -> dict:
     t = {"when": list(when), "base": base, "day_slope": day_slope}
     if max_day is not None:
         t["max_day"] = max_day
+    if amount_bps is not None:
+        t["amount_bps"] = int(amount_bps)
     return t
 
 def cost_spec(*tiers) -> dict:
