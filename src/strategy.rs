@@ -1629,12 +1629,20 @@ where
             .groups
             .into_iter()
             .enumerate()
-            .map(|(gi, mut g)| {
+            .filter_map(|(gi, mut g)| {
                 for (mi, a) in g.members.iter_mut().enumerate() {
                     a.amount = group_amounts[gi][mi];
                 }
+                // Drop zero-mass members (e.g. a pivot target of 0, whose row
+                // carries no pivot mass and whose parent mass flows to residual
+                // via remainder-to-last). A 0 member adds nothing to net or
+                // conservation, so dropping it is safe and keeps groups honest.
+                g.members.retain(|a| a.amount != 0);
+                if g.members.is_empty() {
+                    return None;
+                }
                 g.net = g.members.iter().map(|a| a.amount).sum();
-                g
+                Some(g)
             })
             .collect();
         let residual = res
@@ -2419,5 +2427,24 @@ mod tests {
         let mut res: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
         res.sort();
         assert_eq!(res, vec![(1, 1), (2, 50)]);
+    }
+
+    #[test]
+    fn pivot_zero_target_is_safe() {
+        // X (id 1): parent 5, pivot 0 -- no pivot mass to match. No panic
+        // (prorate guards the zero denominator), the full parent flows to
+        // residual, and no phantom 0-mass member is left in the group.
+        let b = vec![Item::new(1, 5, (0i64,)), Item::new(2, 100, (4i64,))];
+        let mut s = pivot(|d: &(i64,)| d.0, Box::new(HalfMatch));
+        let r = s.run(b);
+
+        // Group keeps only Z; X carries no mass and is not present.
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].members, vec![Allocation { id: 2, amount: 50 }]);
+
+        // Conservation: X's full 5 parent units sit in residual.
+        let mut res: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
+        res.sort();
+        assert_eq!(res, vec![(1, 5), (2, 50)]);
     }
 }
