@@ -1512,7 +1512,70 @@ where
                 }
             })
             .collect();
-        let res = self.inner.run(inner_bag);
+        let mut res = self.inner.run(inner_bag);
+
+        // Conservation airlock. An id consumed into groups in pivot numeraire
+        // can map back to 0 parent units when its parent amount is tiny
+        // relative to its pivot amount (e.g. bs_usd = 1, trx_amt = 4: a 2/4
+        // pivot match prorates to floor(1*2/4) = 0). That leaves a phantom
+        // 0-mass member in a group and silently leaks the parent cent.
+        //
+        // Contract: a row consumed into a group must carry >= 1 parent unit in
+        // groups, or be returned whole to residual for later primary-numeraire
+        // matching. Detect ids whose summed group pivot mass rounds to 0 parent
+        // units, drop their group edges (deterministically, lowest id first via
+        // BTreeSet/BTreeMap), and fold that pivot mass back into residual.
+        {
+            let mut group_pivot: BTreeMap<ExtId, i64> = BTreeMap::new();
+            for g in &res.groups {
+                for a in &g.members {
+                    *group_pivot.entry(a.id).or_insert(0) += a.amount;
+                }
+            }
+            let mut dissolve: BTreeSet<ExtId> = BTreeSet::new();
+            for (id, &gp) in &group_pivot {
+                if gp == 0 {
+                    continue;
+                }
+                let Some(m) = meta.get(id) else { continue };
+                if prorate(m.outer.amount, gp, m.alt_original) == 0 {
+                    dissolve.insert(*id);
+                }
+            }
+            if !dissolve.is_empty() {
+                // Pull every dissolved id's pivot mass out of groups...
+                let mut moved: BTreeMap<ExtId, i64> = BTreeMap::new();
+                for g in &mut res.groups {
+                    g.members.retain(|a| {
+                        if dissolve.contains(&a.id) {
+                            *moved.entry(a.id).or_insert(0) += a.amount;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    g.net = g.members.iter().map(|a| a.amount).sum();
+                }
+                res.groups.retain(|g| !g.members.is_empty());
+                // ...and fold it back into residual (pivot numeraire). The
+                // conversion below re-maps these to parent units exactly.
+                for (id, amt) in moved {
+                    if amt == 0 {
+                        continue;
+                    }
+                    if let Some(item) = res.residual.iter_mut().find(|i| i.id == id) {
+                        item.amount += amt;
+                    } else if let Some(m) = meta.get(&id) {
+                        res.residual.push(Item {
+                            id,
+                            original: m.alt_original,
+                            amount: amt,
+                            data: m.outer.data.clone(),
+                        });
+                    }
+                }
+            }
+        }
 
         // Collect pivot-numeraire output parts per id in deterministic output
         // order: group members first, then residuals. Convert all parts for an
@@ -2303,5 +2366,58 @@ mod tests {
                 }
             ]
         );
+    }
+
+    // Partial-consumption inner: matches half of each row's pivot mass into one
+    // shared group, leaves the remainder in residual. Used to exercise the
+    // pivot conservation airlock.
+    struct HalfMatch;
+    impl Strategy<(i64,)> for HalfMatch {
+        fn run(&mut self, bag: Vec<Item<(i64,)>>) -> Resolution<(i64,)> {
+            let mut members = Vec::new();
+            let mut residual = Vec::new();
+            for it in bag {
+                let half = it.amount / 2;
+                members.push(Allocation {
+                    id: it.id,
+                    amount: half,
+                });
+                let mut r = it.clone();
+                r.amount = it.amount - half;
+                residual.push(r);
+            }
+            let net = members.iter().map(|a| a.amount).sum();
+            let groups = vec![Group {
+                members,
+                origin: "half".into(),
+                net,
+                reason: None,
+            }];
+            Resolution { groups, residual }
+        }
+    }
+
+    #[test]
+    fn pivot_dissolves_rows_that_round_to_zero_parent() {
+        // X (id 1): parent 1, pivot 4. Half-matched (2/4) prorates to
+        // floor(1*2/4) = 0 parent units -> airlock dissolves X's group edge and
+        // returns the whole cent to residual.
+        // Z (id 2): parent 100, pivot 4. Half-matched (2/4) = 50 parent units,
+        // representable -> kept in the group untouched.
+        let b = vec![Item::new(1, 1, (4i64,)), Item::new(2, 100, (4i64,))];
+        let mut s = pivot(|d: &(i64,)| d.0, Box::new(HalfMatch));
+        let r = s.run(b);
+
+        // Group retains only Z at 50; the phantom 0-mass X edge is gone.
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(
+            r.groups[0].members,
+            vec![Allocation { id: 2, amount: 50 }]
+        );
+
+        // Residual: X whole at 1 (conservation preserved), Z remainder at 50.
+        let mut res: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
+        res.sort();
+        assert_eq!(res, vec![(1, 1), (2, 50)]);
     }
 }
