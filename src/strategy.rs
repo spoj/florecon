@@ -638,10 +638,13 @@ pub fn coalesce<E: 'static>(
 /// Post-condition: every surviving group edge is material (`> tol`).
 /// Conservation holds — a cut edge moves intact (same id, same amount) from its
 /// group to the residual.
-pub fn trim<E: Clone + 'static>(tol: Tol, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>> {
+pub fn trim<E: Clone + 'static>(
+    tol: impl Into<Tol>,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>> {
     Box::new(EdgeReshape {
         op: EdgeOp::Trim,
-        tol,
+        tol: tol.into(),
         inner,
     })
 }
@@ -661,10 +664,13 @@ pub fn trim<E: Clone + 'static>(tol: Tol, inner: Box<dyn Strategy<E>>) -> Box<dy
 /// The dominant edge never folds into itself, so a lone clean edge is always
 /// left intact — `snap` never silently un-matches a material row. Post-condition
 /// and conservation match [`trim`]; the two differ only in the sink.
-pub fn snap<E: Clone + 'static>(tol: Tol, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>> {
+pub fn snap<E: Clone + 'static>(
+    tol: impl Into<Tol>,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>> {
     Box::new(EdgeReshape {
         op: EdgeOp::Snap,
-        tol,
+        tol: tol.into(),
         inner,
     })
 }
