@@ -179,10 +179,11 @@ pub enum PlanNode {
     AggNet { key: Sel, tol: Tol },
     /// Pair opposite-sign rows with equal current amount magnitude.
     Exact {},
-    /// Group rows that share an out-of-band token signal and net to zero.
+    /// Group rows that share an out-of-band token signal and net to zero
+    /// within `tol` (absolute, or relative to the bucket's smallest leg).
     Signal {
         signals: String,
-        tol: i64,
+        tol: Tol,
         cap: usize,
     },
     /// Consume small residual allocations into variance/writeoff/unmatched
@@ -1094,7 +1095,7 @@ mod tests {
         plan(PlanNode::Seq { steps: vec![
             PlanNode::AggNet { key: "objsub".into(), tol: Tol::Abs(0) },
             PlanNode::Exact {},
-            PlanNode::Signal { signals: "tokens".into(), tol: 0, cap: 256 },
+            PlanNode::Signal { signals: "tokens".into(), tol: Tol::Abs(0), cap: 256 },
             PlanNode::Flow { order_by: "day".into(), tokens: "tokens".into(), penalty: 1000.0, window: 30, cost: CostSpec::default() },
         ]})
     }

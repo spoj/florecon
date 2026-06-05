@@ -1149,7 +1149,7 @@ where
 
 struct SignalGroup<E, FS> {
     signals: FS,
-    tol: i64,
+    tol: Tol,
     cap: usize,
     _e: PhantomData<E>,
 }
@@ -1184,7 +1184,15 @@ where
             let sum: i64 = members.iter().map(|&i| amt[i]).sum();
             let has_pos = members.iter().any(|&i| amt[i] > 0);
             let has_neg = members.iter().any(|&i| amt[i] < 0);
-            if sum.abs() <= self.tol && has_pos && has_neg {
+            // Relative tolerance scales off the bucket's smallest non-zero leg,
+            // matching `agg_net`.
+            let scale = members
+                .iter()
+                .map(|&i| amt[i].abs())
+                .filter(|&v| v > 0)
+                .min()
+                .unwrap_or(0);
+            if sum.abs() <= self.tol.slack(scale) && has_pos && has_neg {
                 for &i in &members {
                     used[i] = true;
                 }
@@ -1216,13 +1224,17 @@ where
 /// books) and pull buckets that net to zero within `tol`. High precision: a
 /// token *names* the group; netting only validates it. Greedy on most-specific
 /// buckets first; ambiguous/over-large buckets (`> cap`) are left for [`flow`].
-pub fn signal_group<E: 'static, FS>(signals: FS, tol: i64, cap: usize) -> Box<dyn Strategy<E>>
+pub fn signal_group<E: 'static, FS>(
+    signals: FS,
+    tol: impl Into<Tol>,
+    cap: usize,
+) -> Box<dyn Strategy<E>>
 where
     FS: Fn(&E) -> Vec<u64> + 'static,
 {
     Box::new(SignalGroup {
         signals,
-        tol,
+        tol: tol.into(),
         cap,
         _e: PhantomData,
     })
@@ -1967,12 +1979,31 @@ mod tests {
     #[test]
     fn signal_groups_net_and_cascade() {
         let b = bag(&[(1, 50), (2, -50), (3, 9)]);
-        let mut s = signal_group(|a: &i64| if *a == 9 { vec![] } else { vec![10] }, 0, 16);
+        let mut s = signal_group(|a: &i64| if *a == 9 { vec![] } else { vec![10] }, Tol::Abs(0), 16);
         let r = s.run(b);
         conserves(3, &r);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(ids(&r.groups[0]), vec![1, 2]);
         assert_eq!(r.residual.len(), 1);
+    }
+
+    #[test]
+    fn signal_groups_accept_relative_tol() {
+        // Bucket nets to 5 against a smallest leg of 1000. 10 bps = 1, so the
+        // residual 5 is rejected; 60 bps = 6 accepts it. Absolute tol would
+        // have to know the leg magnitude up front; Rel derives it from the
+        // bucket, matching `agg_net`.
+        let b = bag(&[(1, 1000), (2, -995)]);
+        let mut tight = signal_group(|_: &i64| vec![7u64], Tol::Rel { bps: 10, floor: 0 }, 16);
+        let r = tight.run(b.clone());
+        assert_eq!(r.groups.len(), 0);
+        assert_eq!(r.residual.len(), 2);
+
+        let mut loose = signal_group(|_: &i64| vec![7u64], Tol::Rel { bps: 60, floor: 0 }, 16);
+        let r = loose.run(b);
+        conserves(2, &r);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(ids(&r.groups[0]), vec![1, 2]);
     }
 
     /// A deliberately non-maximal leaf: it groups *at most one* opposite-sign

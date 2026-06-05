@@ -182,8 +182,10 @@ def exact() -> dict:
     """Pair opposite-sign rows of equal magnitude on current amount."""
     return {"op": "exact"}
 
-def signal(signals, tol: int = 0, cap: int = 256) -> dict:
-    """Group rows sharing an out-of-band token signal that net to zero."""
+def signal(signals, tol=0, cap: int = 256) -> dict:
+    """Group rows sharing an out-of-band token signal that net to zero within
+    ``tol``. ``tol`` is an absolute int (numeraire slack) or ``rel_tol(bps,
+    floor)`` (relative to the bucket's smallest non-zero leg)."""
     return {"op": "signal", "signals": signals, "tol": tol, "cap": cap}
 
 def flow(order_by, tokens, penalty: float = 1000.0, window: int = -1, cost: dict = None) -> dict:
