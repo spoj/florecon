@@ -43,9 +43,6 @@ struct Interco {
 
 impl Model for Interco {
     type Tx = Row;
-    fn base_amount(&self, tx: &Row) -> i64 {
-        tx.snative
-    }
     fn penalty(&self, _tx: &Row) -> f64 {
         self.penalty
     }

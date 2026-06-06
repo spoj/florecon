@@ -30,16 +30,14 @@
 //! rows they are certain about; [`flow`] is the global *arbiter* for the
 //! ambiguous residual where strategies would otherwise compete.
 
-use crate::engine::SolveStatus;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // The incremental min-cost-flow matcher is just the arbiter behind the `flow`
 // strategy leaf, so it lives here as one strategy among many. Kept in its own
 // file; `flow::Group` stays distinct from this module's own `Group`.
 pub mod flow;
-pub use flow::{Allocation, AllocationGroup, ExtId, Matcher, Model};
-#[cfg(feature = "serde")]
-pub use flow::MatcherSnapshot;
+pub use flow::{flow, Allocation, ExtId, Model};
+
 use std::hash::Hash;
 use std::marker::PhantomData;
 
@@ -137,7 +135,7 @@ pub struct Resolution<E> {
 /// A reconciliation strategy: pull groups from a bag, return the residual.
 ///
 /// `run` takes `&mut self`, so a node *may* carry state across calls (e.g. the
-/// stateful [`flow`] leaf keeps a live [`Matcher`], and [`partition_by`] holds
+/// stateful [`flow`] leaf keeps a live warm basis, and [`partition_by`] holds
 /// one warm child per shard). Statefulness
 /// is an opt-in capability, not a mandate: the cheap leaves (`agg_net`,
 /// `exact_1to1`, `signal_group`, …) ignore `&mut` and recompute, staying
@@ -729,7 +727,7 @@ impl<E> Strategy<E> for FixedPoint<E> {
 /// group found along the way. Conservation holds by construction: each pass
 /// conserves, and only the residual is re-fed while groups are locked in.
 ///
-/// State inside `inner` **persists across passes** (the warm flow [`Matcher`],
+/// State inside `inner` **persists across passes** (the warm flow basis,
 /// per-shard [`partition_by`] children, ...): the loop reuses the same compiled
 /// subtree rather than rebuilding it. That is sound because every node treats
 /// its incoming bag as the *authoritative present-set* and reconciles against
@@ -755,7 +753,7 @@ struct PartitionBy<E, K, FK> {
     /// Builds a fresh child subtree the first time a shard key is seen.
     factory: Box<dyn Fn() -> Box<dyn Strategy<E>>>,
     /// One independent child per shard key. Each child owns its own state
-    /// (notably its own warm flow [`Matcher`]), so per-shard warm-start is
+    /// (notably its own warm flow basis), so per-shard warm-start is
     /// automatic and the flow leaf never needs to know it is sharded.
     children: HashMap<K, Box<dyn Strategy<E>>>,
 }
@@ -797,7 +795,7 @@ where
 /// is seen; each child keeps its own (warm) state across solves. This is how
 /// sharding (e.g. by bilateral pair or by currency) is expressed — and what
 /// makes per-shard warm-start fall out for free, since each shard's flow leaf is
-/// a distinct `Matcher` that only ever sees that shard's rows.
+/// a distinct warm flow leaf that only ever sees that shard's rows.
 pub fn partition_by<E: 'static, K, FK, FF>(key: FK, factory: FF) -> Box<dyn Strategy<E>>
 where
     K: Hash + Eq + Clone + 'static,
@@ -1253,241 +1251,6 @@ where
     })
 }
 
-/// The global arbiter leaf, kept *warm*. It owns one min-cost-flow [`Matcher`]
-/// and the id set currently loaded into it (`present`). Each `run` applies only
-/// the membership delta — upsert new ids, remove departed ones — then re-solves,
-/// reusing the cached simplex basis, so a no-op recalc costs microseconds rather
-/// than a full cold solve. A *fresh* leaf (first run, or one rebuilt when the
-/// compiled strategy is replaced) simply has an empty
-/// `present`, so its first solve *is* the cold solve — warm vs cold is decided
-/// purely by whether the caller keeps the compiled strategy alive. Sharding is
-/// the caller's job: [`partition_by`] gives each shard its own `Flow`, so this
-/// leaf only ever sees one shard's rows.
-#[derive(Clone)]
-struct FlowTx<Tx> {
-    tx: Tx,
-    amount: i64,
-}
-
-#[derive(Clone)]
-struct FlowLotModel<M> {
-    inner: M,
-}
-
-impl<M> Model for FlowLotModel<M>
-where
-    M: Model,
-{
-    type Tx = FlowTx<M::Tx>;
-
-    fn base_amount(&self, tx: &Self::Tx) -> i64 {
-        tx.amount
-    }
-    fn penalty(&self, tx: &Self::Tx) -> f64 {
-        self.inner.penalty(&tx.tx)
-    }
-    fn block_key(&self, tx: &Self::Tx) -> i64 {
-        self.inner.block_key(&tx.tx)
-    }
-    fn window(&self) -> i64 {
-        self.inner.window()
-    }
-    fn cost(&self, a: &Self::Tx, b: &Self::Tx) -> Option<f64> {
-        self.inner.cost_lot(&a.tx, a.amount, &b.tx, b.amount)
-    }
-    fn match_keys(&self, tx: &Self::Tx) -> Vec<u64> {
-        self.inner.match_keys_lot(&tx.tx, tx.amount)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct FlowSig {
-    amount: i64,
-    penalty_bits: u64,
-    key: i64,
-    keys: Vec<u64>,
-}
-
-struct Flow<M: Model> {
-    model: M,
-    matcher: Matcher<FlowLotModel<M>>,
-    loaded: HashMap<ExtId, FlowSig>,
-}
-
-impl<M> Flow<M>
-where
-    M: Model,
-{
-    fn flow_amount(&self, item: &Item<M::Tx>) -> i64 {
-        item.amount
-    }
-
-    fn flow_tx(&self, item: &Item<M::Tx>) -> FlowTx<M::Tx>
-    where
-        M::Tx: Clone,
-    {
-        FlowTx {
-            tx: item.data.clone(),
-            amount: self.flow_amount(item),
-        }
-    }
-
-    fn flow_sig(&self, item: &Item<M::Tx>) -> FlowSig {
-        let amount = self.flow_amount(item);
-        let mut keys = self.model.match_keys_lot(&item.data, amount);
-        keys.sort_unstable();
-        FlowSig {
-            amount,
-            penalty_bits: self.model.penalty(&item.data).to_bits(),
-            key: self.model.block_key(&item.data),
-            keys,
-        }
-    }
-}
-
-impl<M> Strategy<M::Tx> for Flow<M>
-where
-    M: Model + Clone,
-    M::Tx: Clone,
-{
-    fn run(&mut self, bag: Vec<Item<M::Tx>>) -> Resolution<M::Tx> {
-        #[cfg(not(target_arch = "wasm32"))]
-        let timed = std::env::var_os("FLORECON_TIME").is_some();
-        #[cfg(target_arch = "wasm32")]
-        let timed = false;
-        let want: BTreeSet<ExtId> = bag.iter().map(|i| i.id).collect();
-        // id -> lot references (no clones unless we actually upsert). The
-        // matcher conserves the lot's *current* amount, not a fresh amount
-        // recomputed from original row data, so partial residuals compose
-        // through `seq`.
-        let data: HashMap<ExtId, &Item<M::Tx>> = bag.iter().map(|i| (i.id, i)).collect();
-        let sigs: HashMap<ExtId, FlowSig> = bag.iter().map(|i| (i.id, self.flow_sig(i))).collect();
-
-        // Diff want vs loaded. Upsert both new ids and same-id rows whose
-        // current lot amount or candidate-generation signature changed; this is
-        // what keeps warm lot recalc correct when an upstream step changes the
-        // residual amount of an id that remains present.
-        let mut upserts: Vec<ExtId> = sigs
-            .iter()
-            .filter_map(|(&id, sig)| (self.loaded.get(&id) != Some(sig)).then_some(id))
-            .collect();
-        upserts.sort_by_key(|&id| flow_upsert_rank(id));
-        let drops: Vec<ExtId> = self
-            .loaded
-            .keys()
-            .copied()
-            .filter(|id| !want.contains(id))
-            .collect();
-
-        // Instant is only touched when profiling; wasm has no clock source.
-        let tb = timed.then(std::time::Instant::now);
-        for id in upserts {
-            if let Some(item) = data.get(&id) {
-                self.matcher.upsert(id, self.flow_tx(item));
-            }
-        }
-        for id in drops {
-            self.matcher.remove(id);
-        }
-        let build = tb.map(|t| t.elapsed().as_secs_f64() * 1000.0);
-        let ts = timed.then(std::time::Instant::now);
-        let status = self.matcher.solve(); // warm when `present` was non-empty.
-        if let (Some(build), Some(ts)) = (build, ts) {
-            eprintln!(
-                "    flow: delta {build:>6.1} ms ({} arcs), solve {:>6.1} ms",
-                self.matcher.arc_count(),
-                ts.elapsed().as_secs_f64() * 1000.0,
-            );
-        }
-        debug_assert_eq!(status, SolveStatus::Optimal);
-        self.loaded = sigs;
-
-        // Determinism guard: in debug builds (or when FLORECON_VERIFY_WARM is
-        // set) rebuild a fresh cold matcher on the same id set and assert the
-        // warm solution matches. The always-true invariant is the optimal
-        // *objective* (matched costs + unmatched penalties): a min-cost-flow
-        // optimum is unique in cost but can be degenerate in *which* equal-cost
-        // arcs carry flow, so the grouping is only guaranteed identical when the
-        // optimum is unique. This catches the real failure mode — a warm
-        // re-solve drifting to a different (or worse) objective — without
-        // false-positiving on benign tie re-grouping (see the
-        // `warm_flow_matches_cold_*` equivalence tests).
-        if cfg!(debug_assertions) || std::env::var_os("FLORECON_VERIFY_WARM").is_some() {
-            let mut cold = Matcher::new(FlowLotModel {
-                inner: self.model.clone(),
-            });
-            let mut ids: Vec<ExtId> = data.keys().copied().collect();
-            ids.sort_unstable();
-            for id in ids {
-                if let Some(item) = data.get(&id) {
-                    cold.upsert(
-                        id,
-                        FlowTx {
-                            tx: item.data.clone(),
-                            amount: item.amount,
-                        },
-                    );
-                }
-            }
-            cold.solve();
-            let (warm_obj, cold_obj) = (self.matcher.objective(), cold.objective());
-            assert!(
-                (warm_obj - cold_obj).abs() < 1e-6,
-                "warm flow solve diverged from a fresh cold rebuild: \
-                 warm objective {warm_obj} != cold objective {cold_obj}"
-            );
-        }
-
-        let groups = self
-            .matcher
-            .allocation_groups()
-            .into_iter()
-            .map(|g| Group {
-                members: g.members,
-                origin: "flow".to_string(),
-                net: g.net_base,
-                reason: Some("min-cost flow".to_string()),
-            })
-            .collect();
-        let unmatched: HashMap<ExtId, i64> = self
-            .matcher
-            .unmatched_allocations()
-            .into_iter()
-            .map(|a| (a.id, a.amount))
-            .collect();
-        let residual = bag
-            .into_iter()
-            .filter_map(|mut i| {
-                unmatched.get(&i.id).map(|&amount| {
-                    i.amount = amount;
-                    i
-                })
-            })
-            .collect();
-        Resolution { groups, residual }
-    }
-}
-
-/// The global arbiter: hand the residual to the min-cost-flow engine, which
-/// resolves competing candidates into one consistent grouping. This is where
-/// *proposing* signals (reference + amount + date, via the `Model`) become a
-/// committed partition. The returned leaf is *stateful* — it keeps its matcher
-/// warm across solves — but that is invisible to the caller: a one-shot solve
-/// just runs it once.
-pub fn flow<M>(model: M) -> Box<dyn Strategy<M::Tx>>
-where
-    M: Model + Clone + 'static,
-    M::Tx: Clone + 'static,
-{
-    Box::new(Flow {
-        matcher: Matcher::new(FlowLotModel {
-            inner: model.clone(),
-        }),
-        model,
-        loaded: HashMap::new(),
-    })
-}
-
 #[derive(Clone)]
 struct PivotMeta<E> {
     outer: Item<E>,
@@ -1877,24 +1640,6 @@ where
     })
 }
 
-// ---------------------------------------------------------------------------
-// Flow determinism helper
-// ---------------------------------------------------------------------------
-
-/// Deterministic, dataset-robust upsert rank for a flow node. The network
-/// simplex's pivot count depends on the order nodes/arcs are introduced; a
-/// monotone (ascending or descending) id order is a pathological sequence on
-/// real data. Ordering by a stable scramble of the id (a SplitMix64 finalizer)
-/// keeps the order a *pure function of the id* — so cold and warm solves agree
-/// and results are reproducible across builds — while spreading augmenting
-/// paths to avoid the worst case. Measured: ~2x fewer pivots vs ascending id on
-/// the interco sample.
-fn flow_upsert_rank(id: ExtId) -> u64 {
-    let mut z = id.wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
-}
 
 #[cfg(test)]
 mod tests {

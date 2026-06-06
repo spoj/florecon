@@ -9,8 +9,8 @@
 //!   `signal_group`, `running_zero`, `pivot`, `trim`, `snap`) cascade and shard
 //!   via `seq`, `partition_by`, `branch`, and `windowed`. One leaf —
 //!   [`strategy::flow`] — is the min-cost-flow arbiter: describe a domain via
-//!   [`strategy::Model`] and it drives a [`strategy::Matcher`] over the
-//!   [`engine`]. The engine is just that one node's implementation.
+//!   [`strategy::Model`] and the leaf drives the [`engine`] over it. The engine
+//!   is just that one node's implementation.
 //! - [`engine`] — the network-simplex transportation solver behind the `flow`
 //!   node: stable [`engine::NodeId`]/[`engine::ArcId`] handles, warm-started
 //!   re-solving, [`engine::Snapshot`] persistence. Frozen because it is a
@@ -23,31 +23,28 @@
 //!   key, pick a [`strategy`]), then `export_plugin!` emits a self-describing
 //!   wasm module. The host stays a dumb columnar-table carrier.
 //!
-//! Enable the `serde` feature to serialize [`engine::Snapshot`] /
-//! [`strategy::MatcherSnapshot`] to disk and warm-start next month off this
-//! month's tree.
+//! Enable the `serde` feature to serialize an [`engine::Snapshot`] and
+//! warm-start off a persisted basis.
 //!
 //! ```
-//! use florecon::strategy::{Model, Matcher};
+//! use florecon::strategy::{flow, Model, Item};
 //!
-//! struct Tx { amount: i64, date: i64 }
+//! #[derive(Clone)]
+//! struct Tx { date: i64 }
+//! #[derive(Clone)]
 //! struct M;
 //! impl Model for M {
 //!     type Tx = Tx;
-//!     fn base_amount(&self, t: &Tx) -> i64 { t.amount }
 //!     fn penalty(&self, _t: &Tx) -> f64 { 1e6 }
 //!     fn block_key(&self, t: &Tx) -> i64 { t.date }
 //!     fn window(&self) -> i64 { 3 }
-//!     fn cost(&self, a: &Tx, b: &Tx) -> Option<f64> {
-//!         Some(1.0 + (a.amount + b.amount).abs() as f64 * 0.1)
-//!     }
+//!     fn cost(&self, a: &Tx, b: &Tx) -> Option<f64> { Some(1.0 + (a.date - b.date).abs() as f64) }
 //! }
 //!
-//! let mut r = Matcher::new(M);
-//! r.upsert(1, Tx { amount: 100, date: 0 });
-//! r.upsert(2, Tx { amount: -100, date: 0 });
-//! r.solve();
-//! assert!(r.groups()[0].clean);
+//! // The conserved amount rides on `Item::amount`, not the model.
+//! let mut s = flow(M);
+//! let r = s.run(vec![Item::new(1, 100, Tx { date: 0 }), Item::new(2, -100, Tx { date: 0 })]);
+//! assert_eq!(r.groups[0].net, 0); // nets clean
 //! ```
 
 pub mod engine;
@@ -64,7 +61,7 @@ pub mod sdk;
 
 pub use engine::{ArcId, Network, NodeId, SolveStatus};
 pub use error::ApiError;
-pub use strategy::{ExtId, Matcher, Model};
+pub use strategy::{ExtId, Model};
 
 pub use recon::Recon;
 pub use report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};

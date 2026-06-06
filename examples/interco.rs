@@ -35,9 +35,6 @@ struct Interco {
 }
 impl Model for Interco {
     type Tx = Tx;
-    fn base_amount(&self, tx: &Tx) -> i64 {
-        tx.snative // single currency per shard -> exact conservation, no FX
-    }
     fn penalty(&self, _tx: &Tx) -> f64 {
         self.penalty
     }
