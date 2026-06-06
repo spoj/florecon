@@ -1,8 +1,64 @@
 # Architecture shift: domain plugins + a private SDK
 
-Status: **design / branch `arch/plugin-sdk`** — clamps the plugin interface; sketches the SDK.
-Author surface decisions are not final, but the **plugin interface** here is meant to be the
-thing we freeze first.
+Status: **IMPLEMENTED** on branch `arch/plugin-sdk`. The data-plan layer is deleted; the SDK, a
+real wasm plugin, and both hosts (Python + browser data path) are migrated and green. The sections
+below are the original design; §0 records what actually shipped and where it differs.
+
+---
+
+## 0. As-built (what shipped)
+
+The centerpiece is the **`strategy` algebra**; the network-simplex `engine` is just the
+implementation of the `flow` node (untouched). The host is a dumb columnar-table carrier; the
+**plugin owns the domain** and is one self-describing wasm.
+
+**Deleted** (the serialize-closures-as-data-for-a-typeless-host layer): `src/sel.rs`,
+`src/plan_compile.rs`, `src/row.rs` (`PhysicalRow`/`ColumnMap`), `src/arrow.rs` (generic ingest),
+`src/wasm.rs` (plan ABI), the `Plan`/`PlanNode`/`Workspace`/`Cond`/`CostSpec` IR; plus `py/.../plan.py`,
+`py/.../data.py`, and `web/core/plan.js` becomes dead.
+
+**Kept / reshaped:** `engine.rs` frozen; `strategy/` is the spine (`flow` folded in as `strategy::flow`);
+`plan.rs` → `recon.rs` (the algebra-free `Recon` facade); `report.rs` unchanged envelope.
+
+**New `src/sdk/` (feature `sdk`)** — the as-built `Plugin` trait differs from §4's sketch:
+
+```rust
+pub trait Plugin: Sized {
+    type Row: Clone + 'static;
+    fn new() -> Self;
+    fn describe() -> DescribeDoc;               // self-description (also the discovery doc)
+    fn id(&self, row: &RowView<'_>) -> ExtId;   // host's stable id passes through; else hash_key(&k)
+    fn project(&self, row: &RowView<'_>) -> Self::Row;
+    fn primary(row: &Self::Row) -> i64;
+    fn strategy(&self) -> Box<dyn Strategy<Self::Row>>;
+}
+export_plugin!(MyPlugin);
+```
+
+Deltas from the sketch, by design feedback:
+- **Arrow is mandatory** at the boundary (§"host ships the columnar table"): the SDK owns decoding
+  (`Table::from_ipc`), so there is **no `decode(&[u8])`** — `project`/`id` see a typed `RowView`.
+- **Identity returns `ExtId` directly** (not a typed `Key` the SDK hashes). When the host already
+  carries a stable id, `id` just returns it, so report ids equal host ids; composite keys use the
+  provided `hash_key`. (This resolves the §6 open question.)
+- `export_plugin!` emits `abi_version` / `alloc` / `dealloc` / `describe` / `dispatch` and a
+  thread-local `Session<P>`. The static `florecon.manifest` custom section (§3.5a) is **not yet**
+  emitted; discovery currently uses the `describe()` export (Tier 1). Manifest section = follow-up.
+- `conformance::assert_conformance::<P>(arrow)` checks unique-key / idempotent / order-independent /
+  warm==cold (the last two compared **up to ephemeral group-id relabeling**, since live ids are
+  monotonic by design).
+
+**Plugin:** `plugins/interco` (cdylib) ports the old data-plan domain to the trait and builds to
+`wasm32-unknown-unknown` (~0.9 MB), exporting exactly the five ABI funcs. Cargo is now a workspace.
+
+**Hosts:** `py/.../_host.py` and `web/host.js` are generic, describe-driven drivers that ship the
+plugin's declared raw columns as Arrow and run the planless `Cmd` set. Both stateful smokes
+(init/upsert/warm-solve/remove/freeze/breakup) pass against the interco wasm. **Remaining:** the
+browser **DOM UI** (`web/setup.js` plan editor, `web/ingest.js` `buildDataset`, `web/app.js`,
+`index.html`, `styles.css` + the jsdom/ingest/bench smokes) still targets the old plan model — a
+plan-editor→column-mapper redesign; the `Report` shape `app.js` renders is unchanged.
+
+Tests: 50 core + 52 sdk + 2 plugin (incl. conformance) Rust; Python + web node smokes green.
 
 ---
 
