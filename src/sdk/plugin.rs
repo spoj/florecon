@@ -17,10 +17,6 @@ use crate::strategy::Strategy;
 pub trait Plugin: Sized {
     /// The typed row the strategy matches on (the author's lanes).
     type Row: Clone + 'static;
-    /// The natural identity of a row. The SDK hashes it to a stable [`ExtId`];
-    /// it MUST be deterministic and unique per logical row (warm-start and
-    /// frozen decisions key off the resulting id).
-    type Key: Hash;
 
     /// Construct the plugin (load any baked-in reference data here).
     fn new() -> Self;
@@ -28,8 +24,11 @@ pub trait Plugin: Sized {
     /// Advertise the raw columns, numeraire, and identity to the host.
     fn describe() -> DescribeDoc;
 
-    /// Row-local: the natural key. Hashed by the SDK to the engine id.
-    fn key(&self, row: &RowView<'_>) -> Self::Key;
+    /// The stable external id of a row. Return the host's own stable id column
+    /// when the data carries one, or derive one deterministically with
+    /// [`hash_key`] over the natural key. MUST be unique per logical row —
+    /// warm-start and frozen decisions key off it.
+    fn id(&self, row: &RowView<'_>) -> ExtId;
 
     /// Row-local: derive the typed match lanes. Deterministic, no other rows.
     fn project(&self, row: &RowView<'_>) -> Self::Row;
@@ -63,8 +62,9 @@ impl Hasher for StableHasher {
     }
 }
 
-/// Hash a plugin's natural key to the engine's external id, deterministically.
-pub fn ext_id<K: Hash>(key: &K) -> ExtId {
+/// Hash a composite natural key to a stable external id, deterministically
+/// across builds and hosts (unlike `std`'s `DefaultHasher`).
+pub fn hash_key<K: Hash>(key: &K) -> ExtId {
     let mut h = StableHasher::default();
     key.hash(&mut h);
     h.finish()

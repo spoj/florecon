@@ -106,7 +106,6 @@ pub struct IntercoPlugin;
 
 impl Plugin for IntercoPlugin {
     type Row = Row;
-    type Key = i64; // the host's stable ledger line id
 
     fn new() -> Self {
         IntercoPlugin
@@ -133,8 +132,8 @@ impl Plugin for IntercoPlugin {
         ])
     }
 
-    fn key(&self, row: &RowView<'_>) -> i64 {
-        row.i64("row_id")
+    fn id(&self, row: &RowView<'_>) -> u64 {
+        row.i64("row_id") as u64 // the host's own stable ledger line id
     }
 
     fn project(&self, r: &RowView<'_>) -> Row {
@@ -280,13 +279,13 @@ mod tests {
     #[test]
     fn pairs_net_clean() {
         use florecon::recon::Recon;
-        use florecon::sdk::{Table, ext_id};
+        use florecon::sdk::Table;
         let table = Table::from_ipc(&sample_ipc()).unwrap();
         let p = IntercoPlugin::new();
         let mut r = Recon::new(p.strategy(), IntercoPlugin::primary);
         for i in 0..table.len() {
             let rv = table.row(i);
-            r.upsert(ext_id(&p.key(&rv)), p.project(&rv));
+            r.upsert(p.id(&rv), p.project(&rv));
         }
         r.solve().unwrap();
         let rep = r.report();

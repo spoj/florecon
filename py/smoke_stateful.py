@@ -1,24 +1,23 @@
-"""Stateful smoke: prove the Python host can drive the engine's *interactive*
-workspace over the v9 Arrow contract — schema-only init, incremental upserts,
-warm re-solve, remove, freeze, and breakup. This is the pre-Arrow-IPC stateful
-capability, restored. Run it with the engine's own wasm + pyarrow:
+"""Stateful smoke: drive the interco *plugin* wasm through the generic host —
+describe-driven init, incremental upserts, warm re-solve, remove, freeze, and
+breakup. The host ships raw ledger columns; the plugin owns the domain.
 
+Build the plugin first, then run:
+
+    cargo build -p interco-plugin --target wasm32-unknown-unknown --release
     PYTHONPATH=py/src .venv/bin/python py/smoke_stateful.py
 
 Exits non-zero with a clear message on any regression.
 """
 
+import pathlib
 import sys
 
-from florecon import (
-    KEY,
-    NUMBER,
-    TOKENS,
-    Workspace,
-    col,
-    key,
-    plan as P,
-    schema,
+from florecon import Workspace
+
+WASM = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "target/wasm32-unknown-unknown/release/interco_plugin.wasm"
 )
 
 
@@ -49,35 +48,42 @@ def matched_pair(rep, a, b):
     return ga is not None and ga == gb and g is not None and g["net"] == 0 and g["size"] >= 2
 
 
-# A single bilateral unit, single currency. Each invoice pair shares an objsub
-# bucket and an opposite-sign equal-magnitude amount, so it nets cleanly.
-UNIT = key("00492", "00288")
-sch = schema([
-    col("unit", KEY),
-    col("day", NUMBER),
-    col("objsub", KEY),
-    col("native", NUMBER),
-    col("tokens", TOKENS),
-])
-root = P.partition("unit", P.seq(
-    P.agg_net("objsub", tol=0),
-    P.exact(),
-    P.signal("tokens", tol=0, cap=256),
-    P.flow("day", "tokens", window=-1),
-))
+def line(row_id, co, icp, objsub, usd, day, ref):
+    """One ledger line as the raw columns the plugin declared."""
+    return {
+        "row_id": row_id,
+        "company": co,
+        "icp": icp,
+        "objsub": objsub,
+        "indicative_usd_amt": usd,
+        "gl_date": day,
+        "trx_currency": "USD",
+        "trx_amt": abs(usd),
+        "reference": ref,
+    }
 
-# --- open on a schema only, then stream the first invoice pair in ------------
-ws = Workspace(sch, root, primary="native")
-ws.upsert(1, [UNIT, 0, "61500", 100, "INV0001 widgets"])
-ws.upsert(2, [UNIT, 1, "61500", -100, "INV0001 credit"])
+
+if not WASM.exists():
+    print(f"FAIL: plugin wasm not found at {WASM}\n  build it with:\n"
+          "  cargo build -p interco-plugin --target wasm32-unknown-unknown --release")
+    sys.exit(1)
+
+ws = Workspace(str(WASM))
+check(ws.domain.get("id") == "florecon.intercompany", "host should discover the domain via describe()")
+
+# --- first invoice pair: opposite books, shared reference, nets clean --------
+ws.upsert(
+    line(1, "A", "B", "61500", 100.0, 0, "INV0001"),
+    line(2, "B", "A", "61500", -100.0, 1, "INV0001"),
+)
 rep = ws.solve()
-check(matched_pair(rep, 1, 2), "first invoice pair (1,2) should net to a matched group after init+upsert+solve")
+check(matched_pair(rep, 1, 2), "first invoice pair (1,2) should net to a matched group")
 
 # --- stream a second pair in and WARM re-solve -------------------------------
-ws.upsert_many([
-    (3, [UNIT, 2, "61600", 250, "INV0009 services"]),
-    (4, [UNIT, 3, "61600", -250, "INV0009 reversal"]),
-])
+ws.upsert(
+    line(3, "A", "B", "61600", 250.0, 2, "INV0009"),
+    line(4, "B", "A", "61600", -250.0, 3, "INV0009"),
+)
 rep = ws.solve()
 check(matched_pair(rep, 1, 2), "original pair (1,2) must stay matched after warm re-solve")
 check(matched_pair(rep, 3, 4), "new pair (3,4) must match on warm re-solve")
@@ -92,7 +98,8 @@ check(g3 is not None and g3["size"] == 1, "row 3 must become a live singleton on
 
 # --- freeze the clean match: an operator decision survives recalc ------------
 ws.freeze_clean(tol=0)
-g12 = group(ws.report(), gid_of(ws.report(), 1))
+rep = ws.report()
+g12 = group(rep, gid_of(rep, 1))
 check(g12 is not None and g12["status"] == "frozen", "freeze_clean must freeze the clean (1,2) match")
 rep = ws.solve()
 g12 = group(rep, gid_of(rep, 1))
@@ -100,7 +107,7 @@ check(g12 is not None and g12["status"] == "frozen" and g12["size"] >= 2,
       "frozen (1,2) group must survive a subsequent solve")
 
 # --- re-add the partner, re-match, then break the live group apart -----------
-ws.upsert(4, [UNIT, 3, "61600", -250, "INV0009 reversal"])
+ws.upsert(line(4, "B", "A", "61600", -250.0, 3, "INV0009"))
 rep = ws.solve()
 check(matched_pair(rep, 3, 4), "re-adding row 4 must re-form the (3,4) match on warm re-solve")
 ws.breakup(gid_of(rep, 3))

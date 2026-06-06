@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::ExtId;
 use crate::recon::{AllocationSpec, Recon};
 use crate::report::Report;
-use crate::sdk::plugin::{Plugin, ext_id};
+use crate::sdk::plugin::Plugin;
 use crate::sdk::table::Table;
 
 /// A live reconciliation session: the author's plugin plus the stateful
@@ -36,7 +36,7 @@ impl<P: Plugin + 'static> Session<P> {
         let mut seen: BTreeSet<ExtId> = BTreeSet::new();
         for i in 0..table.len() {
             let rv = table.row(i);
-            let id = ext_id(&self.plugin.key(&rv));
+            let id = self.plugin.id(&rv);
             if !seen.insert(id) {
                 return Err(format!(
                     "duplicate identity: two rows in this batch hash to id {id} (non-unique key)"

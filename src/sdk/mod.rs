@@ -19,7 +19,7 @@ mod table;
 
 pub use abi::Session;
 pub use describe::{DescribeDoc, Domain, Field, FieldType};
-pub use plugin::{Plugin, StableHasher, ext_id};
+pub use plugin::{Plugin, StableHasher, hash_key};
 pub use table::{RowView, Table};
 
 /// FNV-1a of a category string to a signed id lane (re-exported for plugins).

@@ -11,7 +11,7 @@ use crate::ExtId;
 use crate::Report;
 use crate::recon::Recon;
 use crate::report::Status;
-use crate::sdk::plugin::{Plugin, ext_id};
+use crate::sdk::plugin::Plugin;
 use crate::sdk::table::Table;
 
 /// Canonical, label-free form of a report: each group as its sorted membership
@@ -42,7 +42,7 @@ fn project_items<P: Plugin>(plugin: &P, table: &Table) -> Vec<(ExtId, P::Row)> {
     (0..table.len())
         .map(|i| {
             let rv = table.row(i);
-            (ext_id(&plugin.key(&rv)), plugin.project(&rv))
+            (plugin.id(&rv), plugin.project(&rv))
         })
         .collect()
 }
