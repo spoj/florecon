@@ -6,15 +6,15 @@
 //!   [`engine::NodeId`]/[`engine::ArcId`] handles, single-dummy transportation
 //!   model, warm-started re-solving with incremental potential updates, and
 //!   [`engine::Snapshot`] persistence for caching the basis across runs.
-//! - [`flow`] — the incremental min-cost-flow matcher: describe your domain
-//!   once via [`flow::Model`], then drive a [`flow::Matcher`] with `upsert` /
-//!   `remove` / `solve` and read back netted [`flow::Group`]s. This is the
-//!   engine behind the `flow` strategy leaf.
 //! - [`strategy`] — a combinator algebra over an unordered bag of items:
 //!   `Strategy: Bag -> (Groups, residual)`, conserving by construction. Cheap
 //!   deterministic primitives (`exact_1to1`, `agg_net`, `signal_group`,
 //!   `running_zero`) cascade ahead of the `flow` arbiter via `seq`,
-//!   `partition_by`, `branch`, and `windowed`.
+//!   `partition_by`, `branch`, and `windowed`. The `flow` leaf is itself the
+//!   incremental min-cost-flow matcher: describe your domain once via
+//!   [`strategy::Model`], then it drives a [`strategy::Matcher`]
+//!   (`upsert` / `remove` / `solve`) and reads back netted
+//!   [`strategy::Group`]s on top of the [`engine`].
 //! - [`plan`] — the consumption surface: a serializable [`plan::Plan`] (the
 //!   strategy tree as data, pricing included via [`plan::CostSpec`]), one
 //!   generic stateful facade [`plan::Recon`] (with [`plan::Workspace`] its
@@ -24,11 +24,11 @@
 //!   single C-ABI module any runtime (wasmtime, browser) can drive.
 //!
 //! Enable the `serde` feature to serialize [`engine::Snapshot`] /
-//! [`flow::MatcherSnapshot`] to disk and warm-start next month off this
+//! [`strategy::MatcherSnapshot`] to disk and warm-start next month off this
 //! month's tree.
 //!
 //! ```
-//! use florecon::flow::{Model, Matcher};
+//! use florecon::strategy::{Model, Matcher};
 //!
 //! struct Tx { amount: i64, date: i64 }
 //! struct M;
@@ -55,8 +55,6 @@ pub mod error;
 pub mod arrow;
 pub mod sel;
 
-pub mod flow;
-
 pub mod plan;
 mod plan_compile;
 pub mod report;
@@ -70,7 +68,8 @@ pub mod wasm;
 
 pub use engine::{ArcId, Network, NodeId, SolveStatus};
 pub use error::ApiError;
-pub use flow::{ExtId, Group, Matcher, Model};
+pub use strategy::flow::Group;
+pub use strategy::{ExtId, Matcher, Model};
 
 pub use report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use row::{PhysicalRow, ColumnMap};

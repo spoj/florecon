@@ -20,7 +20,7 @@ use arrow::datatypes::DataType;
 use arrow::ipc::reader::StreamReader;
 
 use crate::error::ApiError;
-use crate::flow::ExtId;
+use crate::ExtId;
 use crate::row::{ColumnMap, PhysicalRow};
 use crate::token::fnv1a;
 

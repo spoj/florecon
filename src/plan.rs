@@ -19,7 +19,7 @@
 //! never silently lose rows. Amount conservation lives in the strategy/flow
 //! algebra and is exposed directly in report allocations.
 
-use crate::flow::ExtId;
+use crate::ExtId;
 use crate::plan_compile::compile;
 
 /// The wire-contract version: the shape of [`Plan`], [`Report`], and the WASM

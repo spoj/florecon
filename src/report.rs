@@ -1,4 +1,4 @@
-use crate::flow::ExtId;
+use crate::ExtId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The single recalc-status axis of a group. Only a human operator flips a

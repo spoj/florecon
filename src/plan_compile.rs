@@ -1,5 +1,5 @@
 use crate::error::ApiError;
-use crate::flow::Model;
+use crate::Model;
 use crate::plan::{Cond, CostSpec, Plan, PlanNode};
 use crate::row::{PhysicalRow, ColumnMap};
 use crate::sel::Sel;

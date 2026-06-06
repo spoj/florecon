@@ -31,8 +31,15 @@
 //! ambiguous residual where strategies would otherwise compete.
 
 use crate::engine::SolveStatus;
-use crate::flow::{Allocation, ExtId, Matcher, Model};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+// The incremental min-cost-flow matcher is just the arbiter behind the `flow`
+// strategy leaf, so it lives here as one strategy among many. Kept in its own
+// file; `flow::Group` stays distinct from this module's own `Group`.
+pub mod flow;
+pub use flow::{Allocation, AllocationGroup, ExtId, Matcher, Model};
+#[cfg(feature = "serde")]
+pub use flow::MatcherSnapshot;
 use std::hash::Hash;
 use std::marker::PhantomData;
 

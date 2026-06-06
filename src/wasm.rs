@@ -34,7 +34,7 @@ struct Envelope {
     report: Option<Report>,
 }
 
-use crate::flow::ExtId;
+use crate::ExtId;
 use crate::plan::{AllocationSpec, Plan, Workspace};
 
 thread_local! {

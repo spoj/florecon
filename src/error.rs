@@ -1,4 +1,4 @@
-use crate::flow::ExtId;
+use crate::ExtId;
 
 /// Errors from compiling or running the public API.
 #[derive(Debug, Clone, PartialEq)]
