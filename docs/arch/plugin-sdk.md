@@ -148,6 +148,42 @@ is already domain-agnostic and carries over verbatim.
 { "ok": false, "error": "..." }
 ```
 
+### 3.5a Static manifest (custom section) — discovery without running the wasm
+
+`describe()` is authoritative but requires compiling/instantiating the module. For a *folder of
+many plugins*, the host must triage cheaply. So a conforming wasm **also** carries the same document
+as a WebAssembly **custom section** named `florecon.manifest`:
+
+```rust
+// emitted by export_plugin! from the SAME DescribeDoc const that backs describe()
+#[link_section = "florecon.manifest"]
+static MANIFEST: [u8; N] = *b"{ \"abi_version\": 19, \"domain\": {...}, ... }";
+```
+
+Because the macro generates the section and `describe()` from one source, **they cannot drift** —
+and that makes `describe()` the integrity check on the manifest (§9.3). Custom sections carry no
+execution semantics, so a host reads them by scanning the binary: **no wasm runtime required.**
+
+The manifest is the `describe()` doc plus discovery/trust fields:
+
+```jsonc
+{
+  "abi_version": 19,
+  "domain":  { "id": "florecon.intercompany", "version": "1.4.0" },
+  "build":   { "git": "3e6de0a", "at": "2026-06-06T...", "digest": "blake3:..." },
+  "input":   { "encoding": "arrow_ipc", "fields": [ /* required raw fields */ ] },
+  "report":  { "schema_version": 3 },
+  "capabilities": ["solve", "freeze", "group", "breakup"],
+  "selector": {                       // OPTIONAL applicability rule (§9.2)
+    "requires_fields": ["amount_minor", "entity"],
+    "tag": "intercompany",
+    "priority": 100
+  }
+}
+```
+
+See §9 for how the host uses this.
+
 ### 3.5 Versioning / conformance
 
 - `abi_version()` gates the **interface**; every host refuses a mismatched binary (as today).
@@ -279,6 +315,89 @@ This keeps `main` working while the branch proves the seam.
 
 ---
 
+## 9. Plugin discovery & cheap validation (host-side)
+
+Scenario: a company folder holds many `*.wasm` plugins. A generic host must (a) find the conforming
+ones, (b) validate them cheaply, and (c) pick the **correct** plugin for a given dataset — ideally
+without instantiating dozens of modules.
+
+### 9.1 Three-tier triage (cheapest first)
+
+| Tier | Method | Cost | Runtime |
+| --- | --- | --- | --- |
+| **0 Discover** | read the `florecon.manifest` custom section from the file bytes | ~µs, no deps | **none** |
+| **1 Confirm** | compile + `describe()`; assert it equals the manifest | ~ms | compile only |
+| **2 Probe** | run a tiny sample batch through `init`+`solve` | ~10s ms | full instantiate |
+
+Almost all selection happens at **Tier 0**. Tier 1 runs once, on the *chosen* plugin, to defeat a
+stale/forged manifest. Tier 2 is only for genuinely ambiguous matches.
+
+### 9.2 Selection: matching a dataset to a plugin
+
+The host indexes every manifest (Tier 0) and resolves a dataset to a plugin by, in order:
+
+1. **Explicit domain id.** If the dataset is tagged with a `domain.id`, pick the manifest that
+   advertises it. Most robust; zero ambiguity.
+2. **Structural fit.** Otherwise pick manifests whose `input.fields` (and optional
+   `selector.requires_fields` / `selector.tag`) are *satisfiable* by the dataset's columns — i.e.
+   the plugin can be fed from the data on hand.
+3. **Tiebreak** among survivors by `selector.priority`, then highest compatible `domain.version`.
+
+If still ambiguous, fall back to Tier 2 (probe the small candidate set) or surface the choice to the
+operator. Incompatible `abi_version` is filtered out at Tier 0 and never instantiated.
+
+### 9.3 Validation / trust ladder
+
+- **Structural** (Tier 0): manifest present, JSON parses, `abi_version` compatible, required fields
+  declared. Cheap reject of non-plugins and wrong-version binaries.
+- **Integrity** (Tier 0): `build.digest` lets the host detect truncation/corruption; a registry can
+  *pin* expected digests so an unknown/changed binary is flagged before it is ever compiled.
+- **Provenance** (optional, Tier 0): a detached/embedded **signature** over the module, verified
+  against a company key. The wasm sandbox bounds blast radius, but signing gives supply-chain trust
+  for a folder of artifacts that may include custom Rust matchers.
+- **Authoritative** (Tier 1): after selection, instantiate and assert `describe() == manifest`. This
+  is what makes a baked manifest safe to trust at Tier 0 — a lying manifest fails here.
+
+### 9.4 Optional: a cached registry index
+
+A host may pre-scan the folder once into `index.json` (`domain.id → {path, version, digest,
+input.fields, mtime}`) so steady-state selection is a map lookup. The Tier-0 scan is cheap enough
+that the index is an optimization, not a requirement; invalidate entries by file `mtime`/`digest`.
+
+### 9.5 The cheap scanner (no wasm runtime, ~30 lines)
+
+Custom sections are section id `0`: a LEB128-length name followed by the payload. Scan for the one
+named `florecon.manifest` and parse its JSON — no wasmtime, no browser `WebAssembly`:
+
+```python
+def read_manifest(path):
+    b = open(path, "rb").read()
+    if b[:4] != b"\0asm": return None          # not wasm
+    p = 8                                          # skip magic + version
+    while p < len(b):
+        sec_id = b[p]; p += 1
+        size, p = _uleb(b, p)
+        body, p = b[p:p+size], p + size
+        if sec_id == 0:                            # custom section
+            nlen, q = _uleb(body, 0)
+            name = body[q:q+nlen]
+            if name == b"florecon.manifest":
+                return json.loads(body[q+nlen:])
+    return None
+```
+
+(Browser equivalent: `WebAssembly.Module.customSections(await WebAssembly.compile(bytes),
+"florecon.manifest")` — compile, no instantiate.)
+
+### 9.6 SDK responsibility
+
+`export_plugin!` owns the manifest↔`describe()` coupling: it serializes the author's `DescribeDoc`
+once, returns it from `describe()`, **and** embeds it via `#[link_section = "florecon.manifest"]`,
+folding in `build.git`/`build.digest` at compile time. The author writes `describe()` and gets free,
+drift-proof, runtime-less discovery.
+
+---
+
 ## 6. Open questions / decisions
 
 - **Raw encoding in `describe.input.encoding`.** Keep Arrow IPC (zero-copy, columnar, already
@@ -291,6 +410,8 @@ This keeps `main` working while the branch proves the seam.
   functions for directness.
 - **Report schema versioning** independent of `abi_version` (so the human-decision surface can
   evolve without rev'ing the whole ABI).
+- **Manifest signing.** Decide whether `build.digest` alone suffices (corruption detection) or we
+  want detached signatures + a company key for supply-chain trust over a plugin folder (§9.3).
 
 ## 7. Non-goals (for this branch)
 
