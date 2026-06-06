@@ -107,21 +107,18 @@ impl Table {
 }
 
 fn push_i64(cols: &mut HashMap<String, Column>, name: &str, it: impl Iterator<Item = i64>) {
-    match cols.entry(name.to_string()).or_insert_with(|| Column::I64(Vec::new())) {
-        Column::I64(v) => v.extend(it),
-        _ => {}
+    if let Column::I64(v) = cols.entry(name.to_string()).or_insert_with(|| Column::I64(Vec::new())) {
+        v.extend(it);
     }
 }
 fn push_f64(cols: &mut HashMap<String, Column>, name: &str, it: impl Iterator<Item = f64>) {
-    match cols.entry(name.to_string()).or_insert_with(|| Column::F64(Vec::new())) {
-        Column::F64(v) => v.extend(it),
-        _ => {}
+    if let Column::F64(v) = cols.entry(name.to_string()).or_insert_with(|| Column::F64(Vec::new())) {
+        v.extend(it);
     }
 }
 fn push_str(cols: &mut HashMap<String, Column>, name: &str, it: impl Iterator<Item = String>) {
-    match cols.entry(name.to_string()).or_insert_with(|| Column::Str(Vec::new())) {
-        Column::Str(v) => v.extend(it),
-        _ => {}
+    if let Column::Str(v) = cols.entry(name.to_string()).or_insert_with(|| Column::Str(Vec::new())) {
+        v.extend(it);
     }
 }
 

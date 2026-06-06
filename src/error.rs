@@ -3,12 +3,6 @@ use crate::ExtId;
 /// Errors from compiling or running the public API.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiError {
-    UnknownColumn(String),
-    BadExpr(String),
-    SchemaArity {
-        expected: usize,
-        got: usize,
-    },
     /// Amount conservation failed: some input id's allocations do not sum to
     /// its original amount (a row was partly/fully lost, or split incorrectly).
     /// In the allocation-native (lot hypergraph) model this is the conserved
@@ -39,22 +33,11 @@ pub enum ApiError {
         group_id: u64,
         id: ExtId,
     },
-    /// A bare cell did not match its column kind (e.g. a string in a `Number`
-    /// column). `col` is the column index; `want` the expected scalar.
-    BadCell {
-        col: usize,
-        want: &'static str,
-    },
 }
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ApiError::UnknownColumn(c) => write!(f, "unknown column: {c}"),
-            ApiError::BadExpr(e) => write!(f, "bad expression: {e}"),
-            ApiError::SchemaArity { expected, got } => {
-                write!(f, "row arity {got} != schema arity {expected}")
-            }
             ApiError::ConservationViolated {
                 id,
                 original,
@@ -80,7 +63,6 @@ impl std::fmt::Display for ApiError {
             ApiError::UnknownAllocation { group_id, id } => {
                 write!(f, "group {group_id} has no live allocation for row {id}")
             }
-            ApiError::BadCell { col, want } => write!(f, "column {col}: expected a {want}"),
         }
     }
 }
