@@ -237,18 +237,28 @@ The author should not hand-write the ABI, the buffer dance, session state, freez
 ```rust
 pub trait Plugin {
     type Row: Clone + 'static;
+    type Raw;                      // decoded raw row (author's choice of repr)
+    type Key: Hash + Eq + 'static; // the NATURAL identity of a row
 
-    /// The conserved primary amount (signed, minor units).
+    /// Split the opaque raw buffer into individual raw rows. Decoding only —
+    /// no cross-row logic. Use anything: arrow, serde, polars, hand-rolled.
+    fn decode(&self, raw: &[u8]) -> Result<Vec<Self::Raw>, Error>;
+
+    /// Row-local: the stable identity of this row. MUST be deterministic and
+    /// unique per logical row. The SDK hashes it to the engine ExtId, so the
+    /// author never mints a u64 by hand (§10).
+    fn key(&self, raw: &Self::Raw) -> Self::Key;
+
+    /// Row-local: derive the match lanes. Deterministic, no other rows.
+    fn project(&self, raw: &Self::Raw) -> Self::Row;
+
+    /// The conserved primary amount (single numeraire, signed, minor units).
     fn primary(row: &Self::Row) -> i64;
-
-    /// Parse the host's opaque raw buffer into rows. Use anything: arrow, serde,
-    /// polars, hand-rolled. This is the "preprocessing baked into the wasm".
-    fn derive(&self, raw: &[u8]) -> Result<Vec<(ExtId, Self::Row)>, Error>;
 
     /// The baked matching strategy (built per §4.1).
     fn strategy(&self) -> Box<dyn Strategy<Self::Row>>;
 
-    /// Self-description for the generic host (§3.2).
+    /// Self-description for the generic host (§3.2) and manifest (§3.5a).
     fn describe(&self) -> DescribeDoc;
 }
 
@@ -258,14 +268,15 @@ florecon_sdk::export_plugin!(MyPlugin);   // emits abi_version/alloc/dealloc/des
 `export_plugin!` generates the §3 ABI:
 
 - a `thread_local!` `Recon<Row>` session built from `strategy()` + `primary`;
-- `dispatch` decodes the `Cmd`, runs `derive` on the raw buffer for `init`/`upsert`, forwards
-  freeze/group/solve to `Recon`, and serializes the `Report` envelope;
+- `dispatch` decodes the `Cmd`; for `init`/`upsert` it runs `decode` then, per raw row,
+  `ext_id = stable_hash(key(raw))` and `upsert(ext_id, project(raw))` — **the SDK owns id minting,
+  warm-start, freeze, and Report rendering** (§10);
 - `describe` returns the author's `DescribeDoc`;
 - `abi_version` returns the interface constant.
 
-The author's surface is therefore **exactly four functions**: `primary`, `derive`, `strategy`,
-`describe`. Everything that makes the wasm *conform* is the macro's job — that is the "high-end
-wiring nicety."
+The author's surface is `decode`, `key`, `project`, `primary`, `strategy`, `describe` — and only
+`key`/`primary` carry invariant weight (§10). Everything that makes the wasm *conform and stay
+correct across solves* is the macro + `Recon`.
 
 ### 4.3 What the SDK is made of (file-level)
 
@@ -398,6 +409,77 @@ drift-proof, runtime-less discovery.
 
 ---
 
+## 10. Author responsibility boundary: identity & the bookkeeping the SDK owns
+
+The worry: "if the wasm holds the domain, every author must get warm-start / stable ids / freeze
+right." They don't. That bookkeeping is **`Recon<E>`'s**, inherited by every plugin:
+
+| Concern | Owner | Author touches it? |
+| --- | --- | --- |
+| Warm-start flow basis, present-set delta | `Recon` + `flow`/`Matcher` | no |
+| Monotonic group-id minting (`next_id`, never reused) | `Recon` | no |
+| Freeze / unfreeze / breakup / group id stability | `Recon` | no |
+| Incremental upsert / remove | `Recon` | no |
+| Conservation (incl. pivot airlock) | engine | no |
+| Report rendering, envelope, ABI | `export_plugin!` | no |
+| **Stable row identity from raw data** | **author (`key`)** | **yes** |
+| **Coherent primary numeraire** | **author (`primary`)** | **yes** |
+| Row-local lane derivation | author (`project`) | yes (but signature-constrained) |
+
+So the genuinely tricky part collapses to **one thing: identity.** Warm-start and frozen-decision
+persistence both key off a *stable* `ExtId`. If `key` is non-unique, unstable across batches, or
+non-deterministic, you get silent churn (warm-start thrashes) or detached freezes — with no compile
+error. Everything else the author writes is ordinary, local, and hard to get "invariant-wrong".
+
+### 10.1 Make identity a typed obligation, not a freeform u64
+
+The author never mints an `ExtId`. They **name** the natural key (`type Key` + `fn key`), and the
+SDK hashes it to the `ExtId` with the same stable FNV-1a the engine already uses for categories. This
+turns "how do I produce a stable u64" (easy to botch) into "which field(s) identify a row" (a domain
+question the author can actually answer).
+
+### 10.2 Forbid the cross-row footgun by signature
+
+`key` and `project` take **one** `&Self::Raw`, never the batch. Cross-row derivations (rank,
+dedupe, running balance) are therefore *unrepresentable* in the per-row hooks — the type system keeps
+derivation row-local, which is exactly what the warm/incremental model requires. (Cross-row features
+go upstream or become strategies.)
+
+### 10.3 Strict mode: catch identity bugs at runtime, loudly
+
+The harness can run cheap invariant checks (toggleable; off in prod):
+
+- **Collision**: two raw rows in a batch hash to the same `ExtId` but differ in content → duplicate
+  key, raise instead of silently overwriting.
+- **Determinism**: re-run `project`/`key` on a sample and assert identical output (catches float /
+  locale / hashmap-order nondeterminism).
+- **Conservation**: the engine already returns `ConservationViolated`; the harness surfaces it as a
+  clear per-row diagnostic pointing back at `primary`/`project`.
+
+### 10.4 A generic conformance kit (the real guarantee)
+
+Because the SDK controls the harness, it can mechanically test the properties that *only* break when
+identity/derive is wrong — without the author writing any of these tests:
+
+- **Idempotent upsert**: upsert the same batch twice → Report unchanged (stable keys).
+- **Order independence**: shuffle the batch → Report unchanged (no positional identity).
+- **Warm == cold**: incremental upserts vs one cold load → identical Report (warm-start integrity).
+- **Freeze survives churn**: freeze a group, upsert unrelated rows, re-solve → the frozen group is
+  intact (id stability across solves).
+
+The engine already proves the last two for itself (`warm_start_matches_cold`,
+`dual_warm_matches_cold`); the kit re-offers the same harness to plugin authors as a drop-in test.
+A plugin that passes the kit has, by construction, gotten identity right.
+
+### 10.5 Net answer
+
+Not tricky to get the *bookkeeping* right — the author doesn't implement it. The one sharp edge is
+**stable identity**, and we de-risk it three ways: (1) typed `key` so the SDK owns id minting, (2)
+row-local hook signatures so cross-row mistakes can't compile, (3) a conformance kit + strict mode
+that catch the remaining "unstable/non-unique key" failure modes mechanically.
+
+---
+
 ## 6. Open questions / decisions
 
 - **Raw encoding in `describe.input.encoding`.** Keep Arrow IPC (zero-copy, columnar, already
@@ -412,6 +494,9 @@ drift-proof, runtime-less discovery.
   evolve without rev'ing the whole ABI).
 - **Manifest signing.** Decide whether `build.digest` alone suffices (corruption detection) or we
   want detached signatures + a company key for supply-chain trust over a plugin folder (§9.3).
+- **Who mints identity — host or plugin?** Default to the plugin (`fn key`, §10.1) so identity is a
+  domain decision baked with the rest. Allow a host-supplied id column as the trivial `key` for
+  data that already carries a stable id.
 
 ## 7. Non-goals (for this branch)
 
