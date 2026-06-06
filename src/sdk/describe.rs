@@ -23,24 +23,27 @@ pub struct Field {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: FieldType,
-    /// True for the single column that carries the conserved numeraire.
+    /// True for the single column the host shows as the headline figure. This
+    /// is a *display* hint, distinct from the conserved numeraire
+    /// ([`Plugin::primary`](crate::sdk::Plugin::primary)), which a plugin may
+    /// derive from several columns.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub primary: bool,
+    pub amount: bool,
 }
 
 impl Field {
     pub fn int(name: &str) -> Self {
-        Field { name: name.into(), ty: FieldType::I64, primary: false }
+        Field { name: name.into(), ty: FieldType::I64, amount: false }
     }
     pub fn float(name: &str) -> Self {
-        Field { name: name.into(), ty: FieldType::F64, primary: false }
+        Field { name: name.into(), ty: FieldType::F64, amount: false }
     }
     pub fn text(name: &str) -> Self {
-        Field { name: name.into(), ty: FieldType::Utf8, primary: false }
+        Field { name: name.into(), ty: FieldType::Utf8, amount: false }
     }
-    /// Mark this column as the conserved numeraire.
-    pub fn primary(mut self) -> Self {
-        self.primary = true;
+    /// Mark this column as the host's headline display amount.
+    pub fn amount(mut self) -> Self {
+        self.amount = true;
         self
     }
 }
@@ -77,8 +80,8 @@ impl DescribeDoc {
         self
     }
 
-    /// The name of the declared primary column, if any.
-    pub fn primary_field(&self) -> Option<&str> {
-        self.input.iter().find(|f| f.primary).map(|f| f.name.as_str())
+    /// The name of the declared headline-amount column, if any.
+    pub fn amount_field(&self) -> Option<&str> {
+        self.input.iter().find(|f| f.amount).map(|f| f.name.as_str())
     }
 }

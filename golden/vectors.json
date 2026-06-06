@@ -1,0 +1,697 @@
+{
+  "abi_version": 1,
+  "describe": {
+    "abi_version": 1,
+    "domain": {
+      "id": "florecon.intercompany",
+      "version": "1.0.0"
+    },
+    "input": [
+      {
+        "name": "row_id",
+        "type": "i64"
+      },
+      {
+        "name": "company",
+        "type": "utf8"
+      },
+      {
+        "name": "icp",
+        "type": "utf8"
+      },
+      {
+        "name": "objsub",
+        "type": "utf8"
+      },
+      {
+        "amount": true,
+        "name": "indicative_usd_amt",
+        "type": "f64"
+      },
+      {
+        "name": "gl_date",
+        "type": "i64"
+      },
+      {
+        "name": "base_currency",
+        "type": "utf8"
+      },
+      {
+        "name": "trx_currency",
+        "type": "utf8"
+      },
+      {
+        "name": "trx_amt",
+        "type": "f64"
+      },
+      {
+        "name": "fc_amt",
+        "type": "f64"
+      },
+      {
+        "name": "reference",
+        "type": "utf8"
+      },
+      {
+        "name": "reference2",
+        "type": "utf8"
+      },
+      {
+        "name": "description",
+        "type": "utf8"
+      },
+      {
+        "name": "name_remark_explanation",
+        "type": "utf8"
+      },
+      {
+        "name": "invoice_no",
+        "type": "utf8"
+      },
+      {
+        "name": "is_offset",
+        "type": "i64"
+      }
+    ],
+    "report_schema": 1
+  },
+  "steps": [
+    {
+      "arrow": "step-00.arrow",
+      "cmd": {
+        "op": "init"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 0,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 1,
+              "id": 2
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 0,
+              "net": 10000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            },
+            {
+              "group_id": 1,
+              "net": -10000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "init"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "op": "solve"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 2,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 2,
+              "id": 2
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 2,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "solve"
+    },
+    {
+      "arrow": "step-02.arrow",
+      "cmd": {
+        "op": "upsert"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 2,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 2,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 3,
+              "id": 3
+            },
+            {
+              "amount": -5000,
+              "group_id": 4,
+              "id": 4
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 2,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "proposed"
+            },
+            {
+              "group_id": 3,
+              "net": 5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            },
+            {
+              "group_id": 4,
+              "net": -5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "upsert"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "op": "solve"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 5,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 5,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 6,
+              "id": 3
+            },
+            {
+              "amount": -5000,
+              "group_id": 6,
+              "id": 4
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 5,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "proposed"
+            },
+            {
+              "group_id": 6,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "solve"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "ids": [
+          4
+        ],
+        "op": "remove"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 5,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 5,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 6,
+              "id": 3
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 5,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "proposed"
+            },
+            {
+              "group_id": 6,
+              "net": 5000,
+              "origin": "unmatched",
+              "reason": "aggregate net",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "remove"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "op": "solve"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 7,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 7,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 8,
+              "id": 3
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 7,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "proposed"
+            },
+            {
+              "group_id": 8,
+              "net": 5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "solve"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "by": "clean",
+        "op": "pin",
+        "tol": 0
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 7,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 7,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 8,
+              "id": 3
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 7,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "pinned"
+            },
+            {
+              "group_id": 8,
+              "net": 5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "pin_clean"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "op": "solve"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 7,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 7,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 9,
+              "id": 3
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 7,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "pinned"
+            },
+            {
+              "group_id": 9,
+              "net": 5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "solve"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "group_id": 7,
+        "op": "dissolve"
+      },
+      "expect": {
+        "error": {
+          "code": "frozen_group",
+          "group_id": 7,
+          "message": "group 7 is pinned; unpin it first"
+        },
+        "ok": false
+      },
+      "name": "dissolve_pinned_err"
+    },
+    {
+      "arrow": "step-09.arrow",
+      "cmd": {
+        "op": "upsert"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 7,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 7,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 9,
+              "id": 3
+            },
+            {
+              "amount": -5000,
+              "group_id": 10,
+              "id": 4
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 7,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "pinned"
+            },
+            {
+              "group_id": 9,
+              "net": 5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            },
+            {
+              "group_id": 10,
+              "net": -5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "readd"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "op": "solve"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 7,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 7,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 11,
+              "id": 3
+            },
+            {
+              "amount": -5000,
+              "group_id": 11,
+              "id": 4
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 7,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "pinned"
+            },
+            {
+              "group_id": 11,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "solve"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "group_id": 11,
+        "op": "dissolve"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 7,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 7,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 12,
+              "id": 3
+            },
+            {
+              "amount": -5000,
+              "group_id": 13,
+              "id": 4
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 7,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "pinned"
+            },
+            {
+              "group_id": 12,
+              "net": 5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            },
+            {
+              "group_id": 13,
+              "net": -5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "dissolve"
+    },
+    {
+      "arrow": null,
+      "cmd": {
+        "op": "report"
+      },
+      "expect": {
+        "ok": true,
+        "report": {
+          "allocations": [
+            {
+              "amount": 10000,
+              "group_id": 7,
+              "id": 1
+            },
+            {
+              "amount": -10000,
+              "group_id": 7,
+              "id": 2
+            },
+            {
+              "amount": 5000,
+              "group_id": 12,
+              "id": 3
+            },
+            {
+              "amount": -5000,
+              "group_id": 13,
+              "id": 4
+            }
+          ],
+          "groups": [
+            {
+              "group_id": 7,
+              "net": 0,
+              "origin": "agg_net",
+              "reason": "aggregate net",
+              "size": 2,
+              "status": "pinned"
+            },
+            {
+              "group_id": 12,
+              "net": 5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            },
+            {
+              "group_id": 13,
+              "net": -5000,
+              "origin": "unmatched",
+              "size": 1,
+              "status": "proposed"
+            }
+          ]
+        }
+      },
+      "name": "report"
+    }
+  ]
+}

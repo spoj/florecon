@@ -11,4 +11,5 @@ florecon = { path = "../..", features = ["sdk"] }
 
 [dev-dependencies]
 arrow = { version = "53", default-features = false, features = ["ipc"] }
+serde_json = "1"
 

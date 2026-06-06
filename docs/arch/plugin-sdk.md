@@ -4,6 +4,13 @@ Status: **IMPLEMENTED** on branch `arch/plugin-sdk`. The data-plan layer is dele
 real wasm plugin, and both hosts (Python + browser data path) are migrated and green. The sections
 below are the original design; §0 records what actually shipped and where it differs.
 
+> **Superseded surface.** The workspace and SDK surfaces were later redesigned for
+> orthogonality. The command names below (`freeze`/`unfreeze`/`breakup`/`group`/`ungroup`,
+> `Field::primary`) are historical. The **current** surface is specified in
+> [`recon-surface.md`](recon-surface.md) (`pin`/`unpin`/`merge`/`detach`/`dissolve`,
+> proposed-vs-pinned lifecycle) and [`sdk-surface.md`](sdk-surface.md) (enforced schema,
+> collapsed `Cmd` set, typed error envelope, `Field::amount`).
+
 ---
 
 ## 0. As-built (what shipped)

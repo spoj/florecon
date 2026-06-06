@@ -14,7 +14,7 @@
 //! ```
 //!
 //! Primitives ([`exact_1to1`], [`agg_net`], [`signal_group`], [`flow`]) are the
-//! leaves; combinators ([`seq`], [`partition_by`], [`branch`]) compose them. A
+//! leaves; combinators ([`seq`], [`partition_by`], [`when`]) compose them. A
 //! whole pipeline is just an expression:
 //!
 //! ```ignore
@@ -22,7 +22,7 @@
 //!     agg_net(objsub, amount, tol),   // macro nets accepted wholesale
 //!     exact_1to1(amount_key, amount), // clean 1-to-1 pairs
 //!     signal_group(tokens, amount, tol, cap), // reference bridge
-//!     flow(model),                    // engine arbitrates the rest
+//!     flow(spec),                     // engine arbitrates the rest
 //! ])))
 //! ```
 //!
@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 // strategy leaf, so it lives here as one strategy among many. Kept in its own
 // file; `flow::Group` stays distinct from this module's own `Group`.
 pub mod flow;
-pub use flow::{flow, Allocation, ExtId, Model};
+pub use flow::{flow, Allocation, ExtId, FlowSpec};
 
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -90,33 +90,91 @@ impl Group {
     pub fn member_ids(&self) -> Vec<ExtId> {
         self.members.iter().map(|a| a.id).collect()
     }
+
+    /// Number of member allocations.
+    pub fn size(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Magnitude of the residual net (zero means the group balances exactly).
+    pub fn abs_net(&self) -> i64 {
+        self.net.abs()
+    }
+
+    /// Largest member allocation magnitude (the dominant leg).
+    pub fn max_abs(&self) -> i64 {
+        self.members.iter().map(|a| a.amount.abs()).max().unwrap_or(0)
+    }
+
+    /// Smallest non-zero member allocation magnitude; `0` if every leg is zero.
+    pub fn min_abs(&self) -> i64 {
+        self.members
+            .iter()
+            .map(|a| a.amount.abs())
+            .filter(|&v| v > 0)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// The minority side count: `min(#positive, #negative)` legs. A clean 1:1
+    /// pair is `1`; an all-one-sign wash is `0`. The usual structural gate for
+    /// "both books are really represented".
+    pub fn min_side(&self) -> usize {
+        let pos = self.members.iter().filter(|a| a.amount > 0).count();
+        let neg = self.members.iter().filter(|a| a.amount < 0).count();
+        pos.min(neg)
+    }
+
+    /// Whether the group's net balances within `tol`, measured against the
+    /// bucket's leg magnitudes (smallest leg for [`Tol::Rel`], largest for
+    /// [`Tol::RelMax`]). The natural predicate for an [`accept_if`] gate.
+    pub fn clean(&self, tol: Tol) -> bool {
+        self.abs_net() <= tol.slack_for(self.members.iter().map(|a| a.amount))
+    }
 }
 
 /// An acceptance tolerance for a netting primitive. `Abs` is a fixed slack in
-/// the active numeraire; `Rel` is proportional — `bps` basis points of the
-/// bucket's smallest non-zero leg, but never below `floor`. Relative tolerance
-/// is the common reconciliation idiom ("within 0.1% of the smaller side"); it
-/// stays integer-exact, so conservation is untouched.
+/// the active numeraire; `Rel`/`RelMax` are proportional — `bps` basis points
+/// of a reference leg, but never below `floor`. Relative tolerance is the common
+/// reconciliation idiom ("within 0.1% of the line"); it stays integer-exact, so
+/// conservation is untouched. The two relative forms differ only in the
+/// reference leg: `Rel` scales off the **smallest** non-zero leg (conservative —
+/// a tiny leg can't drag a big bucket into "balanced"), `RelMax` off the
+/// **largest** leg (lenient — "within `bps` of the trade").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(untagged))]
 pub enum Tol {
     Abs(i64),
     Rel { bps: i64, floor: i64 },
+    RelMax { bps: i64, floor: i64 },
 }
 
 impl Tol {
-    /// The effective integer slack given the bucket's reference `scale` (its
-    /// smallest non-zero leg magnitude).
+    /// The effective integer slack given a single reference `scale` magnitude.
+    /// Both relative forms apply the same `bps`-of-`scale`-but-never-below-floor
+    /// rule; they differ only in *which* leg [`Tol::slack_for`] feeds as `scale`.
     pub fn slack(&self, scale: i64) -> i64 {
         match *self {
             Tol::Abs(t) => t,
-            Tol::Rel { bps, floor } => {
-                let rel =
-                    (scale.unsigned_abs() as i128 * bps.max(0) as i128 / 10_000) as i64;
+            Tol::Rel { bps, floor } | Tol::RelMax { bps, floor } => {
+                let rel = (scale.unsigned_abs() as i128 * bps.max(0) as i128 / 10_000) as i64;
                 rel.max(floor.max(0))
             }
         }
+    }
+
+    /// The slack for a whole bucket, picking the reference leg from the member
+    /// `legs` per the variant: smallest non-zero leg for [`Tol::Rel`], largest
+    /// for [`Tol::RelMax`], irrelevant for [`Tol::Abs`]. This is the single place
+    /// scale selection lives, so every netting leaf and [`Group::clean`] agree.
+    pub fn slack_for(&self, legs: impl Iterator<Item = i64>) -> i64 {
+        let scale = match self {
+            Tol::Abs(_) => 0,
+            Tol::Rel { .. } => legs.map(i64::abs).filter(|&v| v > 0).min().unwrap_or(0),
+            Tol::RelMax { .. } => legs.map(i64::abs).max().unwrap_or(0),
+        };
+        self.slack(scale)
     }
 }
 
@@ -303,12 +361,8 @@ where
 /// // Accept only groups <= 12 lots whose smaller side exceeds 2; reject the
 /// // rest back to residual for a later stage.
 /// accept_if(
-///     |g| {
-///         let pos = g.members.iter().filter(|a| a.amount > 0).count();
-///         let neg = g.members.len() - pos;
-///         g.members.len() <= 12 && pos.min(neg) > 2
-///     },
-///     flow(model),
+///     |g| g.size() <= 12 && g.min_side() > 2,
+///     flow(spec),
 /// )
 /// ```
 pub fn accept_if<E: Clone + 'static, FP>(
@@ -319,15 +373,6 @@ where
     FP: Fn(&Group) -> bool + 'static,
 {
     Box::new(Filter { pred, inner })
-}
-
-/// Alias for [`accept_if`]: keep the groups matching `pred`, dissolve the rest
-/// back into the residual.
-pub fn filter<E: Clone + 'static, FP>(pred: FP, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>>
-where
-    FP: Fn(&Group) -> bool + 'static,
-{
-    accept_if(pred, inner)
 }
 
 struct Coalesce<E> {
@@ -748,10 +793,16 @@ pub fn fixed_point<E: 'static>(
     })
 }
 
+/// Builds a per-shard child subtree from the shard key (see [`partition_by`] /
+/// [`partition_by_with`]).
+type ShardFactory<E, K> = dyn Fn(&K) -> Box<dyn Strategy<E>>;
+
 struct PartitionBy<E, K, FK> {
     key: FK,
-    /// Builds a fresh child subtree the first time a shard key is seen.
-    factory: Box<dyn Fn() -> Box<dyn Strategy<E>>>,
+    /// Builds a fresh child subtree the first time a shard key is seen. Receives
+    /// the shard key, so [`partition_by_with`] can choose a per-key subtree;
+    /// [`partition_by`] passes a key-ignoring factory.
+    factory: Box<ShardFactory<E, K>>,
     /// One independent child per shard key. Each child owns its own state
     /// (notably its own warm flow basis), so per-shard warm-start is
     /// automatic and the flow leaf never needs to know it is sharded.
@@ -781,8 +832,10 @@ where
         let mut groups = Vec::new();
         let mut residual = Vec::new();
         for (k, items) in shards {
-            let child = children.entry(k).or_insert_with(|| factory());
-            let r = child.run(items);
+            if !children.contains_key(&k) {
+                children.insert(k.clone(), factory(&k));
+            }
+            let r = children.get_mut(&k).unwrap().run(items);
             groups.extend(r.groups);
             residual.extend(r.residual);
         }
@@ -804,18 +857,37 @@ where
 {
     Box::new(PartitionBy {
         key,
+        factory: Box::new(move |_k| factory()),
+        children: HashMap::new(),
+    })
+}
+
+/// [`partition_by`] with a **key-aware** factory: shard by key equality exactly
+/// as `partition_by`, but the factory receives the shard key, so plain Rust
+/// picks a per-key subtree (e.g. an AR/AP shard runs a different cascade than a
+/// GA shard). Routing stays hard-disjoint with per-shard warm state — an item
+/// lands in exactly one key-chosen subtree and never cascades into a sibling.
+/// (For *cascade* routing where leftovers flow on, compose [`when`] in a
+/// [`seq`] instead.)
+pub fn partition_by_with<E: 'static, K, FK, FF>(key: FK, factory: FF) -> Box<dyn Strategy<E>>
+where
+    K: Hash + Eq + Clone + 'static,
+    FK: Fn(&E) -> K + 'static,
+    FF: Fn(&K) -> Box<dyn Strategy<E>> + 'static,
+{
+    Box::new(PartitionBy {
+        key,
         factory: Box::new(factory),
         children: HashMap::new(),
     })
 }
 
-struct Branch<E, FP> {
+struct When<E, FP> {
     pred: FP,
-    and_then: Box<dyn Strategy<E>>,
-    or_else: Box<dyn Strategy<E>>,
+    inner: Box<dyn Strategy<E>>,
 }
 
-impl<E, FP> Strategy<E> for Branch<E, FP>
+impl<E, FP> Strategy<E> for When<E, FP>
 where
     FP: Fn(&E) -> bool,
 {
@@ -829,35 +901,50 @@ where
                 no.push(item);
             }
         }
-        // Always run both children, even on empty input, so stateful leaves such
-        // as `flow` can observe rows that departed their branch and drop stale
-        // warm state.
-        let mut a = self.and_then.run(yes);
-        let b = self.or_else.run(no);
-        a.groups.extend(b.groups);
-        a.residual.extend(b.residual);
-        a
+        // Always run the child, even on empty input, so a stateful leaf such as
+        // `flow` observes rows that departed the guard and drops stale warm
+        // state. Non-matching items pass straight through as residual, joined
+        // with whatever matching items the child could not resolve.
+        let mut r = self.inner.run(yes);
+        r.residual.extend(no);
+        r
     }
 }
 
-/// Route the bag by a predicate, run different child subtrees on the two sides,
-/// then join their groups/residuals. This is a structural split (unlike
-/// [`seq`], which cascades over residual, and unlike [`partition_by`], which
-/// runs the same child per shard). Conservation follows from the disjoint split
-/// and from each child conserving its own side.
-pub fn branch<E: 'static, FP>(
-    pred: FP,
-    and_then: Box<dyn Strategy<E>>,
-    or_else: Box<dyn Strategy<E>>,
-) -> Box<dyn Strategy<E>>
+/// Route the items matching `pred` into `inner`; everything else passes straight
+/// through as residual. `inner`'s own residual (matching items it could not
+/// resolve) joins the passthrough, so inside a [`seq`] the leftovers cascade to
+/// the next step. This is the one-sided guard — the everyday way to apply a
+/// subtree to a subset (only prior-close rows, only rows with a non-zero trx
+/// amount) while leaving the rest for later stages.
+///
+/// For *hard-disjoint* per-key routing with warm shards (an item lands in
+/// exactly one key-chosen subtree, no cascade), use [`partition_by_with`]; for a
+/// two-way split, just sequence two guards: `seq(vec![when(p, a), when(not_p,
+/// b)])`.
+pub fn when<E: 'static, FP>(pred: FP, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>>
 where
     FP: Fn(&E) -> bool + 'static,
 {
-    Box::new(Branch {
-        pred,
-        and_then,
-        or_else,
-    })
+    Box::new(When { pred, inner })
+}
+
+struct Identity;
+
+impl<E> Strategy<E> for Identity {
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        Resolution {
+            groups: Vec::new(),
+            residual: bag,
+        }
+    }
+}
+
+/// The no-op strategy: pulls no groups, returns the whole bag as residual. It is
+/// the unit of [`seq`] (an empty `seq` behaves identically) and the do-nothing
+/// arm of a guard. Rarely written directly; handy as a default subtree.
+pub fn identity<E: 'static>() -> Box<dyn Strategy<E>> {
+    Box::new(Identity)
 }
 
 struct Windowed<E, FO> {
@@ -1022,10 +1109,6 @@ where
     })
 }
 
-pub fn exact_1to1_any<E: 'static>() -> Box<dyn Strategy<E>> {
-    exact_1to1(|_e: &E| Some(0))
-}
-
 struct AggNet<E, FK> {
     key: FK,
     tol: Tol,
@@ -1052,14 +1135,8 @@ where
                 let a = i.amount;
                 (p || a > 0, n || a < 0)
             });
-            // Relative tolerance scales off the bucket's smallest non-zero leg.
-            let scale = items
-                .iter()
-                .map(|i| i.amount.abs())
-                .filter(|&v| v > 0)
-                .min()
-                .unwrap_or(0);
-            let tol = self.tol.slack(scale);
+            // Relative tolerance picks its reference leg per the `Tol` variant.
+            let tol = self.tol.slack_for(items.iter().map(|i| i.amount));
             if items.len() >= 2 && sum.abs() <= tol && signs.0 && signs.1 {
                 groups.push(Group {
                     members: items
@@ -1195,15 +1272,10 @@ where
             let sum: i64 = members.iter().map(|&i| amt[i]).sum();
             let has_pos = members.iter().any(|&i| amt[i] > 0);
             let has_neg = members.iter().any(|&i| amt[i] < 0);
-            // Relative tolerance scales off the bucket's smallest non-zero leg,
+            // Relative tolerance picks its reference leg per the `Tol` variant,
             // matching `agg_net`.
-            let scale = members
-                .iter()
-                .map(|&i| amt[i].abs())
-                .filter(|&v| v > 0)
-                .min()
-                .unwrap_or(0);
-            if sum.abs() <= self.tol.slack(scale) && has_pos && has_neg {
+            let slack = self.tol.slack_for(members.iter().map(|&i| amt[i]));
+            if sum.abs() <= slack && has_pos && has_neg {
                 for &i in &members {
                     used[i] = true;
                 }
@@ -1460,7 +1532,246 @@ where
     Box::new(Pivot { amount, inner })
 }
 
+// ---------------------------------------------------------------------------
+// Soakers — terminal classifiers for the residual tail
+// ---------------------------------------------------------------------------
+//
+// A soaker is *not* a matcher: it consumes leftover residual lots into groups
+// whose non-zero `net` is expected and meaningful (a variance, a write-off, an
+// "unmatched" class). Where the committing primitives pull rows they are
+// *certain* net, soakers terminate the cascade by classifying what is left.
+// `Singleton` mode emits one group per residual lot; `Bucket` mode collects
+// residuals sharing a `key` into one labelled class.
 
+/// How a soaker shapes the residual it consumes: one group per lot, or one
+/// group per `key` bucket.
+#[derive(Clone, Copy)]
+pub enum SoakMode {
+    Singleton,
+    Bucket,
+}
+
+/// Emit the soaked `items` as either singleton groups or one bucketed group,
+/// stamping `origin` (suffixed with the bucket key in `Bucket` mode).
+fn soak_emit<E, K>(
+    groups: &mut Vec<Group>,
+    buckets: &mut HashMap<K, Vec<Item<E>>>,
+    mode: SoakMode,
+    origin: &str,
+    key: Option<K>,
+    item: Item<E>,
+) where
+    K: Hash + Eq,
+{
+    match mode {
+        SoakMode::Singleton => groups.push(Group {
+            members: vec![Allocation {
+                id: item.id,
+                amount: item.amount,
+            }],
+            origin: origin.to_string(),
+            net: item.amount,
+            reason: None,
+        }),
+        SoakMode::Bucket => buckets.entry(key.unwrap()).or_default().push(item),
+    }
+}
+
+/// Flush the per-key buckets accumulated by [`soak_emit`] into one group each.
+fn soak_flush<E, K: ToString>(
+    groups: &mut Vec<Group>,
+    buckets: HashMap<K, Vec<Item<E>>>,
+    origin: &str,
+) {
+    for (k, items) in buckets {
+        let net: i64 = items.iter().map(|i| i.amount).sum();
+        groups.push(Group {
+            members: items
+                .iter()
+                .map(|i| Allocation {
+                    id: i.id,
+                    amount: i.amount,
+                })
+                .collect(),
+            origin: format!("{}:{}", origin, k.to_string()),
+            net,
+            reason: None,
+        });
+    }
+}
+
+struct SoakSmall<E, FK> {
+    tol: Tol,
+    key: FK,
+    mode: SoakMode,
+    origin: String,
+    _e: PhantomData<E>,
+}
+
+impl<E, K, FK> Strategy<E> for SoakSmall<E, FK>
+where
+    K: Hash + Eq + Clone + ToString,
+    FK: Fn(&Item<E>) -> K,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let mut groups = Vec::new();
+        let mut residual = Vec::new();
+        let mut buckets: HashMap<K, Vec<Item<E>>> = HashMap::new();
+        for item in bag {
+            // Immaterial == within `tol` measured against the lot's own
+            // `original` (the materiality scale). A zero-amount lot is never
+            // soaked — there is nothing to classify.
+            let immaterial = item.amount != 0 && item.amount.abs() <= self.tol.slack(item.original);
+            if immaterial {
+                let k = matches!(self.mode, SoakMode::Bucket).then(|| (self.key)(&item));
+                soak_emit(&mut groups, &mut buckets, self.mode, &self.origin, k, item);
+            } else {
+                residual.push(item);
+            }
+        }
+        soak_flush(&mut groups, buckets, &self.origin);
+        Resolution { groups, residual }
+    }
+}
+
+/// Consume residual lots whose current amount is **immaterial versus their own
+/// `original`** line amount, measured by `tol` (absolute, or relative bps of the
+/// original — see [`Tol`]). Material lots pass through untouched as residual.
+/// `Singleton` mode produces one variance group per soaked lot; `Bucket` mode
+/// groups soaked lots by `key`. This is the "soak the rounding tail" classifier
+/// you place at the end of a cascade, before [`soak_all`].
+///
+/// Note the scale is the lot's `original`, not its current `amount`, so this is
+/// only meaningful after an upstream leaf has *shrunk* a lot's residual (a
+/// partial `flow`/`pivot` match): on a fresh bag `amount == original` and a
+/// relative `tol` is a no-op. An absolute `tol` applies regardless.
+pub fn soak_small<E: 'static, K, FK>(
+    tol: impl Into<Tol>,
+    mode: SoakMode,
+    origin: impl Into<String>,
+    key: FK,
+) -> Box<dyn Strategy<E>>
+where
+    K: Hash + Eq + Clone + ToString + 'static,
+    FK: Fn(&Item<E>) -> K + 'static,
+{
+    Box::new(SoakSmall {
+        tol: tol.into(),
+        key,
+        mode,
+        origin: origin.into(),
+        _e: PhantomData,
+    })
+}
+
+struct SoakIf<E, FP, FK> {
+    pred: FP,
+    key: FK,
+    mode: SoakMode,
+    origin: String,
+    _e: PhantomData<E>,
+}
+
+impl<E, K, FP, FK> Strategy<E> for SoakIf<E, FP, FK>
+where
+    K: Hash + Eq + Clone + ToString,
+    FP: Fn(&Item<E>) -> bool,
+    FK: Fn(&Item<E>) -> K,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let mut groups = Vec::new();
+        let mut residual = Vec::new();
+        let mut buckets: HashMap<K, Vec<Item<E>>> = HashMap::new();
+        for item in bag {
+            if item.amount != 0 && (self.pred)(&item) {
+                let k = matches!(self.mode, SoakMode::Bucket).then(|| (self.key)(&item));
+                soak_emit(&mut groups, &mut buckets, self.mode, &self.origin, k, item);
+            } else {
+                residual.push(item);
+            }
+        }
+        soak_flush(&mut groups, buckets, &self.origin);
+        Resolution { groups, residual }
+    }
+}
+
+/// Consume residual lots for which `pred` holds (and whose amount is non-zero)
+/// into singleton or bucketed classes; everything else passes through as
+/// residual. The general soaker that [`soak_small`] (predicate = "immaterial")
+/// and [`soak_all`] (predicate = "true") specialize: reach for it when the
+/// classification rule is neither pure materiality nor "everything", e.g. soak
+/// only one sign, or only lots flagged by a payload field.
+pub fn soak_if<E: 'static, K, FP, FK>(
+    pred: FP,
+    mode: SoakMode,
+    origin: impl Into<String>,
+    key: FK,
+) -> Box<dyn Strategy<E>>
+where
+    K: Hash + Eq + Clone + ToString + 'static,
+    FP: Fn(&Item<E>) -> bool + 'static,
+    FK: Fn(&Item<E>) -> K + 'static,
+{
+    Box::new(SoakIf {
+        pred,
+        key,
+        mode,
+        origin: origin.into(),
+        _e: PhantomData,
+    })
+}
+
+struct SoakAll<E, FK> {
+    key: FK,
+    mode: SoakMode,
+    origin: String,
+    _e: PhantomData<E>,
+}
+
+impl<E, K, FK> Strategy<E> for SoakAll<E, FK>
+where
+    K: Hash + Eq + Clone + ToString,
+    FK: Fn(&Item<E>) -> K,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let mut groups = Vec::new();
+        let mut buckets: HashMap<K, Vec<Item<E>>> = HashMap::new();
+        for item in bag {
+            if item.amount == 0 {
+                continue;
+            }
+            let k = matches!(self.mode, SoakMode::Bucket).then(|| (self.key)(&item));
+            soak_emit(&mut groups, &mut buckets, self.mode, &self.origin, k, item);
+        }
+        soak_flush(&mut groups, buckets, &self.origin);
+        Resolution {
+            groups,
+            residual: Vec::new(),
+        }
+    }
+}
+
+/// Consume *every* remaining non-zero residual lot into singleton or bucketed
+/// groups, leaving an empty residual. A terminal classifier, not a matcher:
+/// non-zero group nets are expected and represent unmatched / variance /
+/// write-off classes. Place it last in a [`seq`] to give every leftover lot a
+/// home.
+pub fn soak_all<E: 'static, K, FK>(
+    mode: SoakMode,
+    origin: impl Into<String>,
+    key: FK,
+) -> Box<dyn Strategy<E>>
+where
+    K: Hash + Eq + Clone + ToString + 'static,
+    FK: Fn(&Item<E>) -> K + 'static,
+{
+    Box::new(SoakAll {
+        key,
+        mode,
+        origin: origin.into(),
+        _e: PhantomData,
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -1510,7 +1821,7 @@ mod tests {
     #[test]
     fn labeled_stamps_reason_on_groups_but_not_residual() {
         let b = bag(&[(1, 5), (2, -5), (3, 7)]);
-        let mut s = labeled("S3a exact", exact_1to1_any());
+        let mut s = labeled("S3a exact", exact_1to1(|_| Some(0)));
         let r = s.run(b);
         conserves(3, &r);
         assert_eq!(r.groups.len(), 1);
@@ -1524,7 +1835,7 @@ mod tests {
     fn labeled_prepends_to_inner_detail() {
         // An inner label is preserved as detail when an outer label wraps it.
         let b = bag(&[(1, 5), (2, -5)]);
-        let mut s = labeled("outer", labeled("inner", exact_1to1_any()));
+        let mut s = labeled("outer", labeled("inner", exact_1to1(|_| Some(0))));
         let r = s.run(b);
         assert_eq!(r.groups[0].reason.as_deref(), Some("outer: inner: exact 1:1 pair"));
     }
@@ -1532,7 +1843,7 @@ mod tests {
     #[test]
     fn exact_pairs_and_leaves_residual() {
         let b = bag(&[(1, 5), (2, -5), (3, 5), (4, 3)]);
-        let mut s = exact_1to1_any();
+        let mut s = exact_1to1(|_| Some(0));
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 1);
@@ -1652,13 +1963,15 @@ mod tests {
     }
 
     #[test]
-    fn branch_routes_to_different_children_and_conserves() {
+    fn when_cascade_routes_to_different_children_and_conserves() {
+        // `seq(when(pred, a), b)` is the cascade replacement for the old
+        // two-way `branch`: the |·|==5 pair nets in the first child, the rest
+        // flow on to the second.
         let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
-        let mut s = branch(
-            |a: &i64| a.unsigned_abs() == 5,
-            agg_net(|_a: &i64| 1u64, 0),
+        let mut s = seq(vec![
+            when(|a: &i64| a.unsigned_abs() == 5, agg_net(|_a: &i64| 1u64, 0)),
             agg_net(|_a: &i64| 2u64, 0),
-        );
+        ]);
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 2);
@@ -1666,9 +1979,32 @@ mod tests {
     }
 
     #[test]
+    fn partition_by_with_picks_a_per_key_subtree() {
+        // Key 0 nets its bucket; key 1 gets identity() and passes through.
+        let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
+        let mut s = partition_by_with(
+            |a: &i64| (a.unsigned_abs() == 5) as u8,
+            |k: &u8| {
+                if *k == 1 {
+                    agg_net(|_a: &i64| 0u64, 0)
+                } else {
+                    identity()
+                }
+            },
+        );
+        let r = s.run(b);
+        conserves(4, &r);
+        // Only the ±5 shard (key 1) nets; the ±7 shard (key 0) is identity.
+        assert_eq!(r.groups.len(), 1);
+        let mut rem: Vec<ExtId> = r.residual.iter().map(|i| i.id).collect();
+        rem.sort_unstable();
+        assert_eq!(rem, vec![3, 4]);
+    }
+
+    #[test]
     fn windowed_blocks_far_matches() {
         let b = vec![Item::new(1, 5, (1i64, 5i64)), Item::new(2, -5, (100, -5))];
-        let inner = exact_1to1_any();
+        let inner = exact_1to1(|_| Some(0));
         let r = {
             let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner);
             w.run(b)
@@ -1680,7 +2016,7 @@ mod tests {
     #[test]
     fn windowed_finds_near_match_across_band_boundary() {
         let b = vec![Item::new(1, 5, (4i64, 5i64)), Item::new(2, -5, (7, -5))];
-        let inner = exact_1to1_any();
+        let inner = exact_1to1(|_| Some(0));
         let r = {
             let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner);
             w.run(b)
@@ -1724,7 +2060,7 @@ mod tests {
     fn seq_then_partition_compose() {
         let mut pipeline = partition_by(
             |a: &i64| a.signum().unsigned_abs(),
-            || seq(vec![exact_1to1_any()]),
+            || seq(vec![exact_1to1(|_| Some(0))]),
         );
         let b = bag(&[(1, 4), (2, -4), (3, 4), (4, -4)]);
         let r = pipeline.run(b);
@@ -1740,7 +2076,7 @@ mod tests {
         let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
         let mut s = accept_if(
             |g: &Group| g.members.iter().all(|a| a.amount.abs() == 5),
-            exact_1to1_any(),
+            exact_1to1(|_| Some(0)),
         );
         let r = s.run(b);
         conserves(4, &r);
@@ -1770,16 +2106,6 @@ mod tests {
         assert_eq!(r.groups.len(), 1, "only the small pair is accepted");
         assert_eq!(ids(&r.groups[0]), vec![6, 7]);
         assert_eq!(r.residual.len(), 5, "the over-large group is dissolved");
-    }
-
-    #[test]
-    fn filter_is_an_alias_for_accept_if() {
-        let b = bag(&[(1, 5), (2, -5)]);
-        let mut s = filter(|_g: &Group| false, exact_1to1_any());
-        let r = s.run(b);
-        conserves(2, &r);
-        assert_eq!(r.groups.len(), 0, "rejecting everything leaves only residual");
-        assert_eq!(r.residual.len(), 2);
     }
 
     /// A leaf that emits a fixed, possibly-interlocking set of groups (members
@@ -1970,7 +2296,7 @@ mod tests {
     #[test]
     fn pivot_converts_back_to_outer_amount() {
         let b = vec![Item::new(1, 110, (100i64,)), Item::new(2, -110, (-100i64,))];
-        let mut s = pivot(|d: &(i64,)| d.0, exact_1to1_any());
+        let mut s = pivot(|d: &(i64,)| d.0, exact_1to1(|_| Some(0)));
         let r = s.run(b);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].net, 0);
@@ -2056,5 +2382,151 @@ mod tests {
         let mut res: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
         res.sort();
         assert_eq!(res, vec![(1, 5), (2, 50)]);
+    }
+
+    // --- soakers ---------------------------------------------------------
+
+    // Items here carry their own `original` (= amount) via `bag`, except where
+    // a materiality test needs a distinct original, built explicitly.
+
+    #[test]
+    fn soak_small_abs_threshold_singletons() {
+        // amounts: two immaterial (<=5), one material.
+        let mut s = soak_small(5, SoakMode::Singleton, "rounding", |_: &Item<i64>| 0u64);
+        let r = s.run(bag(&[(1, 3), (2, -2), (3, 100)]));
+        conserves(3, &r);
+        // Two soaked singletons, one material lot left as residual.
+        assert_eq!(r.groups.len(), 2);
+        assert!(r.groups.iter().all(|g| g.members.len() == 1 && g.origin == "rounding"));
+        assert_eq!(r.residual.len(), 1);
+        assert_eq!(r.residual[0].id, 3);
+    }
+
+    #[test]
+    fn soak_small_bps_against_original() {
+        // amount 10 on an original of 1000 = 100 bps (1%); soak under 200 bps.
+        let items = vec![
+            Item { id: 1, original: 1000, amount: 10, data: 0 }, // immaterial: 100 bps
+            Item { id: 2, original: 1000, amount: 50, data: 0 }, // material:   500 bps
+        ];
+        let mut s = soak_small(
+            Tol::Rel { bps: 200, floor: 0 },
+            SoakMode::Singleton,
+            "var",
+            |_: &Item<i64>| 0u64,
+        );
+        let r = s.run(items);
+        conserves(2, &r);
+        assert_eq!(ids(&r.groups[0]), vec![1]);
+        assert_eq!(r.residual.iter().map(|i| i.id).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn soak_small_bucket_groups_by_key() {
+        // Soak immaterial lots, bucketing by sign of the amount.
+        let key = |i: &Item<i64>| if i.amount > 0 { "pos" } else { "neg" };
+        let mut s = soak_small(5, SoakMode::Bucket, "tail", key);
+        let r = s.run(bag(&[(1, 3), (2, 4), (3, -2), (4, 100)]));
+        conserves(4, &r);
+        // One bucket per sign among the soaked lots; the material lot stays.
+        assert_eq!(r.groups.len(), 2);
+        assert!(r.groups.iter().all(|g| g.origin.starts_with("tail:")));
+        assert_eq!(r.residual.iter().map(|i| i.id).collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn soak_if_predicate_selects() {
+        // Soak only negative residual lots; positives pass through.
+        let mut s = soak_if(
+            |i: &Item<i64>| i.amount < 0,
+            SoakMode::Singleton,
+            "shorts",
+            |_: &Item<i64>| 0u64,
+        );
+        let r = s.run(bag(&[(1, 50), (2, -30), (3, -10)]));
+        conserves(3, &r);
+        let mut soaked: Vec<ExtId> = r.groups.iter().flat_map(ids).collect();
+        soaked.sort();
+        assert_eq!(soaked, vec![2, 3]);
+        assert_eq!(r.residual.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn soak_all_terminates_residual() {
+        let mut s = soak_all(SoakMode::Singleton, "unmatched", |_: &Item<i64>| 0u64);
+        let r = s.run(bag(&[(1, 50), (2, -30), (3, 0)]));
+        // Zero-amount lots are dropped (nothing to classify); the rest soak and
+        // the residual is fully drained.
+        assert!(r.residual.is_empty());
+        let mut soaked: Vec<ExtId> = r.groups.iter().flat_map(ids).collect();
+        soaked.sort();
+        assert_eq!(soaked, vec![1, 2]);
+        assert!(r.groups.iter().all(|g| g.net != 0));
+    }
+
+    #[test]
+    fn soak_all_bucket_nets_per_key() {
+        let key = |i: &Item<i64>| if i.amount > 0 { 1u64 } else { 2u64 };
+        let mut s = soak_all(SoakMode::Bucket, "class", key);
+        let r = s.run(bag(&[(1, 50), (2, 30), (3, -20)]));
+        assert!(r.residual.is_empty());
+        // pos bucket nets 80, neg bucket nets -20.
+        let mut nets: Vec<i64> = r.groups.iter().map(|g| g.net).collect();
+        nets.sort();
+        assert_eq!(nets, vec![-20, 80]);
+    }
+
+    // --- Group metrics & Tol scale references ----------------------------
+
+    fn group(members: &[(ExtId, i64)]) -> Group {
+        let members: Vec<Allocation> = members
+            .iter()
+            .map(|&(id, amount)| Allocation { id, amount })
+            .collect();
+        let net = members.iter().map(|a| a.amount).sum();
+        Group {
+            members,
+            origin: "test".into(),
+            net,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn group_metrics() {
+        // legs: +1_000_000, -999_000, -1_200  -> net -200
+        let g = group(&[(1, 1_000_000), (2, -999_000), (3, -1_200)]);
+        assert_eq!(g.size(), 3);
+        assert_eq!(g.abs_net(), 200);
+        assert_eq!(g.max_abs(), 1_000_000);
+        assert_eq!(g.min_abs(), 1_200);
+        assert_eq!(g.min_side(), 1); // one positive leg, two negative
+    }
+
+    #[test]
+    fn clean_rel_vs_relmax_pick_different_scale_legs() {
+        // The partial-alloc example: net -200 against a {1_000_000, 999_000,
+        // 1_200} bucket. tol = 5bps, $1.00 floor.
+        let g = group(&[(1, 1_000_000), (2, -999_000), (3, -1_200)]);
+        // Rel scales off the smallest leg (1_200): slack = max(100, 0) = 100.
+        assert!(!g.clean(Tol::Rel { bps: 5, floor: 100 }), "200 > 100 -> dirty");
+        // RelMax scales off the largest leg (1_000_000): slack = max(100, 500).
+        assert!(g.clean(Tol::RelMax { bps: 5, floor: 100 }), "200 <= 500 -> clean");
+        // Abs ignores the legs entirely.
+        assert!(g.clean(Tol::Abs(200)));
+        assert!(!g.clean(Tol::Abs(199)));
+    }
+
+    #[test]
+    fn agg_net_relmax_accepts_what_rel_rejects() {
+        // Same shape as a leaf bucket: the large leg lets RelMax accept a net
+        // that Rel (smallest-leg) would reject.
+        let b = bag(&[(1, 1_000_000), (2, -999_000), (3, -1_200)]);
+        let mut rel = agg_net(|_: &i64| 0u64, Tol::Rel { bps: 5, floor: 100 });
+        assert_eq!(rel.run(b.clone()).groups.len(), 0);
+        let mut relmax = agg_net(|_: &i64| 0u64, Tol::RelMax { bps: 5, floor: 100 });
+        let r = relmax.run(b);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].net, -200);
     }
 }

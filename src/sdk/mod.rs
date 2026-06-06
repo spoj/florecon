@@ -1,7 +1,7 @@
 //! The plugin authoring SDK (private, `sdk` feature).
 //!
 //! A domain author implements [`Plugin`] — project the host's columnar Arrow
-//! [`Table`] into typed items, name a stable [`Plugin::key`], pick a
+//! [`Table`] into typed items, name a stable [`Plugin::id`], pick a
 //! [`Strategy`](crate::strategy::Strategy) — and `export_plugin!` emits a
 //! self-describing wasm module. Everything stateful is inherited from
 //! [`Recon`](crate::Recon); the only invariant-bearing author code is

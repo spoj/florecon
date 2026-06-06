@@ -1,9 +1,7 @@
 /target
 /.venv
 __pycache__/
-py/src/florecon/_engine.wasm
-py/dist/
-py/build/
+hosts/python/src/florecon/_engine.wasm
+hosts/python/dist/
+hosts/python/build/
 **/*.egg-info/
-web/core/engine.wasm
-/node_modules

@@ -8,7 +8,7 @@
 //!       agg_net,       // whole unit+currency nets at aggregate
 //!       exact_1to1,    // clean opposite-sign pairs of equal native amount
 //!       signal_group,  // reference bridge: shared token buckets that net
-//!       flow(model),   // engine arbitrates the ambiguous remainder
+//!       flow(spec),    // engine arbitrates the ambiguous remainder
 //!   ]))
 //!
 //! Sharding by currency makes each sub-problem single-currency, so the native
@@ -17,7 +17,7 @@
 use florecon::export_plugin;
 use florecon::sdk::{DescribeDoc, Field, Plugin, RowView};
 use florecon::strategy::{
-    Model, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group,
+    FlowSpec, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group,
 };
 use florecon::token::fnv1a;
 
@@ -35,46 +35,35 @@ pub struct Row {
     tokens: Vec<u64>, // hashed reference tokens (the cross-book bridge)
 }
 
-/// The flow arbiter for the ambiguous remainder.
-#[derive(Clone)]
-struct Interco {
-    penalty: f64,
-}
-
-impl Model for Interco {
-    type Tx = Row;
-    fn penalty(&self, _tx: &Row) -> f64 {
-        self.penalty
-    }
-    fn block_key(&self, tx: &Row) -> i64 {
-        tx.gl_day
-    }
-    fn window(&self) -> i64 {
-        -1
-    }
-    fn match_keys(&self, tx: &Row) -> Vec<u64> {
-        let mut k = tx.tokens.clone();
-        if tx.snative != 0 {
-            k.push(fnv1a(format!("AMT:{}", tx.snative.abs()).as_bytes()));
-        }
-        k
-    }
-    fn cost(&self, a: &Row, b: &Row) -> Option<f64> {
-        let ref_bridge = a.tokens.iter().any(|t| b.tokens.contains(t));
-        let amt_match = a.snative.abs() == b.snative.abs() && a.snative != 0;
-        let dd = (a.gl_day - b.gl_day).abs() as f64;
-        let eps = 0.5;
-        if ref_bridge {
-            Some(1.0 + eps + dd * 0.002 + if amt_match { 0.0 } else { 0.5 })
-        } else if amt_match {
-            if dd > 92.0 {
-                return None;
+/// The flow arbiter for the ambiguous remainder, as a [`FlowSpec`].
+fn interco_spec(penalty: f64) -> FlowSpec<Row> {
+    FlowSpec::new()
+        .window(-1)
+        .penalty(penalty)
+        .block_key(|tx: &Row| tx.gl_day)
+        .match_keys(|tx: &Row| {
+            let mut k = tx.tokens.clone();
+            if tx.snative != 0 {
+                k.push(fnv1a(format!("AMT:{}", tx.snative.abs()).as_bytes()));
             }
-            Some(4.0 + eps + dd * 0.02)
-        } else {
-            None
-        }
-    }
+            k
+        })
+        .cost(|a: &Row, b: &Row| {
+            let ref_bridge = a.tokens.iter().any(|t| b.tokens.contains(t));
+            let amt_match = a.snative.abs() == b.snative.abs() && a.snative != 0;
+            let dd = (a.gl_day - b.gl_day).abs() as f64;
+            let eps = 0.5;
+            if ref_bridge {
+                Some(1.0 + eps + dd * 0.002 + if amt_match { 0.0 } else { 0.5 })
+            } else if amt_match {
+                if dd > 92.0 {
+                    return None;
+                }
+                Some(4.0 + eps + dd * 0.02)
+            } else {
+                None
+            }
+        })
 }
 
 /// Reference tokenization: the cross-book bridge (filters boilerplate noise).
@@ -114,7 +103,7 @@ impl Plugin for IntercoPlugin {
             Field::text("company"),
             Field::text("icp"),
             Field::text("objsub"),
-            Field::float("indicative_usd_amt").primary(),
+            Field::float("indicative_usd_amt").amount(),
             Field::int("gl_date"),
             Field::text("base_currency"),
             Field::text("trx_currency"),
@@ -182,7 +171,7 @@ impl Plugin for IntercoPlugin {
                             agg_net(|t: &Row| t.objsub, TOL),
                             exact_1to1(|_t: &Row| Some(0)),
                             signal_group(|t: &Row| t.tokens.clone(), TOL, CAP),
-                            flow(Interco { penalty: 1000.0 }),
+                            flow(interco_spec(1000.0)),
                         ])
                     },
                 )
@@ -277,7 +266,7 @@ mod tests {
     fn pairs_net_clean() {
         use florecon::recon::Recon;
         use florecon::sdk::Table;
-        let table = Table::from_ipc(&sample_ipc()).unwrap();
+        let table = Table::from_ipc(&sample_ipc(), &IntercoPlugin::describe()).unwrap();
         let p = IntercoPlugin::new();
         let mut r = Recon::new(p.strategy(), IntercoPlugin::primary);
         for i in 0..table.len() {
@@ -289,5 +278,29 @@ mod tests {
         // All four rows net to zero across two clean groups.
         let clean: i64 = rep.groups.iter().filter(|g| g.net == 0).map(|g| g.size as i64).sum();
         assert_eq!(clean, 4, "expected all four rows in net-zero groups: {rep:?}");
+    }
+
+    #[test]
+    fn missing_declared_column_errors() {
+        use florecon::sdk::Table;
+        let doc = DescribeDoc::new("x", "1").input(vec![Field::int("does_not_exist")]);
+        assert!(Table::from_ipc(&sample_ipc(), &doc).is_err());
+    }
+
+    #[test]
+    fn wrong_typed_column_errors() {
+        use florecon::sdk::Table;
+        // row_id is shipped as Int64; declaring it text must fail at ingest.
+        let doc = DescribeDoc::new("x", "1").input(vec![Field::text("row_id")]);
+        assert!(Table::from_ipc(&sample_ipc(), &doc).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "undeclared column")]
+    fn undeclared_access_panics() {
+        use florecon::sdk::Table;
+        let doc = DescribeDoc::new("x", "1").input(vec![Field::int("row_id")]);
+        let t = Table::from_ipc(&sample_ipc(), &doc).unwrap();
+        let _ = t.row(0).i64("company"); // declared nowhere -> loud panic, not 0
     }
 }

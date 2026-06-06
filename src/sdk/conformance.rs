@@ -1,6 +1,6 @@
 //! The conformance kit: mechanically prove a plugin got identity right.
 //!
-//! These properties only break when `key`/`project`/`primary` are wrong
+//! These properties only break when `id`/`project`/`primary` are wrong
 //! (non-unique, unstable, order-dependent, or non-conserving). Because the SDK
 //! drives the harness, a plugin author gets them for free — no hand-written
 //! invariant tests.
@@ -78,7 +78,12 @@ fn run_warm<P: Plugin + 'static>(items: &[(ExtId, P::Row)]) -> Report {
 /// Arrow IPC batch the host would ship). Panics with a precise message on the
 /// first violated property.
 pub fn assert_conformance<P: Plugin + 'static>(arrow: &[u8]) {
-    let table = Table::from_ipc(arrow).expect("decode arrow batch");
+    let doc = P::describe();
+    assert!(
+        doc.input.iter().filter(|f| f.amount).count() <= 1,
+        "describe() declares more than one amount() column"
+    );
+    let table = Table::from_ipc(arrow, &doc).expect("decode arrow batch");
     let plugin = P::new();
     let items = project_items::<P>(&plugin, &table);
 
@@ -87,7 +92,7 @@ pub fn assert_conformance<P: Plugin + 'static>(arrow: &[u8]) {
     for (id, _) in &items {
         assert!(
             seen.insert(*id),
-            "non-unique key: two rows hash to id {id} (fix Plugin::key)"
+            "non-unique id: two rows hash to id {id} (fix Plugin::id)"
         );
     }
 
@@ -97,7 +102,7 @@ pub fn assert_conformance<P: Plugin + 'static>(arrow: &[u8]) {
     // Idempotent re-upsert: same ids overwrite, report is unchanged.
     let mut twice = items.clone();
     twice.extend(items.clone());
-    assert_eq!(canon(&run_cold::<P>(&twice)), cold_c, "re-upserting the same batch changed the report (unstable key)");
+    assert_eq!(canon(&run_cold::<P>(&twice)), cold_c, "re-upserting the same batch changed the report (unstable id)");
 
     // Order independence: no positional identity.
     let mut reversed = items.clone();

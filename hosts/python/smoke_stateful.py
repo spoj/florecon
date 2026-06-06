@@ -1,11 +1,11 @@
 """Stateful smoke: drive the interco *plugin* wasm through the generic host —
-describe-driven init, incremental upserts, warm re-solve, remove, freeze, and
-breakup. The host ships raw ledger columns; the plugin owns the domain.
+describe-driven init, incremental upserts, warm re-solve, remove, pin, and
+dissolve. The host ships raw ledger columns; the plugin owns the domain.
 
 Build the plugin first, then run:
 
-    cargo build -p interco-plugin --target wasm32-unknown-unknown --release
-    PYTHONPATH=py/src .venv/bin/python py/smoke_stateful.py
+    just build-wasm   # or: cargo build -p interco-plugin --target wasm32-unknown-unknown --release
+    PYTHONPATH=hosts/python/src .venv/bin/python hosts/python/smoke_stateful.py
 
 Exits non-zero with a clear message on any regression.
 """
@@ -15,10 +15,8 @@ import sys
 
 from florecon import Workspace
 
-WASM = (
-    pathlib.Path(__file__).resolve().parent.parent
-    / "target/wasm32-unknown-unknown/release/interco_plugin.wasm"
-)
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+WASM = ROOT / "target/wasm32-unknown-unknown/release/interco_plugin.wasm"
 
 
 def check(cond, msg):
@@ -94,25 +92,25 @@ ws.remove(4)
 rep = ws.solve()
 check(matched_pair(rep, 1, 2), "pair (1,2) untouched by removing row 4")
 g3 = group(rep, gid_of(rep, 3))
-check(g3 is not None and g3["size"] == 1, "row 3 must become a live singleton once its partner is removed")
+check(g3 is not None and g3["size"] == 1, "row 3 must become a proposed singleton once its partner is removed")
 
-# --- freeze the clean match: an operator decision survives recalc ------------
-ws.freeze_clean(tol=0)
+# --- pin the clean match: an operator decision survives recalc ---------------
+ws.pin_clean(tol=0)
 rep = ws.report()
 g12 = group(rep, gid_of(rep, 1))
-check(g12 is not None and g12["status"] == "frozen", "freeze_clean must freeze the clean (1,2) match")
+check(g12 is not None and g12["status"] == "pinned", "pin_clean must pin the clean (1,2) match")
 rep = ws.solve()
 g12 = group(rep, gid_of(rep, 1))
-check(g12 is not None and g12["status"] == "frozen" and g12["size"] >= 2,
-      "frozen (1,2) group must survive a subsequent solve")
+check(g12 is not None and g12["status"] == "pinned" and g12["size"] >= 2,
+      "pinned (1,2) group must survive a subsequent solve")
 
-# --- re-add the partner, re-match, then break the live group apart -----------
+# --- re-add the partner, re-match, then dissolve the proposed group ----------
 ws.upsert(line(4, "B", "A", "61600", -250.0, 3, "INV0009"))
 rep = ws.solve()
 check(matched_pair(rep, 3, 4), "re-adding row 4 must re-form the (3,4) match on warm re-solve")
-ws.breakup(gid_of(rep, 3))
+ws.dissolve(gid_of(rep, 3))
 rep = ws.report()
-check(gid_of(rep, 3) != gid_of(rep, 4), "breakup must split rows 3 and 4 back into separate groups")
-check(group(rep, gid_of(rep, 1))["status"] == "frozen", "breakup must not disturb the frozen (1,2) group")
+check(gid_of(rep, 3) != gid_of(rep, 4), "dissolve must split rows 3 and 4 back into separate groups")
+check(group(rep, gid_of(rep, 1))["status"] == "pinned", "dissolve must not disturb the pinned (1,2) group")
 
 print("STATEFUL SMOKE OK")

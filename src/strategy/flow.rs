@@ -2,20 +2,21 @@
 //!
 //! This is one [`Strategy`](super::Strategy) among many, but a special one — it
 //! is the only stateful leaf, keeping a live network-simplex basis warm across
-//! solves. You describe your domain once via the [`Model`] trait; the leaf owns
+//! solves. You describe your domain once via a [`FlowSpec`] (closures for
+//! penalty / block_key / window / match_keys / cost); the leaf owns
 //! candidate-arc generation (a 1-D proximity window over `block_key` plus
 //! exact-join `match_keys`) and maps solved flow back to netted [`Group`]s.
 //!
-//! Currency lives entirely inside your opaque `Tx`: the engine conserves the
-//! single shared numeraire carried on each [`Item::amount`](super::Item) and
-//! reads only whatever your `cost`/`match_keys`/`block_key` hooks inspect. An
+//! Currency lives entirely inside your opaque payload `E`: the engine conserves
+//! the single shared numeraire carried on each [`Item::amount`](super::Item) and
+//! reads only whatever your `cost`/`match_keys`/`block_key` closures inspect. An
 //! "FX reprice" is therefore just a re-`run` with an updated amount — no special
 //! verb, no FX table in the engine. Warm vs cold is decided purely by whether
 //! the caller keeps the compiled strategy alive between runs.
-
 use super::{Group, Item, Resolution, Strategy};
 use crate::engine::{ArcId, Network, NodeId, SolveStatus};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 /// External, caller-owned identity for a transaction/lot.
 pub type ExtId = u64;
@@ -30,47 +31,128 @@ pub struct Allocation {
     pub amount: i64,
 }
 
-/// Describes how to turn your transactions into a transportation problem. The
-/// conserved amount is *not* here — it rides on [`Item::amount`](super::Item),
-/// so a residual that an upstream leaf shrank flows through unchanged.
-pub trait Model {
-    /// Your opaque per-transaction payload (all currency lanes, dates, refs).
-    type Tx;
+/// Describes how to turn your payloads `E` into a transportation problem: the
+/// five hooks the [`flow`] leaf needs, each a closure consistent with the rest
+/// of the strategy algebra. Build it with the chained setters from
+/// [`FlowSpec::new`]. The conserved amount is *not* here — it rides on
+/// [`Item::amount`](super::Item), so a residual an upstream leaf shrank flows
+/// through unchanged.
+///
+/// Closures live behind `Arc`, so `FlowSpec` is cheaply `Clone` (the warm-vs-
+/// cold determinism guard rebuilds a cold leaf from a clone each solve).
+///
+/// ```ignore
+/// flow(
+///     FlowSpec::new()
+///         .window(15)
+///         .penalty(1000.0)
+///         .block_key(|r: &Row| r.day)
+///         .match_keys(|r| r.tokens.clone())
+///         .cost(|a, b| (a.amount == -b.amount).then_some(1.0)),
+/// )
+/// ```
+/// Lot-aware exact-join key hook: `(payload, residual amount) -> keys`.
+type MatchKeysFn<E> = dyn Fn(&E, i64) -> Vec<u64>;
+/// Lot-aware pair-cost hook: `(src, src amount, snk, snk amount) -> cost`.
+type CostFn<E> = dyn Fn(&E, i64, &E, i64) -> Option<f64>;
 
-    /// Cost of leaving this transaction unmatched.
-    fn penalty(&self, tx: &Self::Tx) -> f64;
-
+pub struct FlowSpec<E> {
+    /// Cost of leaving a lot unmatched.
+    penalty: Arc<dyn Fn(&E) -> f64>,
     /// 1-D ordering key used for candidate generation (e.g. GL date in days).
-    fn block_key(&self, tx: &Self::Tx) -> i64;
-
+    block_key: Arc<dyn Fn(&E) -> i64>,
     /// Proximity radius on `block_key`: only pairs within this window become
     /// candidate arcs. Negative disables the proximity window (exact-join only).
-    fn window(&self) -> i64;
+    window: i64,
+    /// Exact-join keys (hashed reference tokens, amount bridges). Opposite-sign
+    /// lots sharing any key become candidate pairs, *in addition to* the
+    /// `block_key` proximity window. Lot-aware: receives the current residual
+    /// amount so amount bridges track partial matches.
+    match_keys: Arc<MatchKeysFn<E>>,
+    /// Cost of matching source `a` (amount `a_amt`) with sink `b` (amount
+    /// `b_amt`), or `None` to forbid the pair. Lot-aware so amount-dependent
+    /// conditions can price the current residual rather than the whole row.
+    cost: Arc<CostFn<E>>,
+}
 
-    /// Cost of matching source `a` with sink `b`, or `None` to forbid the pair.
-    fn cost(&self, a: &Self::Tx, b: &Self::Tx) -> Option<f64>;
+impl<E> Clone for FlowSpec<E> {
+    fn clone(&self) -> Self {
+        FlowSpec {
+            penalty: self.penalty.clone(),
+            block_key: self.block_key.clone(),
+            window: self.window,
+            match_keys: self.match_keys.clone(),
+            cost: self.cost.clone(),
+        }
+    }
+}
 
-    /// Cost hook for lot wrappers that conserve a current residual amount
-    /// different from the row's original amount. Domain models that price
-    /// amount-dependent conditions override this; the default ignores the lot
-    /// amounts and prices the whole rows.
-    fn cost_lot(&self, a: &Self::Tx, _a_amount: i64, b: &Self::Tx, _b_amount: i64) -> Option<f64> {
-        self.cost(a, b)
+impl<E> Default for FlowSpec<E> {
+    /// Penalty 0, block_key 0, window -1 (exact-join only), no match keys, and a
+    /// `cost` that forbids every pair. A usable spec sets at least `cost`.
+    fn default() -> Self {
+        FlowSpec {
+            penalty: Arc::new(|_| 0.0),
+            block_key: Arc::new(|_| 0),
+            window: -1,
+            match_keys: Arc::new(|_, _| Vec::new()),
+            cost: Arc::new(|_, _, _, _| None),
+        }
+    }
+}
+
+impl<E> FlowSpec<E> {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Optional exact-join keys for candidate generation (e.g. hashed reference
-    /// tokens). Opposite-sign transactions that share any key become candidate
-    /// pairs, *in addition to* the `block_key` proximity window. This is how
-    /// non-ordinal signals (a reference that appears in the other book's
-    /// description) drive matching. Default: none.
-    fn match_keys(&self, _tx: &Self::Tx) -> Vec<u64> {
-        Vec::new()
+    /// Constant cost of leaving a lot unmatched.
+    pub fn penalty(mut self, p: f64) -> Self {
+        self.penalty = Arc::new(move |_| p);
+        self
     }
 
-    /// Exact-join keys for a lot whose current residual amount differs from the
-    /// original row amount. Defaults to [`Model::match_keys`].
-    fn match_keys_lot(&self, tx: &Self::Tx, _amount: i64) -> Vec<u64> {
-        self.match_keys(tx)
+    /// Per-lot unmatched penalty (when it varies by payload).
+    pub fn penalty_fn(mut self, f: impl Fn(&E) -> f64 + 'static) -> Self {
+        self.penalty = Arc::new(f);
+        self
+    }
+
+    /// Proximity radius on `block_key`; negative = exact-join only.
+    pub fn window(mut self, w: i64) -> Self {
+        self.window = w;
+        self
+    }
+
+    /// 1-D ordering key for the proximity window.
+    pub fn block_key(mut self, f: impl Fn(&E) -> i64 + 'static) -> Self {
+        self.block_key = Arc::new(f);
+        self
+    }
+
+    /// Amount-independent exact-join keys (the common case).
+    pub fn match_keys(mut self, f: impl Fn(&E) -> Vec<u64> + 'static) -> Self {
+        self.match_keys = Arc::new(move |e, _amount| f(e));
+        self
+    }
+
+    /// Lot-aware exact-join keys (when a key depends on the residual amount,
+    /// e.g. an `AMT:<n>` bridge).
+    pub fn match_keys_lot(mut self, f: impl Fn(&E, i64) -> Vec<u64> + 'static) -> Self {
+        self.match_keys = Arc::new(f);
+        self
+    }
+
+    /// Amount-independent pair cost (the common case); `None` forbids the pair.
+    pub fn cost(mut self, f: impl Fn(&E, &E) -> Option<f64> + 'static) -> Self {
+        self.cost = Arc::new(move |a, _aa, b, _bb| f(a, b));
+        self
+    }
+
+    /// Lot-aware pair cost: prices the current residual amounts of `a` and `b`.
+    pub fn cost_lot(mut self, f: impl Fn(&E, i64, &E, i64) -> Option<f64> + 'static) -> Self {
+        self.cost = Arc::new(f);
+        self
     }
 }
 
@@ -80,9 +162,9 @@ pub trait Model {
 const MATCH_BUCKET_CAP: usize = 256;
 
 /// One transaction loaded into the warm engine.
-struct Entry<Tx> {
+struct Entry<E> {
     node: NodeId,
-    tx: Tx,
+    tx: E,
     key: i64,
     base: i64,
     /// Exact-join keys this transaction is indexed under.
@@ -107,10 +189,10 @@ struct FlowSig {
 /// departed ones — then re-solves off the cached basis. Sharding is the
 /// caller's job ([`partition_by`](super::partition_by) gives each shard its own
 /// `Flow`), so this leaf only ever sees one shard's rows.
-struct Flow<M: Model> {
-    model: M,
+struct Flow<E> {
+    spec: FlowSpec<E>,
     net: Network,
-    entries: HashMap<ExtId, Entry<M::Tx>>,
+    entries: HashMap<ExtId, Entry<E>>,
     /// block_key -> ExtIds at that key (for windowed candidate lookup).
     by_key: BTreeMap<i64, Vec<ExtId>>,
     /// exact-join key -> ExtIds carrying it (reference/amount bridges).
@@ -119,10 +201,10 @@ struct Flow<M: Model> {
     loaded: HashMap<ExtId, FlowSig>,
 }
 
-impl<M: Model> Flow<M> {
-    fn new(model: M) -> Self {
+impl<E> Flow<E> {
+    fn new(spec: FlowSpec<E>) -> Self {
         Flow {
-            model,
+            spec,
             net: Network::new(),
             entries: HashMap::new(),
             by_key: BTreeMap::new(),
@@ -131,14 +213,14 @@ impl<M: Model> Flow<M> {
         }
     }
 
-    fn flow_sig(&self, item: &Item<M::Tx>) -> FlowSig {
+    fn flow_sig(&self, item: &Item<E>) -> FlowSig {
         let amount = item.amount;
-        let mut keys = self.model.match_keys_lot(&item.data, amount);
+        let mut keys = (self.spec.match_keys)(&item.data, amount);
         keys.sort_unstable();
         FlowSig {
             amount,
-            penalty_bits: self.model.penalty(&item.data).to_bits(),
-            key: self.model.block_key(&item.data),
+            penalty_bits: (self.spec.penalty)(&item.data).to_bits(),
+            key: (self.spec.block_key)(&item.data),
             keys,
         }
     }
@@ -146,9 +228,9 @@ impl<M: Model> Flow<M> {
     /// Add a new transaction or correct/reprice an existing one. `base` is the
     /// conserved lot amount (the [`Item::amount`](super::Item)); a single verb
     /// covers insert, amount correction, and lane edits.
-    fn upsert(&mut self, id: ExtId, tx: M::Tx, base: i64) {
-        let key = self.model.block_key(&tx);
-        let keys = self.model.match_keys_lot(&tx, base);
+    fn upsert(&mut self, id: ExtId, tx: E, base: i64) {
+        let key = (self.spec.block_key)(&tx);
+        let keys = (self.spec.match_keys)(&tx, base);
 
         if self.entries.contains_key(&id) {
             // Drop old candidate arcs and re-key; we will regenerate.
@@ -168,7 +250,7 @@ impl<M: Model> Flow<M> {
             if old_base != base {
                 self.net.set_supply(old_node, base);
             }
-            self.net.set_penalty(old_node, self.model.penalty(&tx));
+            self.net.set_penalty(old_node, (self.spec.penalty)(&tx));
             {
                 let e = self.entries.get_mut(&id).unwrap();
                 e.tx = tx;
@@ -178,7 +260,7 @@ impl<M: Model> Flow<M> {
             }
             self.generate_arcs(id);
         } else {
-            let node = self.net.add_node(base, self.model.penalty(&tx));
+            let node = self.net.add_node(base, (self.spec.penalty)(&tx));
             self.by_key.entry(key).or_default().push(id);
             self.index_match_keys(id, &keys);
             self.entries.insert(
@@ -306,7 +388,7 @@ impl<M: Model> Flow<M> {
     // --- candidate generation -------------------------------------------
 
     fn generate_arcs(&mut self, id: ExtId) {
-        let window = self.model.window();
+        let window = self.spec.window;
         let (key, base, node, keys) = {
             let e = &self.entries[&id];
             (e.key, e.base, e.node, e.keys.clone())
@@ -362,7 +444,7 @@ impl<M: Model> Flow<M> {
             let cost = {
                 let s = &self.entries[&src_id];
                 let t = &self.entries[&snk_id];
-                self.model.cost_lot(&s.tx, s.base, &t.tx, t.base)
+                (self.spec.cost)(&s.tx, s.base, &t.tx, t.base)
             };
             if let Some(cost) = cost
                 && let Some(arc) = self.net.add_arc(src_node, snk_node, cost)
@@ -410,12 +492,11 @@ impl<M: Model> Flow<M> {
     }
 }
 
-impl<M> Strategy<M::Tx> for Flow<M>
+impl<E> Strategy<E> for Flow<E>
 where
-    M: Model + Clone,
-    M::Tx: Clone,
+    E: Clone,
 {
-    fn run(&mut self, bag: Vec<Item<M::Tx>>) -> Resolution<M::Tx> {
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
         #[cfg(not(target_arch = "wasm32"))]
         let timed = std::env::var_os("FLORECON_TIME").is_some();
         #[cfg(target_arch = "wasm32")]
@@ -424,7 +505,7 @@ where
         // id -> lot reference (no clones unless we actually upsert). The leaf
         // conserves the lot's *current* amount, so partial residuals compose
         // through `seq`.
-        let data: HashMap<ExtId, &Item<M::Tx>> = bag.iter().map(|i| (i.id, i)).collect();
+        let data: HashMap<ExtId, &Item<E>> = bag.iter().map(|i| (i.id, i)).collect();
         let sigs: HashMap<ExtId, FlowSig> = bag.iter().map(|i| (i.id, self.flow_sig(i))).collect();
 
         // Diff want vs loaded. Upsert new ids and same-id rows whose amount or
@@ -471,7 +552,7 @@ where
         // failure mode is a warm re-solve drifting to a worse objective), not
         // the grouping (see the `warm_flow_matches_cold_*` equivalence tests).
         if cfg!(debug_assertions) || std::env::var_os("FLORECON_VERIFY_WARM").is_some() {
-            let mut cold = Flow::new(self.model.clone());
+            let mut cold = Flow::new(self.spec.clone());
             let mut ids: Vec<ExtId> = data.keys().copied().collect();
             ids.sort_unstable();
             for id in ids {
@@ -518,16 +599,15 @@ where
 
 /// The global arbiter: hand the residual to the min-cost-flow engine, which
 /// resolves competing candidates into one consistent grouping. This is where
-/// *proposing* signals (reference + amount + date, via the [`Model`]) become a
-/// committed partition. The returned leaf is *stateful* — it keeps its basis
+/// *proposing* signals (reference + amount + date, via the [`FlowSpec`]) become
+/// a committed partition. The returned leaf is *stateful* — it keeps its basis
 /// warm across solves — but that is invisible to the caller: a one-shot solve
 /// just runs it once.
-pub fn flow<M>(model: M) -> Box<dyn Strategy<M::Tx>>
+pub fn flow<E>(spec: FlowSpec<E>) -> Box<dyn Strategy<E>>
 where
-    M: Model + Clone + 'static,
-    M::Tx: Clone + 'static,
+    E: Clone + 'static,
 {
-    Box::new(Flow::new(model))
+    Box::new(Flow::new(spec))
 }
 
 /// Stable, well-mixed upsert order (SplitMix64 over the id), so the ambiguous
@@ -553,26 +633,16 @@ mod tests {
         date: i64,
     }
 
-    #[derive(Clone)]
-    struct Demo;
-    impl Model for Demo {
-        type Tx = Tx;
-        fn penalty(&self, _tx: &Tx) -> f64 {
-            1_000_000.0
-        }
-        fn block_key(&self, tx: &Tx) -> i64 {
-            tx.date
-        }
-        fn window(&self) -> i64 {
-            3
-        }
-        fn cost(&self, a: &Tx, b: &Tx) -> Option<f64> {
-            Some(1.0 + (a.date - b.date).abs() as f64)
-        }
-        fn cost_lot(&self, a: &Tx, a_amt: i64, b: &Tx, b_amt: i64) -> Option<f64> {
-            // Prefer the cleaner net: penalize leftover residual, like a real model.
-            Some(1.0 + (a_amt + b_amt).abs() as f64 * 0.1 + (a.date - b.date).abs() as f64)
-        }
+    /// The demo spec: a date-proximity window with a lot-aware cost that prefers
+    /// the cleaner net (penalizing leftover residual), like a real model.
+    fn demo() -> FlowSpec<Tx> {
+        FlowSpec::new()
+            .penalty(1_000_000.0)
+            .window(3)
+            .block_key(|tx: &Tx| tx.date)
+            .cost_lot(|a: &Tx, a_amt, b: &Tx, b_amt| {
+                Some(1.0 + (a_amt + b_amt).abs() as f64 * 0.1 + (a.date - b.date).abs() as f64)
+            })
     }
 
     fn item(id: ExtId, amount: i64, date: i64) -> Item<Tx> {
@@ -585,7 +655,7 @@ mod tests {
 
     #[test]
     fn basic_recon() {
-        let mut s = flow(Demo);
+        let mut s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 1)]);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].net, 0); // clean
@@ -595,7 +665,7 @@ mod tests {
 
     #[test]
     fn streaming_add_is_warm() {
-        let mut s = flow(Demo);
+        let mut s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0)]);
         assert_eq!(r.groups.len(), 1);
         // Stream a second pair into the same (warm) leaf.
@@ -611,7 +681,7 @@ mod tests {
 
     #[test]
     fn allocation_readback_exposes_partial_matches() {
-        let mut s = flow(Demo);
+        let mut s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, 200, 1), item(3, -250, 0)]);
         assert_eq!(r.groups.len(), 1);
         let g = &r.groups[0];
@@ -629,7 +699,7 @@ mod tests {
 
     #[test]
     fn out_of_window_unmatched() {
-        let mut s = flow(Demo);
+        let mut s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 100)]); // far apart
         assert_eq!(r.groups.len(), 0);
         let mut rem: Vec<ExtId> = r.residual.iter().map(|i| i.id).collect();
@@ -639,7 +709,7 @@ mod tests {
 
     #[test]
     fn correction_reprice_is_warm() {
-        let mut s = flow(Demo);
+        let mut s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0), item(3, -50, 0)]);
         assert!(r.groups.iter().any(|g| ids(g).contains(&1) && ids(g).contains(&2)));
         // Correct id 1 down to 50 -> now prefers matching id 3.
@@ -649,7 +719,7 @@ mod tests {
 
     #[test]
     fn remove_is_warm() {
-        let mut s = flow(Demo);
+        let mut s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0)]);
         assert_eq!(r.groups.len(), 1);
         // Drop id 2 from the bag; the warm leaf removes it and re-solves.
@@ -660,29 +730,14 @@ mod tests {
 
     #[test]
     fn lot_cost_sees_residual_amount() {
-        // A model whose cost depends on the lot amounts: forbid matching unless
+        // A spec whose cost depends on the lot amounts: forbid matching unless
         // the residual magnitudes are equal. Exercises cost_lot threading.
-        #[derive(Clone)]
-        struct LotModel;
-        impl Model for LotModel {
-            type Tx = Tx;
-            fn penalty(&self, _t: &Tx) -> f64 {
-                1e9
-            }
-            fn block_key(&self, t: &Tx) -> i64 {
-                t.date
-            }
-            fn window(&self) -> i64 {
-                5
-            }
-            fn cost(&self, _a: &Tx, _b: &Tx) -> Option<f64> {
-                Some(1.0)
-            }
-            fn cost_lot(&self, _a: &Tx, a_amt: i64, _b: &Tx, b_amt: i64) -> Option<f64> {
-                (a_amt.abs() == b_amt.abs()).then_some(1.0)
-            }
-        }
-        let mut s = flow(LotModel);
+        let spec = FlowSpec::new()
+            .penalty(1e9)
+            .window(5)
+            .block_key(|t: &Tx| t.date)
+            .cost_lot(|_a: &Tx, a_amt, _b: &Tx, b_amt| (a_amt.abs() == b_amt.abs()).then_some(1.0));
+        let mut s = flow(spec);
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0)]);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].net, 0);

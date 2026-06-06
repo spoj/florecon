@@ -1,9 +1,11 @@
 """The wasmtime host for a florecon plugin.
 
 The host is generic and dumb: it loads a plugin ``.wasm``, asks it to
-``describe()`` itself (which raw columns it needs, which is the numeraire), then
-ships a columnar table as Arrow IPC and drives the planless ``Cmd`` protocol.
-State lives inside the module; only JSON + Arrow cross the boundary.
+``describe()`` itself (which raw columns it needs, which one is the headline
+amount), then ships a columnar table as Arrow IPC and drives the planless
+``Cmd`` protocol. State lives inside the module; only JSON + Arrow cross the
+boundary. The host knows *nothing* about any domain — the same code runs every
+florecon plugin.
 """
 
 import json
@@ -17,6 +19,21 @@ ABI_VERSION = 1
 
 class ContractMismatch(RuntimeError):
     """The plugin wasm speaks a different ABI than this host."""
+
+
+class PluginError(RuntimeError):
+    """A typed failure returned by the plugin's dispatch envelope.
+
+    Carries the stable ``code`` (e.g. ``"unknown_group"``, ``"frozen_group"``,
+    ``"conservation_violated"``) plus the row ``id`` / ``group_id`` it concerns
+    when the plugin knows them.
+    """
+
+    def __init__(self, code: str, message: str, id=None, group_id=None):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.id = id
+        self.group_id = group_id
 
 
 _PA_TYPE = {"i64": pa.int64(), "f64": pa.float64(), "utf8": pa.string()}
@@ -54,7 +71,7 @@ class Florecon:
 
     def dispatch(self, command: dict, arrow_bytes: bytes = None) -> dict:
         """Drive the persistent session with one ``Cmd`` dict. ``init``/``upsert``
-        carry their rows in ``arrow_bytes``."""
+        carry their rows in ``arrow_bytes``. Returns the raw envelope."""
         data = json.dumps(command).encode("utf-8")
         n = len(data)
         ptr = self._alloc(self.store, n)
@@ -74,10 +91,17 @@ class Florecon:
         return json.loads(self._read_packed(packed))
 
 
-def _ok(env: dict, key: str = "report") -> dict:
+def _ok(env: dict) -> dict:
+    """Unwrap a dispatch envelope to its report, or raise the typed error."""
     if not env.get("ok"):
-        raise RuntimeError(env.get("error", "unknown plugin error"))
-    return env.get(key, {})
+        e = env.get("error") or {}
+        raise PluginError(
+            e.get("code", "unknown"),
+            e.get("message", "unknown plugin error"),
+            id=e.get("id"),
+            group_id=e.get("group_id"),
+        )
+    return env.get("report", {})
 
 
 def _ipc(batch: "pa.RecordBatch") -> bytes:
@@ -92,8 +116,13 @@ class Workspace:
 
     The plugin owns the domain (preprocessing, identity, matching). The host
     just ships the raw columns the plugin's ``describe()`` declares, as rows of
-    ``{column: value}`` dicts, and drives solve / freeze / breakup. State lives
-    in the wasm module, so repeated :meth:`solve` calls warm re-solve.
+    ``{column: value}`` dicts, and drives the lifecycle (``pin``/``unpin``) and
+    partition (``merge``/``detach``/``dissolve``) verbs. State lives in the wasm
+    module, so repeated :meth:`solve` calls warm re-solve.
+
+    A group lives on a lifecycle axis: ``proposed`` groups are the solver's
+    current opinion (recomputed each :meth:`solve`); ``pinned`` groups are your
+    decisions, kept verbatim across solves.
     """
 
     def __init__(self, wasm_path=None, _engine: Florecon = None):
@@ -101,6 +130,10 @@ class Workspace:
         self.spec = self.fe.describe()
         self.fields = self.spec["input"]
         self.domain = self.spec.get("domain", {})
+        #: Name of the column the plugin flags as the headline display amount.
+        self.amount_field = next(
+            (f["name"] for f in self.fields if f.get("amount")), None
+        )
         self._schema = pa.schema(
             [pa.field(f["name"], _PA_TYPE[f["type"]]) for f in self.fields]
         )
@@ -117,6 +150,8 @@ class Workspace:
             arrays.append(pa.array(lane, type=ty))
         return pa.RecordBatch.from_arrays(arrays, schema=self._schema)
 
+    # --- ledger --------------------------------------------------------------
+
     def upsert(self, *rows) -> "Workspace":
         """Insert/replace rows. Each row is a ``{column: value}`` dict using the
         plugin's declared raw column names."""
@@ -131,53 +166,63 @@ class Workspace:
         _ok(self.last)
         return self
 
+    # --- machine -------------------------------------------------------------
+
     def solve(self) -> dict:
         self.last = self.fe.dispatch({"op": "solve"})
         return _ok(self.last)
 
-    def freeze(self, group_id: int) -> dict:
-        self.last = self.fe.dispatch({"op": "freeze", "group_id": group_id})
+    # --- lifecycle -----------------------------------------------------------
+
+    def pin(self, group_id: int) -> dict:
+        """Pin one proposed group — keep it verbatim across later solves."""
+        self.last = self.fe.dispatch({"op": "pin", "by": "group", "group_id": group_id})
         return _ok(self.last)
 
-    def freeze_singletons(self, ids) -> dict:
-        self.last = self.fe.dispatch({"op": "freeze_singletons", "ids": list(ids)})
+    def pin_clean(self, tol: int = 0) -> dict:
+        """Pin every proposed match that nets to zero within ``tol``."""
+        self.last = self.fe.dispatch({"op": "pin", "by": "clean", "tol": int(tol)})
         return _ok(self.last)
 
-    def freeze_clean(self, tol: int) -> dict:
-        self.last = self.fe.dispatch({"op": "freeze_clean", "tol": tol})
+    def pin_singletons(self, ids) -> dict:
+        """Pin the named lone lots (proposed singletons) as accepted-as-is."""
+        self.last = self.fe.dispatch({"op": "pin", "by": "singletons", "ids": list(ids)})
         return _ok(self.last)
 
-    def unfreeze(self, group_id: int) -> dict:
-        self.last = self.fe.dispatch({"op": "unfreeze", "group_id": group_id})
+    def unpin(self, group_id: int) -> dict:
+        """Release a pinned group back to the solver's control."""
+        self.last = self.fe.dispatch({"op": "unpin", "group_id": group_id})
         return _ok(self.last)
 
-    def breakup(self, group_id: int) -> dict:
-        self.last = self.fe.dispatch({"op": "breakup", "group_id": group_id})
-        return _ok(self.last)
+    # --- partition -----------------------------------------------------------
 
-    def group(self, ids, net: int = 0, origin: str = "manual", reason=None) -> dict:
-        cmd = {"op": "group", "ids": list(ids), "net": int(net), "origin": origin}
+    def merge(self, allocations, label: str = "manual", reason=None) -> dict:
+        """Assert a pinned group over exact allocations ``[{"id", "amount"}, ...]``."""
+        cmd = {
+            "op": "merge",
+            "allocations": [
+                {"id": int(a["id"]), "amount": int(a["amount"])} for a in allocations
+            ],
+            "label": label,
+        }
         if reason is not None:
             cmd["reason"] = str(reason)
         self.last = self.fe.dispatch(cmd)
         return _ok(self.last)
 
-    def group_allocations(self, allocations, origin: str = "manual", reason=None) -> dict:
-        cmd = {"op": "group_allocations", "allocations": list(allocations), "origin": origin}
-        if reason is not None:
-            cmd["reason"] = str(reason)
-        self.last = self.fe.dispatch(cmd)
-        return _ok(self.last)
-
-    def remove_allocations(self, group_id: int, ids) -> dict:
+    def detach(self, group_id: int, ids) -> dict:
+        """Pull rows out of a proposed group into lone singletons."""
         self.last = self.fe.dispatch(
-            {"op": "remove_allocations", "group_id": group_id, "ids": list(ids)}
+            {"op": "detach", "group_id": group_id, "ids": list(ids)}
         )
         return _ok(self.last)
 
-    def ungroup(self, ids) -> dict:
-        self.last = self.fe.dispatch({"op": "ungroup", "ids": list(ids)})
+    def dissolve(self, group_id: int) -> dict:
+        """Break a proposed group back into singletons."""
+        self.last = self.fe.dispatch({"op": "dissolve", "group_id": group_id})
         return _ok(self.last)
+
+    # --- read ----------------------------------------------------------------
 
     def report(self) -> dict:
         return _ok(self.fe.dispatch({"op": "report"}))

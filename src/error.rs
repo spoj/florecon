@@ -17,8 +17,10 @@ pub enum ApiError {
     UnknownGroup(u64),
     /// A manual op referenced an id that is not in the workspace.
     UnknownId(ExtId),
-    /// A manual op would disturb a frozen (signed-off) group; unfreeze first.
+    /// A manual op would disturb a frozen (signed-off) member; unpin first.
     FrozenMember(ExtId),
+    /// A structural edit targeted a pinned (signed-off) group; unpin first.
+    FrozenGroup(u64),
     /// A manual group needs at least two distinct members.
     DegenerateGroup,
     /// A requested allocation amount is not available in the live (unfrozen)
@@ -35,6 +37,44 @@ pub enum ApiError {
     },
 }
 
+impl ApiError {
+    /// A stable machine code for the wire error envelope.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ApiError::ConservationViolated { .. } => "conservation_violated",
+            ApiError::UnknownGroup(_) => "unknown_group",
+            ApiError::UnknownId(_) => "unknown_id",
+            ApiError::FrozenMember(_) => "frozen_member",
+            ApiError::FrozenGroup(_) => "frozen_group",
+            ApiError::DegenerateGroup => "degenerate_group",
+            ApiError::InsufficientLiveAmount { .. } => "insufficient_live_amount",
+            ApiError::UnknownAllocation { .. } => "unknown_allocation",
+        }
+    }
+
+    /// The row id this error is about, if any (lets a client highlight it).
+    pub fn id(&self) -> Option<ExtId> {
+        match *self {
+            ApiError::ConservationViolated { id, .. }
+            | ApiError::UnknownId(id)
+            | ApiError::FrozenMember(id)
+            | ApiError::InsufficientLiveAmount { id, .. }
+            | ApiError::UnknownAllocation { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The group id this error is about, if any.
+    pub fn group_id(&self) -> Option<u64> {
+        match *self {
+            ApiError::UnknownGroup(g)
+            | ApiError::FrozenGroup(g)
+            | ApiError::UnknownAllocation { group_id: g, .. } => Some(g),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -49,7 +89,10 @@ impl std::fmt::Display for ApiError {
             ApiError::UnknownGroup(g) => write!(f, "unknown group id: {g}"),
             ApiError::UnknownId(id) => write!(f, "unknown row id: {id}"),
             ApiError::FrozenMember(id) => {
-                write!(f, "row {id} is in a frozen group; unfreeze it first")
+                write!(f, "row {id} is in a pinned group; unpin it first")
+            }
+            ApiError::FrozenGroup(g) => {
+                write!(f, "group {g} is pinned; unpin it first")
             }
             ApiError::DegenerateGroup => write!(f, "a manual group needs at least two rows"),
             ApiError::InsufficientLiveAmount {

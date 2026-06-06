@@ -33,7 +33,10 @@ pub trait Plugin: Sized {
     /// Row-local: derive the typed match lanes. Deterministic, no other rows.
     fn project(&self, row: &RowView<'_>) -> Self::Row;
 
-    /// The conserved primary amount (single numeraire, signed, minor units).
+    /// The conserved numeraire (single, signed, minor units). This is what
+    /// [`Recon`](crate::Recon) conserves and may be *derived* from several
+    /// columns — it is distinct from the host's display
+    /// [`amount`](crate::sdk::Field::amount) column, which is only a UI hint.
     fn primary(row: &Self::Row) -> i64;
 
     /// The matching cascade.

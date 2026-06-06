@@ -18,7 +18,7 @@ the raw columns it asks for and drives the interactive workspace.
     print(ws.solve())
 """
 
-from ._host import ABI_VERSION, ContractMismatch, Florecon, Workspace
+from ._host import ABI_VERSION, ContractMismatch, Florecon, PluginError, Workspace
 from .projections import connected_components, strict_assignments
 
 __all__ = [
@@ -26,6 +26,7 @@ __all__ = [
     "Workspace",
     "ABI_VERSION",
     "ContractMismatch",
+    "PluginError",
     "strict_assignments",
     "connected_components",
 ]

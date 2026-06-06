@@ -1,16 +1,16 @@
 use crate::ExtId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// The single recalc-status axis of a group. Only a human operator flips a
-/// group between these in a workspace: `live` is the machine's current opinion
-/// (subject to recalc), `frozen` is the operator's decision (inviolable).
-/// Stateless batch solves return live proposals.
+/// The lifecycle axis of a group. Only a human operator flips a group between
+/// these in a workspace: `proposed` is the machine's current opinion (subject to
+/// recalc each solve), `pinned` is the operator's decision (kept verbatim).
+/// Stateless batch solves return proposed groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Status {
-    Live,
-    Frozen,
+    Proposed,
+    Pinned,
 }
 
 /// One reconciled group in a [`Report`].
@@ -25,7 +25,7 @@ pub struct GroupOut {
     /// also the number of business rows; for lot strategies a row id may appear
     /// in multiple groups across the report.
     pub size: usize,
-    /// The single recalc-status axis: `live` or `frozen`. (Matched vs unmatched
+    /// The single lifecycle axis: `proposed` or `pinned`. (Matched vs unmatched
     /// is a client projection over the allocation hypergraph, not core state.)
     pub status: Status,
     /// Optional human-facing explanation of why the group formed (the plan's
