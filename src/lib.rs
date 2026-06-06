@@ -64,7 +64,6 @@ pub mod sdk;
 
 pub use engine::{ArcId, Network, NodeId, SolveStatus};
 pub use error::ApiError;
-pub use strategy::flow::Group;
 pub use strategy::{ExtId, Matcher, Model};
 
 pub use recon::Recon;

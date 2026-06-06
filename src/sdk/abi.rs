@@ -11,7 +11,8 @@ use std::mem::ManuallyDrop;
 use serde::{Deserialize, Serialize};
 
 use crate::ExtId;
-use crate::recon::{AllocationSpec, Recon};
+use crate::recon::Recon;
+use crate::strategy::Allocation;
 use crate::report::Report;
 use crate::sdk::plugin::Plugin;
 use crate::sdk::table::Table;
@@ -97,7 +98,7 @@ enum Cmd {
         reason: Option<String>,
     },
     GroupAllocations {
-        allocations: Vec<AllocationSpec>,
+        allocations: Vec<Allocation>,
         #[serde(default)]
         origin: Option<String>,
         #[serde(default)]

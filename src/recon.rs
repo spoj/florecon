@@ -11,21 +11,13 @@
 //! id's allocations sum to its original amount, so a bad strategy degrades to a
 //! bad proposal, never a broken ledger.
 
+use crate::strategy::{Allocation, Item, Strategy};
 use crate::ExtId;
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
 pub use crate::strategy::Tol;
 
-use crate::strategy::{Item, Strategy};
 use std::collections::{BTreeMap, BTreeSet};
-
-/// Allocation request used by allocation-native manual workspace operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct AllocationSpec {
-    pub id: ExtId,
-    pub amount: i64,
-}
 
 /// Amount-conservation guard for the allocation-native report. The report is a
 /// lot hypergraph, so a row may be split across many groups — or, when its
@@ -461,7 +453,7 @@ impl<E: Clone> Recon<E> {
     /// are never disturbed.
     pub fn group_allocations(
         &mut self,
-        specs: &[AllocationSpec],
+        specs: &[Allocation],
         origin: &str,
         reason: Option<String>,
     ) -> Result<u64, ApiError> {

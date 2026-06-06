@@ -119,7 +119,9 @@ pub struct Group {
 
 /// A signed matched or unmatched quantity allocated to one external row/lot id.
 /// Positive amounts come from source lots; negative amounts from sink lots.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Also the wire shape a host sends to request a manual group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Allocation {
     pub id: ExtId,
     pub amount: i64,
