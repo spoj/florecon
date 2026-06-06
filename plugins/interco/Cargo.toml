@@ -1,0 +1,14 @@
+[package]
+name = "interco-plugin"
+version = "1.0.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+florecon = { path = "../..", features = ["sdk"] }
+
+[dev-dependencies]
+arrow = { version = "53", default-features = false, features = ["ipc"] }
+
