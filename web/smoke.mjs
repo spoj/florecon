@@ -1,96 +1,78 @@
-// Node smoke test for the browser host ABI against real data.
+// Node smoke: drive the interco *plugin* wasm through the generic browser host
+// (the new ABI: describe-driven, planless). Proves the JS host stack works
+// against a plugin end to end. Mirrors py/smoke_stateful.py.
+//
+//   cargo build -p interco-plugin --target wasm32-unknown-unknown --release
 //   node web/smoke.mjs
+
 import { readFileSync } from "fs";
-import { Florecon, primaryAssignments } from "./core/florecon.js";
-import { parseCsv, buildDataset } from "./ingest.js";
+import { Florecon } from "./core/florecon.js";
+import { Session } from "./host.js";
 
-const here = new URL(".", import.meta.url);
-const rel = (p) => new URL(p, here);
-const wasm = readFileSync(rel("core/engine.wasm"));
-const { instance } = await WebAssembly.instantiate(wasm, {});
-const fe = new Florecon(instance);
+const wasmUrl = new URL(
+  "../target/wasm32-unknown-unknown/release/interco_plugin.wasm",
+  import.meta.url,
+);
 
-const csv = `Entity,Currency,Account,Date,Amount,Ref,Memo
-ACME,USD,4000,2024-01-02,100.00,INV0001,widgets
-ACME,USD,4000,2024-01-03,-100.00,INV0001,credit
-GLOBEX,EUR,5000,2024-02-01,250.50,INV0009,services
-GLOBEX,EUR,5000,2024-02-04,-250.50,INV0009,reversal
-ACME,USD,4000,2024-01-05,42.00,INV0002,stray`;
-const parsed = parseCsv(csv);
-const data = buildDataset({
-  header: parsed.header, rows: parsed.rows,
-  columns: [
-    { ci: 0, name: "entity", kind: "key" },
-    { ci: 1, name: "currency", kind: "key" },
-    { ci: 2, name: "account", kind: "key" },
-    { ci: 3, name: "date", kind: "date" },
-    { ci: 4, name: "amount", kind: "amount" },
-    { ci: 5, name: "ref", kind: "text" },
-    { ci: 6, name: "memo", kind: "display" },
-  ],
+function check(cond, msg) {
+  if (!cond) {
+    console.error("FAIL: " + msg);
+    process.exit(1);
+  }
+}
+
+const gidOf = (rep, rid) => (rep.allocations.find((a) => a.id === rid) || {}).group_id;
+const group = (rep, gid) => rep.groups.find((g) => g.group_id === gid);
+function matchedPair(rep, a, b) {
+  const ga = gidOf(rep, a), gb = gidOf(rep, b);
+  const g = ga != null ? group(rep, ga) : null;
+  return ga != null && ga === gb && g && g.net === 0 && g.size >= 2;
+}
+
+const line = (row_id, co, icp, objsub, usd, day, ref) => ({
+  row_id, company: co, icp, objsub,
+  indicative_usd_amt: usd, gl_date: day,
+  trx_currency: "USD", trx_amt: Math.abs(usd), reference: ref,
 });
 
-const t0 = performance.now();
-let r = fe.dispatch({ op: "init", plan: data.plan }, data.arrowBytes);
-if (!r.ok) throw new Error("init: " + r.error);
-const tColdStart = performance.now();
-r = fe.dispatch({ op: "solve" });
-if (!r.ok) throw new Error("solve: " + r.error);
-const coldMs = performance.now() - tColdStart;
-const tWarmStart = performance.now();
-const r1 = fe.dispatch({ op: "solve" });
-if (!r1.ok) throw new Error("warm solve: " + r1.error);
-const warmMs = performance.now() - tWarmStart;
-const rep = r1.report;
-const assignments = (rp) => primaryAssignments(rp);
-const warmConserve = assignments(rep).length === data.display.length;
-const residCount = (rp) => rp.groups.filter((g) => g.status !== "frozen" && g.size === 1).length;
-const singletonIds = (rp) => {
-  const live = new Set(rp.groups.filter((g) => g.status !== "frozen" && g.size === 1).map((g) => g.group_id));
-  return assignments(rp).filter(([, gid]) => live.has(gid)).map(([id]) => id);
-};
-const total = data.display.length;
-const matched = assignments(rep).length;
-const conserve = matched === total;
-const resid = residCount(rep);
+const { instance } = await WebAssembly.instantiate(readFileSync(wasmUrl), {});
+const fe = new Florecon(instance);
+const s = new Session(fe);
+check(s.domain.id === "florecon.intercompany", "host should discover the domain via describe()");
 
-const g = rep.groups.find((x) => x.size >= 2);
-let n = fe.dispatch({ op: "freeze", group_id: g.group_id }).report.groups.find((x) => x.group_id === g.group_id);
-const g2 = rep.groups.filter((x) => x.size >= 2)[1].group_id;
-const after = fe.dispatch({ op: "breakup", group_id: g2 }).report;
-const stillThere = after.groups.some((x) => x.group_id === g2);
-const re = fe.dispatch({ op: "solve" }).report;
-const frozenKept = re.groups.some((x) => x.group_id === g.group_id && x.status === "frozen");
-const reConserve = assignments(re).length === total;
+// first invoice pair: opposite books, shared reference, nets clean
+s.upsert(line(1, "A", "B", "61500", 100.0, 0, "INV0001"), line(2, "B", "A", "61500", -100.0, 1, "INV0001"));
+let rep = s.solve();
+check(matchedPair(rep, 1, 2), "first invoice pair (1,2) should net to a matched group");
 
-const pick = singletonIds(re).slice(0, 2);
-let manualOk = false, frozenRefused = false, ungroupOk = false;
-if (pick.length === 2) {
-  const gm = fe.dispatch({ op: "group", ids: pick, net: 0, origin: "manual" });
-  const mg = gm.ok && assignments(gm.report).filter(([id]) => pick.includes(id)).length === 2;
-  const frozenManual = gm.ok && gm.report.groups.some((x) => x.origin === "manual" && x.status === "frozen");
-  manualOk = mg && frozenManual;
-  frozenRefused = fe.dispatch({ op: "ungroup", ids: pick }).ok === false;
-}
+// stream a second pair and WARM re-solve
+s.upsert(line(3, "A", "B", "61600", 250.0, 2, "INV0009"), line(4, "B", "A", "61600", -250.0, 3, "INV0009"));
+rep = s.solve();
+check(matchedPair(rep, 1, 2), "original pair (1,2) stays matched after warm re-solve");
+check(matchedPair(rep, 3, 4), "new pair (3,4) matches on warm re-solve");
+check(gidOf(rep, 1) !== gidOf(rep, 3), "distinct invoice buckets form distinct groups");
 
-const exId = singletonIds(fe.dispatch({ op: "report" }).report)[0];
-let exceptionOk = false;
-if (exId != null) {
-  const fr = fe.dispatch({ op: "freeze_singletons", ids: [exId] }).report;
-  const exGid = assignments(fr).find(([id]) => id === exId)?.[1];
-  const frozenSingleton = fr.groups.some((x) => x.group_id === exGid && x.status === "frozen" && x.size === 1);
-  const sur = fe.dispatch({ op: "solve" }).report;
-  const kept = sur.groups.some((x) => x.group_id === exGid && x.status === "frozen" && x.size === 1);
-  exceptionOk = frozenSingleton && kept;
-}
+// remove one leg: partner falls back to a live singleton
+s.remove(4);
+rep = s.solve();
+check(matchedPair(rep, 1, 2), "pair (1,2) untouched by removing row 4");
+const g3 = group(rep, gidOf(rep, 3));
+check(g3 && g3.size === 1, "row 3 becomes a live singleton once its partner is removed");
 
-const live = fe.dispatch({ op: "report" }).report.groups.find((x) => x.status !== "frozen" && x.size >= 2);
-if (live) {
-  const cur = fe.dispatch({ op: "report" }).report;
-  const mem = assignments(cur).filter(([, gid]) => gid === live.group_id).map(([id]) => id);
-  const ug = fe.dispatch({ op: "ungroup", ids: mem });
-  const singles = new Set(singletonIds(ug.report));
-  ungroupOk = ug.ok && mem.every((id) => singles.has(id));
-}
+// freeze the clean match; it survives recalc
+s.freezeClean(0);
+rep = s.report();
+check(group(rep, gidOf(rep, 1)).status === "frozen", "freeze_clean freezes the clean (1,2) match");
+rep = s.solve();
+check(group(rep, gidOf(rep, 1)).status === "frozen", "frozen (1,2) survives a subsequent solve");
 
-console.log("SMOKE OK");
+// re-add the partner, re-match, then break the live group apart
+s.upsert(line(4, "B", "A", "61600", -250.0, 3, "INV0009"));
+rep = s.solve();
+check(matchedPair(rep, 3, 4), "re-adding row 4 re-forms the (3,4) match");
+s.breakup(gidOf(rep, 3));
+rep = s.report();
+check(gidOf(rep, 3) !== gidOf(rep, 4), "breakup splits rows 3 and 4 apart");
+check(group(rep, gidOf(rep, 1)).status === "frozen", "breakup leaves the frozen (1,2) group alone");
+
+console.log("WEB PLUGIN SMOKE OK");

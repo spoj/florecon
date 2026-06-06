@@ -89,9 +89,9 @@ export function connectedComponents(report) {
 }
 
 export class Florecon {
-  // The wire-contract version this host speaks; must equal the engine's
-  // abi_version() export. Bump in lockstep with plan::CONTRACT_VERSION.
-  static CONTRACT_VERSION = 18;
+  // The host↔plugin ABI version this host speaks; must equal the plugin's
+  // abi_version() export (florecon::sdk::ABI_VERSION).
+  static ABI_VERSION = 1;
 
   static async load(url) {
     const bytes = await (await fetch(url)).arrayBuffer();
@@ -105,13 +105,21 @@ export class Florecon {
     this.enc = new TextEncoder();
     this.dec = new TextDecoder();
     const v = this.ex.abi_version();
-    if (v !== Florecon.CONTRACT_VERSION) {
+    if (v !== Florecon.ABI_VERSION) {
       throw new Error(
-        `wasm contract v${v} != host v${Florecon.CONTRACT_VERSION}; ` +
-          "rebuild the wasm or update this host",
+        `plugin ABI v${v} != host v${Florecon.ABI_VERSION}; ` +
+          "rebuild the plugin or update this host",
       );
     }
-    this.engineVersion = v;
+    this.abiVersion = v;
+  }
+
+  _readPacked(packed) {
+    const outPtr = Number(packed & 0xffffffffn);
+    const outLen = Number((packed >> 32n) & 0xffffffffn);
+    const out = new Uint8Array(this.mem.buffer, outPtr, outLen).slice();
+    this.ex.dealloc(outPtr, outLen);
+    return JSON.parse(this.dec.decode(out));
   }
 
   _call(fn, payload, arrowBytes = null) {
@@ -131,18 +139,18 @@ export class Florecon {
 
     this.ex.dealloc(ptr, n);
     if (arrowN > 0) this.ex.dealloc(arrowPtr, arrowN);
-
-    const outPtr = Number(packed & 0xffffffffn);
-    const outLen = Number((packed >> 32n) & 0xffffffffn);
-    const out = new Uint8Array(this.mem.buffer, outPtr, outLen).slice();
-    this.ex.dealloc(outPtr, outLen);
-    return JSON.parse(this.dec.decode(out));
+    return this._readPacked(packed);
   }
 
-  // The single low-level entry point: one command (init/upsert/remove/solve/
-  // freeze/...) against the persistent workspace. A stateless batch solve is
-  // just `dispatch({op:"init", plan}, arrowBytes)` followed by
-  // `dispatch({op:"solve"})`.
+  // The plugin's self-description: { abi_version, domain, input, ... }. The
+  // host reads this to know which raw columns to ship and which is the numeraire.
+  describe() {
+    return this._readPacked(this.ex.describe());
+  }
+
+  // The single low-level entry point: one planless command (init/upsert/remove/
+  // solve/freeze/...) against the persistent session. A stateless batch solve is
+  // just `dispatch({op:"init"}, arrowBytes)` then `dispatch({op:"solve"})`.
   dispatch(cmd, arrowBytes = null) {
     return this._call(this.ex.dispatch, cmd, arrowBytes);
   }
