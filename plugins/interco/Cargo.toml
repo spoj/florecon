@@ -2,6 +2,7 @@
 name = "interco-plugin"
 version = "1.0.0"
 edition = "2024"
+publish = false  # demo plugin (cdylib/wasm artifact), not a library crate
 
 [lib]
 crate-type = ["cdylib", "rlib"]

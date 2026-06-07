@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "derive(Record) for florecon plugins: one struct is the wire schema, the typed projection, and the identity."
 license = "MIT"
-repository = "https://github.com/florecon/florecon"
+repository = "https://github.com/spoj/florecon"
 
 [lib]
 proc-macro = true

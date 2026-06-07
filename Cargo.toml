@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "Incremental financial reconciliation by min-cost flow: a conserving combinator algebra over a network-simplex core. Nothing created, nothing lost."
 license = "MIT"
-repository = "https://github.com/florecon/florecon"
+repository = "https://github.com/spoj/florecon"
 readme = "README.md"
 keywords = ["reconciliation", "min-cost-flow", "network-simplex", "finance", "matching"]
 categories = ["finance", "algorithms", "mathematics"]
+
+[package.metadata.docs.rs]
+# Build docs with the full authoring SDK (Arrow Table, Plugin, derive(Record)).
+features = ["sdk"]
 
 [lib]
 crate-type = ["rlib"]
