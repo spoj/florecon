@@ -1,5 +1,18 @@
 # The plugin SDK surface — redesign
 
+> **Update — authoring surface v2 (IMPLEMENTED).** The "three stringly
+> contracts" below are now collapsed by `#[derive(Record)]`: one struct is the
+> input schema (`describe()`), the typed projection, and the identity. The
+> `Plugin` trait is `type Input: Record` + `type Row` + `type Config` +
+> `domain()` / `new(config)` / `project(&Input)` / `primary()` / `strategy()`;
+> `describe()` and identity are *provided*, and an author never writes a stringly
+> column name or touches `RowView`. The host accepts a **dataframe only**
+> (polars / pandas / pyarrow), validated and cast against `describe()` — no dict
+> rows. `Config` is delivered in the `init` command, so tolerances/windows tune
+> at runtime without rebuilding the wasm. See the `Plugin`/`Record` rustdoc and
+> `templates/plugin/` for the current shape; the sections below are the original
+> rationale.
+
 Status: proposal. Companion to `recon-surface.md` (the workspace) and
 `strategy-surface.md` (the algebra). This rethinks `src/sdk/*` so the authoring
 and host surfaces are **robust** (the loader catches what the conformance kit

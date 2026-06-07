@@ -31,9 +31,9 @@
 //! bad proposal, never a broken ledger.
 
 use crate::ExtId;
-use crate::strategy::{Allocation, Item, Strategy, Tol};
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
+use crate::strategy::{Allocation, Item, Strategy, Tol};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -312,7 +312,12 @@ impl<E: Clone> Recon<E> {
             }
             if g.is_pinned() {
                 // Demote the whole pinned group: its inputs changed.
-                scattered.extend(g.allocations.iter().filter(|a| !victims.contains(&a.id)).cloned());
+                scattered.extend(
+                    g.allocations
+                        .iter()
+                        .filter(|a| !victims.contains(&a.id))
+                        .cloned(),
+                );
                 return false;
             }
             g.allocations.retain(|a| !victims.contains(&a.id));
@@ -667,7 +672,10 @@ mod tests {
         r.upsert(2, -50);
         r.solve().unwrap();
         // Row 1 is pinned out of the bag, so it cannot net with row 2.
-        assert!(r.groups().any(|g| g.id() == gid && g.is_pinned() && g.contains(1)));
+        assert!(
+            r.groups()
+                .any(|g| g.id() == gid && g.is_pinned() && g.contains(1))
+        );
         assert!(r.groups().any(|g| g.contains(2) && !g.is_pinned()));
     }
 
@@ -676,11 +684,19 @@ mod tests {
         let mut r = recon();
         r.upsert(1, 100);
         r.upsert(2, -100);
-        let gid = r.merge(&[alloc(1, 100), alloc(2, -100)], "m", None).unwrap();
-        assert!(r.groups().any(|g| g.id() == gid && g.is_pinned() && g.size() == 2));
+        let gid = r
+            .merge(&[alloc(1, 100), alloc(2, -100)], "m", None)
+            .unwrap();
+        assert!(
+            r.groups()
+                .any(|g| g.id() == gid && g.is_pinned() && g.size() == 2)
+        );
         // The mass is now pinned; a second claim finds nothing live.
         let err = r.merge(&[alloc(1, 100), alloc(2, -100)], "m", None);
-        assert!(matches!(err, Err(ApiError::InsufficientLiveAmount { id: 1, .. })));
+        assert!(matches!(
+            err,
+            Err(ApiError::InsufficientLiveAmount { id: 1, .. })
+        ));
     }
 
     #[test]
@@ -688,7 +704,9 @@ mod tests {
         let mut r = recon();
         r.upsert(1, 100);
         r.upsert(2, -100);
-        let gid = r.merge(&[alloc(1, 100), alloc(2, -100)], "m", None).unwrap();
+        let gid = r
+            .merge(&[alloc(1, 100), alloc(2, -100)], "m", None)
+            .unwrap();
         assert!(matches!(r.dissolve(gid), Err(ApiError::FrozenGroup(_))));
         assert!(matches!(r.detach(gid, &[1]), Err(ApiError::FrozenGroup(_))));
         // Unpin first, then both succeed.
@@ -702,7 +720,9 @@ mod tests {
         let mut r = recon();
         r.upsert(1, 100);
         r.upsert(2, -100);
-        let gid = r.merge(&[alloc(1, 100), alloc(2, -100)], "m", None).unwrap();
+        let gid = r
+            .merge(&[alloc(1, 100), alloc(2, -100)], "m", None)
+            .unwrap();
         r.remove(&[1]);
         // The pinned group is gone (its inputs changed); the survivor is a
         // proposed singleton, never a silently half-pinned group.
@@ -720,7 +740,10 @@ mod tests {
         r.solve().unwrap();
         let n = r.pin_where(|g| g.is_match() && g.clean(0));
         assert_eq!(n, 1); // the {1,2} net-zero match, not the lone 3
-        assert!(r.groups().any(|g| g.is_pinned() && g.contains(1) && g.contains(2)));
+        assert!(
+            r.groups()
+                .any(|g| g.is_pinned() && g.contains(1) && g.contains(2))
+        );
         assert!(r.groups().any(|g| g.contains(3) && !g.is_pinned()));
     }
 

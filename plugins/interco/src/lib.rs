@@ -1,8 +1,10 @@
 //! Intercompany reconciliation as a florecon plugin.
 //!
-//! The host ships a columnar ledger (one Arrow table). This plugin bakes in the
-//! preprocessing (FX selection, reference tokenization, identity) and the
-//! matching cascade, then `export_plugin!` emits the self-describing wasm.
+//! The host ships a columnar ledger (one Arrow table). The `Ledger` record —
+//! `#[derive(Record)]` — is the single source of truth for the input schema,
+//! the typed projection, and identity. This plugin bakes in the preprocessing
+//! (FX selection, reference tokenization) and the matching cascade, then
+//! `export_plugin!` emits the self-describing wasm.
 //!
 //!   partition_by(unit, partition_by(ccy, seq[
 //!       agg_net,       // whole unit+currency nets at aggregate
@@ -15,7 +17,7 @@
 //! amount derived in `project` IS the conserved numeraire and FX never enters.
 
 use florecon::export_plugin;
-use florecon::sdk::{DescribeDoc, Field, Plugin, RowView};
+use florecon::sdk::{Domain, Plugin, Record};
 use florecon::strategy::{
     FlowSpec, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group,
 };
@@ -23,6 +25,29 @@ use florecon::token::fnv1a;
 
 const TOL: i64 = 100; // 1.00 in native minor units
 const CAP: usize = 256;
+
+/// The raw ledger line the host ships: schema + projection + identity in one.
+#[derive(Record)]
+pub struct Ledger {
+    #[record(id)]
+    row_id: i64,
+    company: String,
+    icp: String,
+    objsub: String,
+    #[record(amount)]
+    indicative_usd_amt: f64,
+    gl_date: i64,
+    base_currency: String,
+    trx_currency: String,
+    trx_amt: f64,
+    fc_amt: f64,
+    reference: String,
+    reference2: String,
+    description: String,
+    name_remark_explanation: String,
+    invoice_no: String,
+    is_offset: i64,
+}
 
 /// The typed match row, derived per ledger line.
 #[derive(Clone)]
@@ -76,7 +101,11 @@ fn tokens(fields: &[&str]) -> Vec<u64> {
                 .filter(|c| c.is_alphanumeric())
                 .collect::<String>()
                 .to_uppercase();
-            if t.len() < 6 || t.len() > 40 || t == "OFFSETENTRY" || t.chars().all(|c| c.is_alphabetic()) {
+            if t.len() < 6
+                || t.len() > 40
+                || t == "OFFSETENTRY"
+                || t.chars().all(|c| c.is_alphabetic())
+            {
                 continue;
             }
             let h = fnv1a(t.as_bytes());
@@ -91,67 +120,51 @@ fn tokens(fields: &[&str]) -> Vec<u64> {
 pub struct IntercoPlugin;
 
 impl Plugin for IntercoPlugin {
+    type Input = Ledger;
     type Row = Row;
+    type Config = ();
 
-    fn new() -> Self {
+    fn domain() -> Domain {
+        Domain::new("florecon.intercompany", "1.0.0")
+    }
+
+    fn new(_config: ()) -> Self {
         IntercoPlugin
     }
 
-    fn describe() -> DescribeDoc {
-        DescribeDoc::new("florecon.intercompany", "1.0.0").input(vec![
-            Field::int("row_id"),
-            Field::text("company"),
-            Field::text("icp"),
-            Field::text("objsub"),
-            Field::float("indicative_usd_amt").amount(),
-            Field::int("gl_date"),
-            Field::text("base_currency"),
-            Field::text("trx_currency"),
-            Field::float("trx_amt"),
-            Field::float("fc_amt"),
-            Field::text("reference"),
-            Field::text("reference2"),
-            Field::text("description"),
-            Field::text("name_remark_explanation"),
-            Field::text("invoice_no"),
-            Field::int("is_offset"),
-        ])
-    }
-
-    fn id(&self, row: &RowView<'_>) -> u64 {
-        row.i64("row_id") as u64 // the host's own stable ledger line id
-    }
-
-    fn project(&self, r: &RowView<'_>) -> Row {
-        let co = r.str("company");
-        let icp = r.str("icp");
-        let inert = r.i64("is_offset") != 0 || co.is_empty() || icp.is_empty() || co == icp;
+    fn project(&self, r: &Ledger) -> Row {
+        let inert =
+            r.is_offset != 0 || r.company.is_empty() || r.icp.is_empty() || r.company == r.icp;
 
         // native amount: trx currency, falling back to base currency.
-        let (trx, fc) = (r.f64("trx_amt"), r.f64("fc_amt"));
+        let (trx, fc) = (r.trx_amt, r.fc_amt);
         let (ccy_s, amt) = if trx.abs() >= 0.005 {
-            (r.str("trx_currency"), trx)
+            (r.trx_currency.as_str(), trx)
         } else {
-            (r.str("base_currency"), fc)
+            (r.base_currency.as_str(), fc)
         };
-        let usd_cents = (r.f64("indicative_usd_amt") * 100.0).round() as i64;
+        let usd_cents = (r.indicative_usd_amt * 100.0).round() as i64;
         let sign = usd_cents.signum();
-        let snative = if inert { 0 } else { (amt.abs() * 100.0).round() as i64 * sign };
+        let snative = if inert {
+            0
+        } else {
+            (amt.abs() * 100.0).round() as i64 * sign
+        };
 
-        let mut pair = [co.to_string(), icp.to_string()];
+        let mut pair = [r.company.clone(), r.icp.clone()];
         pair.sort();
         Row {
             unit: fnv1a(format!("{}|{}", pair[0], pair[1]).as_bytes()),
             ccy: fnv1a(ccy_s.as_bytes()),
-            objsub: fnv1a(r.str("objsub").as_bytes()),
+            objsub: fnv1a(r.objsub.as_bytes()),
             snative,
-            gl_day: r.i64("gl_date"),
+            gl_day: r.gl_date,
             tokens: tokens(&[
-                r.str("reference"),
-                r.str("reference2"),
-                r.str("description"),
-                r.str("name_remark_explanation"),
-                r.str("invoice_no"),
+                r.reference.as_str(),
+                r.reference2.as_str(),
+                r.description.as_str(),
+                r.name_remark_explanation.as_str(),
+                r.invoice_no.as_str(),
             ]),
         }
     }
@@ -189,6 +202,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field as AField, Schema};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
+    use florecon::sdk::{DescribeDoc, Field, Table};
     use std::sync::Arc;
 
     fn sample_ipc() -> Vec<u8> {
@@ -203,7 +217,8 @@ mod tests {
         let tccy = StringArray::from(vec!["USD", "USD", "USD", "USD"]);
         let trx = Float64Array::from(vec![100.0, 100.0, 50.0, 50.0]);
         let fc = Float64Array::from(vec![0.0, 0.0, 0.0, 0.0]);
-        let reference = StringArray::from(vec!["INV-AAAA-1", "INV-AAAA-1", "INV-BBBB-2", "INV-BBBB-2"]);
+        let reference =
+            StringArray::from(vec!["INV-AAAA-1", "INV-AAAA-1", "INV-BBBB-2", "INV-BBBB-2"]);
         let blank = StringArray::from(vec!["", "", "", ""]);
         let is_off = Int64Array::from(vec![0, 0, 0, 0]);
 
@@ -265,31 +280,36 @@ mod tests {
     #[test]
     fn pairs_net_clean() {
         use florecon::recon::Recon;
-        use florecon::sdk::Table;
         let table = Table::from_ipc(&sample_ipc(), &IntercoPlugin::describe()).unwrap();
-        let p = IntercoPlugin::new();
+        let p = IntercoPlugin::new(());
         let mut r = Recon::new(p.strategy(), IntercoPlugin::primary);
         for i in 0..table.len() {
-            let rv = table.row(i);
-            r.upsert(p.id(&rv), p.project(&rv));
+            let input = Ledger::from_view(&table.row(i));
+            r.upsert(input.ext_id(), p.project(&input));
         }
         r.solve().unwrap();
         let rep = r.report();
         // All four rows net to zero across two clean groups.
-        let clean: i64 = rep.groups.iter().filter(|g| g.net == 0).map(|g| g.size as i64).sum();
-        assert_eq!(clean, 4, "expected all four rows in net-zero groups: {rep:?}");
+        let clean: i64 = rep
+            .groups
+            .iter()
+            .filter(|g| g.net == 0)
+            .map(|g| g.size as i64)
+            .sum();
+        assert_eq!(
+            clean, 4,
+            "expected all four rows in net-zero groups: {rep:?}"
+        );
     }
 
     #[test]
     fn missing_declared_column_errors() {
-        use florecon::sdk::Table;
         let doc = DescribeDoc::new("x", "1").input(vec![Field::int("does_not_exist")]);
         assert!(Table::from_ipc(&sample_ipc(), &doc).is_err());
     }
 
     #[test]
     fn wrong_typed_column_errors() {
-        use florecon::sdk::Table;
         // row_id is shipped as Int64; declaring it text must fail at ingest.
         let doc = DescribeDoc::new("x", "1").input(vec![Field::text("row_id")]);
         assert!(Table::from_ipc(&sample_ipc(), &doc).is_err());
@@ -298,7 +318,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "undeclared column")]
     fn undeclared_access_panics() {
-        use florecon::sdk::Table;
         let doc = DescribeDoc::new("x", "1").input(vec![Field::int("row_id")]);
         let t = Table::from_ipc(&sample_ipc(), &doc).unwrap();
         let _ = t.row(0).i64("company"); // declared nowhere -> loud panic, not 0

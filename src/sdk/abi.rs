@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::ExtId;
 use crate::error::ApiError;
 use crate::recon::Recon;
-use crate::strategy::Allocation;
 use crate::report::Report;
 use crate::sdk::plugin::Plugin;
+use crate::sdk::record::Record;
 use crate::sdk::table::Table;
+use crate::strategy::Allocation;
 
 /// A live reconciliation session: the author's plugin plus the stateful
 /// [`Recon`] it drives. One per wasm instance.
@@ -26,8 +27,8 @@ pub struct Session<P: Plugin> {
 }
 
 impl<P: Plugin + 'static> Session<P> {
-    pub fn new() -> Self {
-        let plugin = P::new();
+    pub fn new(config: P::Config) -> Self {
+        let plugin = P::new(config);
         let recon = Recon::new(plugin.strategy(), P::primary);
         Session { plugin, recon }
     }
@@ -38,12 +39,12 @@ impl<P: Plugin + 'static> Session<P> {
         let table = Table::from_ipc(arrow, &P::describe()).map_err(DispatchError::Ingest)?;
         let mut seen: BTreeSet<ExtId> = BTreeSet::new();
         for i in 0..table.len() {
-            let rv = table.row(i);
-            let id = self.plugin.id(&rv);
+            let input = P::Input::from_view(&table.row(i));
+            let id = input.ext_id();
             if !seen.insert(id) {
                 return Err(DispatchError::DuplicateId(id));
             }
-            let row = self.plugin.project(&rv);
+            let row = self.plugin.project(&input);
             self.recon.upsert(id, row);
         }
         Ok(())
@@ -52,7 +53,7 @@ impl<P: Plugin + 'static> Session<P> {
 
 impl<P: Plugin + 'static> Default for Session<P> {
     fn default() -> Self {
-        Self::new()
+        Self::new(P::Config::default())
     }
 }
 
@@ -67,10 +68,18 @@ struct Envelope {
 
 impl Envelope {
     fn ok(report: Report) -> Self {
-        Envelope { ok: true, error: None, report: Some(report) }
+        Envelope {
+            ok: true,
+            error: None,
+            report: Some(report),
+        }
     }
     fn err(e: DispatchError) -> Self {
-        Envelope { ok: false, error: Some(e.wire()), report: None }
+        Envelope {
+            ok: false,
+            error: Some(e.wire()),
+            report: None,
+        }
     }
 }
 
@@ -142,18 +151,25 @@ impl From<ApiError> for DispatchError {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Cmd {
-    /// (Re)open the session and ingest any rows in the batch.
-    Init,
+    /// (Re)open the session with optional `config` and ingest any rows.
+    Init {
+        #[serde(default)]
+        config: Option<serde_json::Value>,
+    },
     /// Ingest more rows (carried in the Arrow batch).
     Upsert,
-    Remove { ids: Vec<ExtId> },
+    Remove {
+        ids: Vec<ExtId>,
+    },
     Solve,
     /// Pin proposed group(s): one group, every clean match, or named singletons.
     Pin {
         #[serde(flatten)]
         select: Select,
     },
-    Unpin { group_id: u64 },
+    Unpin {
+        group_id: u64,
+    },
     /// Assert a pinned group over exact allocation amounts.
     Merge {
         allocations: Vec<Allocation>,
@@ -163,9 +179,14 @@ enum Cmd {
         reason: Option<String>,
     },
     /// Pull row allocations out of a proposed group into singletons.
-    Detach { group_id: u64, ids: Vec<ExtId> },
+    Detach {
+        group_id: u64,
+        ids: Vec<ExtId>,
+    },
     /// Break a proposed group back into singletons.
-    Dissolve { group_id: u64 },
+    Dissolve {
+        group_id: u64,
+    },
     Report,
 }
 
@@ -180,14 +201,33 @@ enum Select {
 
 /// Run one command against the session slot. Generic over the plugin; the
 /// `export_plugin!` macro supplies the thread-local slot.
-pub fn dispatch<P: Plugin + 'static>(slot: &mut Option<Session<P>>, cmd_bytes: &[u8], arrow: &[u8]) -> Vec<u8> {
+pub fn dispatch<P: Plugin + 'static>(
+    slot: &mut Option<Session<P>>,
+    cmd_bytes: &[u8],
+    arrow: &[u8],
+) -> Vec<u8> {
     let cmd: Cmd = match serde_json::from_slice(cmd_bytes) {
         Ok(c) => c,
-        Err(e) => return enc(Envelope::err(DispatchError::BadCommand(format!("bad command json: {e}")))),
+        Err(e) => {
+            return enc(Envelope::err(DispatchError::BadCommand(format!(
+                "bad command json: {e}"
+            ))));
+        }
     };
 
-    if let Cmd::Init = cmd {
-        let mut session = Session::<P>::new();
+    if let Cmd::Init { config } = cmd {
+        let cfg: P::Config = match config {
+            Some(v) => match serde_json::from_value(v) {
+                Ok(c) => c,
+                Err(e) => {
+                    return enc(Envelope::err(DispatchError::BadCommand(format!(
+                        "bad init config: {e}"
+                    ))));
+                }
+            },
+            None => P::Config::default(),
+        };
+        let mut session = Session::<P>::new(cfg);
         if let Err(e) = session.feed(arrow) {
             return enc(Envelope::err(e));
         }
@@ -202,7 +242,7 @@ pub fn dispatch<P: Plugin + 'static>(slot: &mut Option<Session<P>>, cmd_bytes: &
     };
 
     let result: Result<(), DispatchError> = match cmd {
-        Cmd::Init => unreachable!(),
+        Cmd::Init { .. } => unreachable!(),
         Cmd::Upsert => session.feed(arrow),
         Cmd::Remove { ids } => {
             session.recon.remove(&ids);
@@ -216,19 +256,23 @@ pub fn dispatch<P: Plugin + 'static>(slot: &mut Option<Session<P>>, cmd_bytes: &
                 Ok(())
             }
             Select::Singletons { ids } => {
-                session.recon.pin_where(|g| g.is_singleton() && g.contains_any(&ids));
+                session
+                    .recon
+                    .pin_where(|g| g.is_singleton() && g.contains_any(&ids));
                 Ok(())
             }
         },
         Cmd::Unpin { group_id } => session.recon.unpin(group_id).map_err(Into::into),
-        Cmd::Merge { allocations, label, reason } => session
+        Cmd::Merge {
+            allocations,
+            label,
+            reason,
+        } => session
             .recon
             .merge(&allocations, label.as_deref().unwrap_or("manual"), reason)
             .map(|_| ())
             .map_err(Into::into),
-        Cmd::Detach { group_id, ids } => {
-            session.recon.detach(group_id, &ids).map_err(Into::into)
-        }
+        Cmd::Detach { group_id, ids } => session.recon.detach(group_id, &ids).map_err(Into::into),
         Cmd::Dissolve { group_id } => session.recon.dissolve(group_id).map_err(Into::into),
         Cmd::Report => Ok(()),
     };
@@ -261,7 +305,13 @@ pub fn alloc(len: u32) -> u32 {
 /// # Safety
 /// `ptr`/`len` must come from a prior [`alloc`] call.
 pub unsafe fn dealloc(ptr: u32, len: u32) {
-    unsafe { drop(Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize)) }
+    unsafe {
+        drop(Vec::from_raw_parts(
+            ptr as *mut u8,
+            len as usize,
+            len as usize,
+        ))
+    }
 }
 
 /// Borrow a host-provided buffer as a slice.
@@ -318,12 +368,16 @@ macro_rules! export_plugin {
         }
 
         #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn dispatch(ptr: u32, len: u32, arrow_ptr: u32, arrow_len: u32) -> u64 {
+        pub unsafe extern "C" fn dispatch(
+            ptr: u32,
+            len: u32,
+            arrow_ptr: u32,
+            arrow_len: u32,
+        ) -> u64 {
             let cmd = unsafe { $crate::sdk::abi::slice(ptr, len) };
             let arrow = unsafe { $crate::sdk::abi::slice(arrow_ptr, arrow_len) };
-            let out = __FLORECON_SESSION.with(|cell| {
-                $crate::sdk::abi::dispatch::<$t>(&mut cell.borrow_mut(), cmd, arrow)
-            });
+            let out = __FLORECON_SESSION
+                .with(|cell| $crate::sdk::abi::dispatch::<$t>(&mut cell.borrow_mut(), cmd, arrow));
             $crate::sdk::abi::ret_bytes(out)
         }
     };

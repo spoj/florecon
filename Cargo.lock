@@ -424,10 +424,20 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "csv",
+ "florecon-derive",
  "log",
  "parquet",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "florecon-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

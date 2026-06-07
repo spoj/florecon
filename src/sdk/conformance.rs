@@ -12,6 +12,7 @@ use crate::Report;
 use crate::recon::Recon;
 use crate::report::Status;
 use crate::sdk::plugin::Plugin;
+use crate::sdk::record::Record;
 use crate::sdk::table::Table;
 
 /// Canonical, label-free form of a report: each group as its sorted membership
@@ -23,7 +24,10 @@ type Canon = Vec<(String, i64, Status, Option<String>, Vec<(ExtId, i64)>)>;
 fn canon(report: &Report) -> Canon {
     let mut members: BTreeMap<u64, Vec<(ExtId, i64)>> = BTreeMap::new();
     for a in &report.allocations {
-        members.entry(a.group_id).or_default().push((a.id, a.amount));
+        members
+            .entry(a.group_id)
+            .or_default()
+            .push((a.id, a.amount));
     }
     let mut out: Canon = report
         .groups
@@ -41,15 +45,15 @@ fn canon(report: &Report) -> Canon {
 fn project_items<P: Plugin>(plugin: &P, table: &Table) -> Vec<(ExtId, P::Row)> {
     (0..table.len())
         .map(|i| {
-            let rv = table.row(i);
-            (plugin.id(&rv), plugin.project(&rv))
+            let input = P::Input::from_view(&table.row(i));
+            (input.ext_id(), plugin.project(&input))
         })
         .collect()
 }
 
 /// Cold load: upsert everything, then one solve.
 fn run_cold<P: Plugin + 'static>(items: &[(ExtId, P::Row)]) -> Report {
-    let plugin = P::new();
+    let plugin = P::new(P::Config::default());
     let mut recon = Recon::new(plugin.strategy(), P::primary);
     for (id, row) in items {
         recon.upsert(*id, row.clone());
@@ -60,7 +64,7 @@ fn run_cold<P: Plugin + 'static>(items: &[(ExtId, P::Row)]) -> Report {
 
 /// Warm load: ingest and solve in two interleaved halves.
 fn run_warm<P: Plugin + 'static>(items: &[(ExtId, P::Row)]) -> Report {
-    let plugin = P::new();
+    let plugin = P::new(P::Config::default());
     let mut recon = Recon::new(plugin.strategy(), P::primary);
     let mid = items.len() / 2;
     for (id, row) in &items[..mid] {
@@ -84,7 +88,7 @@ pub fn assert_conformance<P: Plugin + 'static>(arrow: &[u8]) {
         "describe() declares more than one amount() column"
     );
     let table = Table::from_ipc(arrow, &doc).expect("decode arrow batch");
-    let plugin = P::new();
+    let plugin = P::new(P::Config::default());
     let items = project_items::<P>(&plugin, &table);
 
     // Unique identity within the batch.
@@ -102,14 +106,26 @@ pub fn assert_conformance<P: Plugin + 'static>(arrow: &[u8]) {
     // Idempotent re-upsert: same ids overwrite, report is unchanged.
     let mut twice = items.clone();
     twice.extend(items.clone());
-    assert_eq!(canon(&run_cold::<P>(&twice)), cold_c, "re-upserting the same batch changed the report (unstable id)");
+    assert_eq!(
+        canon(&run_cold::<P>(&twice)),
+        cold_c,
+        "re-upserting the same batch changed the report (unstable id)"
+    );
 
     // Order independence: no positional identity.
     let mut reversed = items.clone();
     reversed.reverse();
-    assert_eq!(canon(&run_cold::<P>(&reversed)), cold_c, "row order changed the report (positional identity)");
+    assert_eq!(
+        canon(&run_cold::<P>(&reversed)),
+        cold_c,
+        "row order changed the report (positional identity)"
+    );
 
     // Warm == cold: incremental ingestion matches a cold load (up to ephemeral
     // group-id relabeling).
-    assert_eq!(canon(&run_warm::<P>(&items)), cold_c, "warm incremental result differs from cold (warm-start integrity)");
+    assert_eq!(
+        canon(&run_warm::<P>(&items)),
+        cold_c,
+        "warm incremental result differs from cold (warm-start integrity)"
+    );
 }

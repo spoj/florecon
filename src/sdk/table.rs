@@ -67,7 +67,10 @@ impl Table {
     /// empty table.
     pub fn from_ipc(bytes: &[u8], schema: &DescribeDoc) -> Result<Self, String> {
         if bytes.is_empty() {
-            return Ok(Table { cols: HashMap::new(), rows: 0 });
+            return Ok(Table {
+                cols: HashMap::new(),
+                rows: 0,
+            });
         }
         let reader = StreamReader::try_new(bytes, None).map_err(|e| e.to_string())?;
         let mut cols: HashMap<String, Column> = HashMap::new();
@@ -105,23 +108,32 @@ fn decode_column(
             let v: Vec<i64> = match arr.data_type() {
                 DataType::Int64 => {
                     let a = arr.as_primitive::<Int64Type>();
-                    (0..a.len()).map(|i| if a.is_null(i) { 0 } else { a.value(i) }).collect()
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { 0 } else { a.value(i) })
+                        .collect()
                 }
                 DataType::Int32 => {
                     let a = arr.as_primitive::<Int32Type>();
-                    (0..a.len()).map(|i| if a.is_null(i) { 0 } else { a.value(i) as i64 }).collect()
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { 0 } else { a.value(i) as i64 })
+                        .collect()
                 }
                 DataType::Date32 => {
                     let a = arr.as_primitive::<Date32Type>();
-                    (0..a.len()).map(|i| if a.is_null(i) { 0 } else { a.value(i) as i64 }).collect()
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { 0 } else { a.value(i) as i64 })
+                        .collect()
                 }
                 DataType::Date64 => {
                     let a = arr.as_primitive::<Date64Type>();
-                    (0..a.len()).map(|i| if a.is_null(i) { 0 } else { a.value(i) }).collect()
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { 0 } else { a.value(i) })
+                        .collect()
                 }
                 other => return Err(mismatch(other)),
             };
-            cols.entry(name.to_string()).or_insert_with(|| Column::I64(Vec::new()));
+            cols.entry(name.to_string())
+                .or_insert_with(|| Column::I64(Vec::new()));
             if let Some(Column::I64(dst)) = cols.get_mut(name) {
                 dst.extend(v);
             }
@@ -130,23 +142,32 @@ fn decode_column(
             let v: Vec<f64> = match arr.data_type() {
                 DataType::Float64 => {
                     let a = arr.as_primitive::<Float64Type>();
-                    (0..a.len()).map(|i| if a.is_null(i) { 0.0 } else { a.value(i) }).collect()
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { 0.0 } else { a.value(i) })
+                        .collect()
                 }
                 DataType::Float32 => {
                     let a = arr.as_primitive::<Float32Type>();
-                    (0..a.len()).map(|i| if a.is_null(i) { 0.0 } else { a.value(i) as f64 }).collect()
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { 0.0 } else { a.value(i) as f64 })
+                        .collect()
                 }
                 DataType::Int64 => {
                     let a = arr.as_primitive::<Int64Type>();
-                    (0..a.len()).map(|i| if a.is_null(i) { 0.0 } else { a.value(i) as f64 }).collect()
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { 0.0 } else { a.value(i) as f64 })
+                        .collect()
                 }
                 DataType::Int32 => {
                     let a = arr.as_primitive::<Int32Type>();
-                    (0..a.len()).map(|i| if a.is_null(i) { 0.0 } else { a.value(i) as f64 }).collect()
+                    (0..a.len())
+                        .map(|i| if a.is_null(i) { 0.0 } else { a.value(i) as f64 })
+                        .collect()
                 }
                 other => return Err(mismatch(other)),
             };
-            cols.entry(name.to_string()).or_insert_with(|| Column::F64(Vec::new()));
+            cols.entry(name.to_string())
+                .or_insert_with(|| Column::F64(Vec::new()));
             if let Some(Column::F64(dst)) = cols.get_mut(name) {
                 dst.extend(v);
             }
@@ -155,15 +176,32 @@ fn decode_column(
             let v: Vec<String> = match arr.data_type() {
                 DataType::Utf8 => {
                     let a = arr.as_string::<i32>();
-                    (0..a.len()).map(|i| if a.is_null(i) { String::new() } else { a.value(i).to_string() }).collect()
+                    (0..a.len())
+                        .map(|i| {
+                            if a.is_null(i) {
+                                String::new()
+                            } else {
+                                a.value(i).to_string()
+                            }
+                        })
+                        .collect()
                 }
                 DataType::LargeUtf8 => {
                     let a = arr.as_string::<i64>();
-                    (0..a.len()).map(|i| if a.is_null(i) { String::new() } else { a.value(i).to_string() }).collect()
+                    (0..a.len())
+                        .map(|i| {
+                            if a.is_null(i) {
+                                String::new()
+                            } else {
+                                a.value(i).to_string()
+                            }
+                        })
+                        .collect()
                 }
                 other => return Err(mismatch(other)),
             };
-            cols.entry(name.to_string()).or_insert_with(|| Column::Str(Vec::new()));
+            cols.entry(name.to_string())
+                .or_insert_with(|| Column::Str(Vec::new()));
             if let Some(Column::Str(dst)) = cols.get_mut(name) {
                 dst.extend(v);
             }

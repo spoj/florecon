@@ -8,30 +8,37 @@
 
 use std::hash::{Hash, Hasher};
 
+use serde::de::DeserializeOwned;
+
 use crate::ExtId;
-use crate::sdk::describe::DescribeDoc;
-use crate::sdk::table::RowView;
+use crate::sdk::describe::{DescribeDoc, Domain};
+use crate::sdk::record::Record;
 use crate::strategy::Strategy;
 
 /// A self-contained reconciliation domain, compiled to one wasm module.
 pub trait Plugin: Sized {
+    /// The raw host row, as a `#[derive(Record)]` struct: this single type is
+    /// the input schema (`describe()`), the typed projection, and the identity.
+    type Input: Record;
+
     /// The typed row the strategy matches on (the author's lanes).
     type Row: Clone + 'static;
 
-    /// Construct the plugin (load any baked-in reference data here).
-    fn new() -> Self;
+    /// Runtime configuration, deserialized from the `init` command's `config`
+    /// (tolerances, windows, toggles — *data*, tuned without recompiling). Use
+    /// `type Config = ()` when the plugin has none.
+    type Config: DeserializeOwned + Default;
 
-    /// Advertise the raw columns, numeraire, and identity to the host.
-    fn describe() -> DescribeDoc;
+    /// The domain identity and semantic version (drives `describe()`).
+    fn domain() -> Domain;
 
-    /// The stable external id of a row. Return the host's own stable id column
-    /// when the data carries one, or derive one deterministically with
-    /// [`hash_key`] over the natural key. MUST be unique per logical row —
-    /// warm-start and frozen decisions key off it.
-    fn id(&self, row: &RowView<'_>) -> ExtId;
+    /// Construct the plugin from its runtime config (load baked-in reference
+    /// data, precompute tolerances from `config`, …).
+    fn new(config: Self::Config) -> Self;
 
-    /// Row-local: derive the typed match lanes. Deterministic, no other rows.
-    fn project(&self, row: &RowView<'_>) -> Self::Row;
+    /// Row-local: derive the typed match lanes from the typed input record.
+    /// Deterministic, no other rows.
+    fn project(&self, input: &Self::Input) -> Self::Row;
 
     /// The conserved numeraire (single, signed, minor units). This is what
     /// [`Recon`](crate::Recon) conserves and may be *derived* from several
@@ -39,8 +46,15 @@ pub trait Plugin: Sized {
     /// [`amount`](crate::sdk::Field::amount) column, which is only a UI hint.
     fn primary(row: &Self::Row) -> i64;
 
-    /// The matching cascade.
+    /// The matching cascade (may read `self`, hence the runtime config).
     fn strategy(&self) -> Box<dyn Strategy<Self::Row>>;
+
+    /// The self-description shipped to the host: assembled from [`domain`] and
+    /// the [`Input`](Self::Input) schema. Provided — authors never write it.
+    fn describe() -> DescribeDoc {
+        let d = Self::domain();
+        DescribeDoc::new(&d.id, &d.version).input(Self::Input::fields())
+    }
 }
 
 /// A stable FNV-1a hasher, so `ext_id` is reproducible across builds and hosts

@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 // strategy leaf, so it lives here as one strategy among many. Kept in its own
 // file; `flow::Group` stays distinct from this module's own `Group`.
 pub mod flow;
-pub use flow::{flow, Allocation, ExtId, FlowSpec};
+pub use flow::{Allocation, ExtId, FlowSpec, flow};
 
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -103,7 +103,11 @@ impl Group {
 
     /// Largest member allocation magnitude (the dominant leg).
     pub fn max_abs(&self) -> i64 {
-        self.members.iter().map(|a| a.amount.abs()).max().unwrap_or(0)
+        self.members
+            .iter()
+            .map(|a| a.amount.abs())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Smallest non-zero member allocation magnitude; `0` if every leg is zero.
@@ -419,7 +423,10 @@ fn group_components(groups: &[Group]) -> Vec<Vec<usize>> {
         }
         buckets.entry(r).or_default().push(gi);
     }
-    order.into_iter().map(|r| buckets.remove(&r).unwrap()).collect()
+    order
+        .into_iter()
+        .map(|r| buckets.remove(&r).unwrap())
+        .collect()
 }
 
 impl<E> Strategy<E> for Coalesce<E> {
@@ -1825,7 +1832,10 @@ mod tests {
         let r = s.run(b);
         conserves(3, &r);
         assert_eq!(r.groups.len(), 1);
-        assert_eq!(r.groups[0].reason.as_deref(), Some("S3a exact: exact 1:1 pair"));
+        assert_eq!(
+            r.groups[0].reason.as_deref(),
+            Some("S3a exact: exact 1:1 pair")
+        );
         // The leftover row is residual, not a group, so it carries no label.
         assert_eq!(r.residual.len(), 1);
         assert_eq!(r.residual[0].id, 3);
@@ -1837,7 +1847,10 @@ mod tests {
         let b = bag(&[(1, 5), (2, -5)]);
         let mut s = labeled("outer", labeled("inner", exact_1to1(|_| Some(0))));
         let r = s.run(b);
-        assert_eq!(r.groups[0].reason.as_deref(), Some("outer: inner: exact 1:1 pair"));
+        assert_eq!(
+            r.groups[0].reason.as_deref(),
+            Some("outer: inner: exact 1:1 pair")
+        );
     }
 
     #[test]
@@ -1869,7 +1882,11 @@ mod tests {
     #[test]
     fn signal_groups_net_and_cascade() {
         let b = bag(&[(1, 50), (2, -50), (3, 9)]);
-        let mut s = signal_group(|a: &i64| if *a == 9 { vec![] } else { vec![10] }, Tol::Abs(0), 16);
+        let mut s = signal_group(
+            |a: &i64| if *a == 9 { vec![] } else { vec![10] },
+            Tol::Abs(0),
+            16,
+        );
         let r = s.run(b);
         conserves(3, &r);
         assert_eq!(r.groups.len(), 1);
@@ -1910,17 +1927,31 @@ mod tests {
                         let mut members = Vec::new();
                         for (k, item) in bag.into_iter().enumerate() {
                             if k == i || k == j {
-                                members.push(Allocation { id: item.id, amount: item.amount });
+                                members.push(Allocation {
+                                    id: item.id,
+                                    amount: item.amount,
+                                });
                             } else {
                                 residual.push(item);
                             }
                         }
-                        let g = Group { members, origin: "onepair".into(), net: 0, reason: None };
-                        return Resolution { groups: vec![g], residual };
+                        let g = Group {
+                            members,
+                            origin: "onepair".into(),
+                            net: 0,
+                            reason: None,
+                        };
+                        return Resolution {
+                            groups: vec![g],
+                            residual,
+                        };
                     }
                 }
             }
-            Resolution { groups: vec![], residual: bag }
+            Resolution {
+                groups: vec![],
+                residual: bag,
+            }
         }
     }
 
@@ -2096,7 +2127,15 @@ mod tests {
     fn accept_if_size_cap_and_minority_side() {
         // A big one-to-many group (1 vs 4) and a clean small pair. Reject groups
         // bigger than 3 lots; the small pair survives, the big group dissolves.
-        let b = bag(&[(1, 40), (2, -10), (3, -10), (4, -10), (5, -10), (6, 8), (7, -8)]);
+        let b = bag(&[
+            (1, 40),
+            (2, -10),
+            (3, -10),
+            (4, -10),
+            (5, -10),
+            (6, 8),
+            (7, -8),
+        ]);
         let mut s = accept_if(
             |g: &Group| g.members.len() <= 3,
             agg_net(|a: &i64| if a.unsigned_abs() == 8 { 1u64 } else { 0u64 }, 0),
@@ -2114,8 +2153,7 @@ mod tests {
     struct EmitGroups(Vec<Vec<(ExtId, i64)>>);
     impl Strategy<i64> for EmitGroups {
         fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
-            let claimed: BTreeSet<ExtId> =
-                self.0.iter().flatten().map(|&(id, _)| id).collect();
+            let claimed: BTreeSet<ExtId> = self.0.iter().flatten().map(|&(id, _)| id).collect();
             let groups = self
                 .0
                 .iter()
@@ -2129,7 +2167,10 @@ mod tests {
                     reason: None,
                 })
                 .collect();
-            let residual = bag.into_iter().filter(|i| !claimed.contains(&i.id)).collect();
+            let residual = bag
+                .into_iter()
+                .filter(|i| !claimed.contains(&i.id))
+                .collect();
             Resolution { groups, residual }
         }
     }
@@ -2222,8 +2263,14 @@ mod tests {
         fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
             let g = Group {
                 members: vec![
-                    Allocation { id: 1, amount: self.matched },
-                    Allocation { id: 2, amount: -self.matched },
+                    Allocation {
+                        id: 1,
+                        amount: self.matched,
+                    },
+                    Allocation {
+                        id: 2,
+                        amount: -self.matched,
+                    },
                 ],
                 origin: "partial".into(),
                 net: 0,
@@ -2282,12 +2329,32 @@ mod tests {
     fn snap_tol_scales_with_the_row_original() {
         // Relative Tol measures the tail against the row's own `original`. A 20
         // tail on a 100 line is 20%: below 30% it absorbs, above 10% it does not.
-        let mut s = snap(Tol::Rel { bps: 3000, floor: 0 }, Box::new(Partial { matched: 80 }));
+        let mut s = snap(
+            Tol::Rel {
+                bps: 3000,
+                floor: 0,
+            },
+            Box::new(Partial { matched: 80 }),
+        );
         let r = s.run(bag(&[(1, 100), (2, -80)]));
-        assert_eq!(r.groups[0].members.iter().find(|a| a.id == 1).unwrap().amount, 100);
+        assert_eq!(
+            r.groups[0]
+                .members
+                .iter()
+                .find(|a| a.id == 1)
+                .unwrap()
+                .amount,
+            100
+        );
         assert!(r.residual.is_empty(), "20% tail under 30% -> absorbed");
 
-        let mut s = snap(Tol::Rel { bps: 1000, floor: 0 }, Box::new(Partial { matched: 80 }));
+        let mut s = snap(
+            Tol::Rel {
+                bps: 1000,
+                floor: 0,
+            },
+            Box::new(Partial { matched: 80 }),
+        );
         let r = s.run(bag(&[(1, 100), (2, -80)]));
         assert_eq!(r.residual.len(), 1, "20% tail over 10% -> left split");
         assert_eq!(r.residual[0].amount, 20);
@@ -2354,10 +2421,7 @@ mod tests {
 
         // Group retains only Z at 50; the phantom 0-mass X edge is gone.
         assert_eq!(r.groups.len(), 1);
-        assert_eq!(
-            r.groups[0].members,
-            vec![Allocation { id: 2, amount: 50 }]
-        );
+        assert_eq!(r.groups[0].members, vec![Allocation { id: 2, amount: 50 }]);
 
         // Residual: X whole at 1 (conservation preserved), Z remainder at 50.
         let mut res: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
@@ -2397,7 +2461,11 @@ mod tests {
         conserves(3, &r);
         // Two soaked singletons, one material lot left as residual.
         assert_eq!(r.groups.len(), 2);
-        assert!(r.groups.iter().all(|g| g.members.len() == 1 && g.origin == "rounding"));
+        assert!(
+            r.groups
+                .iter()
+                .all(|g| g.members.len() == 1 && g.origin == "rounding")
+        );
         assert_eq!(r.residual.len(), 1);
         assert_eq!(r.residual[0].id, 3);
     }
@@ -2406,8 +2474,18 @@ mod tests {
     fn soak_small_bps_against_original() {
         // amount 10 on an original of 1000 = 100 bps (1%); soak under 200 bps.
         let items = vec![
-            Item { id: 1, original: 1000, amount: 10, data: 0 }, // immaterial: 100 bps
-            Item { id: 2, original: 1000, amount: 50, data: 0 }, // material:   500 bps
+            Item {
+                id: 1,
+                original: 1000,
+                amount: 10,
+                data: 0,
+            }, // immaterial: 100 bps
+            Item {
+                id: 2,
+                original: 1000,
+                amount: 50,
+                data: 0,
+            }, // material:   500 bps
         ];
         let mut s = soak_small(
             Tol::Rel { bps: 200, floor: 0 },
@@ -2509,9 +2587,15 @@ mod tests {
         // 1_200} bucket. tol = 5bps, $1.00 floor.
         let g = group(&[(1, 1_000_000), (2, -999_000), (3, -1_200)]);
         // Rel scales off the smallest leg (1_200): slack = max(100, 0) = 100.
-        assert!(!g.clean(Tol::Rel { bps: 5, floor: 100 }), "200 > 100 -> dirty");
+        assert!(
+            !g.clean(Tol::Rel { bps: 5, floor: 100 }),
+            "200 > 100 -> dirty"
+        );
         // RelMax scales off the largest leg (1_000_000): slack = max(100, 500).
-        assert!(g.clean(Tol::RelMax { bps: 5, floor: 100 }), "200 <= 500 -> clean");
+        assert!(
+            g.clean(Tol::RelMax { bps: 5, floor: 100 }),
+            "200 <= 500 -> clean"
+        );
         // Abs ignores the legs entirely.
         assert!(g.clean(Tol::Abs(200)));
         assert!(!g.clean(Tol::Abs(199)));

@@ -33,13 +33,25 @@ pub struct Field {
 
 impl Field {
     pub fn int(name: &str) -> Self {
-        Field { name: name.into(), ty: FieldType::I64, amount: false }
+        Field {
+            name: name.into(),
+            ty: FieldType::I64,
+            amount: false,
+        }
     }
     pub fn float(name: &str) -> Self {
-        Field { name: name.into(), ty: FieldType::F64, amount: false }
+        Field {
+            name: name.into(),
+            ty: FieldType::F64,
+            amount: false,
+        }
     }
     pub fn text(name: &str) -> Self {
-        Field { name: name.into(), ty: FieldType::Utf8, amount: false }
+        Field {
+            name: name.into(),
+            ty: FieldType::Utf8,
+            amount: false,
+        }
     }
     /// Mark this column as the host's headline display amount.
     pub fn amount(mut self) -> Self {
@@ -52,6 +64,16 @@ impl Field {
 pub struct Domain {
     pub id: String,
     pub version: String,
+}
+
+impl Domain {
+    /// A domain identity `id` at semantic `version` (e.g. `"florecon.intercompany"`, `"1.0.0"`).
+    pub fn new(id: &str, version: &str) -> Self {
+        Domain {
+            id: id.into(),
+            version: version.into(),
+        }
+    }
 }
 
 /// The full self-description a plugin returns from `describe()`.
@@ -68,7 +90,10 @@ impl DescribeDoc {
     pub fn new(id: &str, version: &str) -> Self {
         DescribeDoc {
             abi_version: ABI_VERSION,
-            domain: Domain { id: id.into(), version: version.into() },
+            domain: Domain {
+                id: id.into(),
+                version: version.into(),
+            },
             input: Vec::new(),
             report_schema: 1,
         }
@@ -82,6 +107,9 @@ impl DescribeDoc {
 
     /// The name of the declared headline-amount column, if any.
     pub fn amount_field(&self) -> Option<&str> {
-        self.input.iter().find(|f| f.amount).map(|f| f.name.as_str())
+        self.input
+            .iter()
+            .find(|f| f.amount)
+            .map(|f| f.name.as_str())
     }
 }

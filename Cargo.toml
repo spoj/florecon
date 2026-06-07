@@ -17,12 +17,13 @@ log = "0.4"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 arrow = { version = "53", default-features = false, features = ["ipc"], optional = true }
+florecon-derive = { version = "0.1", path = "florecon-derive", optional = true }
 
 [features]
 serde = ["dep:serde", "dep:serde_json"]
 # The plugin authoring SDK: columnar Arrow Table, Plugin trait, DescribeDoc,
-# the wasm ABI driver + export_plugin! macro, and the conformance kit.
-sdk = ["serde", "dep:arrow"]
+# derive(Record), the wasm ABI driver + export_plugin! macro, and conformance.
+sdk = ["serde", "dep:arrow", "dep:florecon-derive"]
 
 [dev-dependencies]
 csv = "1.3"
@@ -30,7 +31,7 @@ parquet = "53.0"
 serde_json = "1"
 
 [workspace]
-members = [".", "plugins/interco"]
+members = [".", "florecon-derive", "plugins/interco"]
 
 [profile.release]
 opt-level = "z"

@@ -31,10 +31,7 @@ pub enum ApiError {
         available: i64,
     },
     /// A group does not contain a live allocation for the requested row id.
-    UnknownAllocation {
-        group_id: u64,
-        id: ExtId,
-    },
+    UnknownAllocation { group_id: u64, id: ExtId },
 }
 
 impl ApiError {

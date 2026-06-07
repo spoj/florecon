@@ -22,7 +22,7 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field as AField, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use florecon::sdk::Session;
 use interco_plugin::IntercoPlugin;
@@ -39,8 +39,24 @@ struct Row {
     reference: &'static str,
 }
 
-fn row(id: i64, co: &'static str, icp: &'static str, objsub: &'static str, usd: f64, gl: i64, reference: &'static str) -> Row {
-    Row { id, co, icp, objsub, usd, gl, reference }
+fn row(
+    id: i64,
+    co: &'static str,
+    icp: &'static str,
+    objsub: &'static str,
+    usd: f64,
+    gl: i64,
+    reference: &'static str,
+) -> Row {
+    Row {
+        id,
+        co,
+        icp,
+        objsub,
+        usd,
+        gl,
+        reference,
+    }
 }
 
 /// Encode rows as an Arrow IPC stream over the interco input schema.
@@ -68,17 +84,33 @@ fn ipc(rows: &[Row]) -> Vec<u8> {
     let batch = RecordBatch::try_new(
         Arc::new(schema),
         vec![
-            Arc::new(Int64Array::from(rows.iter().map(|r| r.id).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|r| r.co).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|r| r.icp).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(rows.iter().map(|r| r.objsub).collect::<Vec<_>>())),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.usd).collect::<Vec<_>>())),
-            Arc::new(Int64Array::from(rows.iter().map(|r| r.gl).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.co).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.icp).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.objsub).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.usd).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.gl).collect::<Vec<_>>(),
+            )),
             Arc::new(StringArray::from(vec!["USD"; n])),
             Arc::new(StringArray::from(vec!["USD"; n])),
-            Arc::new(Float64Array::from(rows.iter().map(|r| r.usd.abs()).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.usd.abs()).collect::<Vec<_>>(),
+            )),
             Arc::new(Float64Array::from(vec![0.0; n])),
-            Arc::new(StringArray::from(rows.iter().map(|r| r.reference).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.reference).collect::<Vec<_>>(),
+            )),
             Arc::new(blank.clone()),
             Arc::new(blank.clone()),
             Arc::new(blank.clone()),
@@ -103,7 +135,12 @@ fn normalize(mut env: Value) -> Value {
             groups.sort_by_key(|g| g["group_id"].as_u64().unwrap_or(0));
         }
         if let Some(allocs) = report.get_mut("allocations").and_then(|v| v.as_array_mut()) {
-            allocs.sort_by_key(|a| (a["group_id"].as_u64().unwrap_or(0), a["id"].as_u64().unwrap_or(0)));
+            allocs.sort_by_key(|a| {
+                (
+                    a["group_id"].as_u64().unwrap_or(0),
+                    a["id"].as_u64().unwrap_or(0),
+                )
+            });
         }
     }
     env
@@ -147,35 +184,88 @@ fn run_script() -> Vec<Step> {
         if env.get("report").is_some() {
             *last = env.clone();
         }
-        steps.push(Step { name, cmd, arrow, envelope: env });
+        steps.push(Step {
+            name,
+            cmd,
+            arrow,
+            envelope: env,
+        });
     };
 
     let r = |id, co, icp, obj, usd, gl, rf| row(id, co, icp, obj, usd, gl, rf);
 
-    step(&mut slot, &mut last, "init", json!({"op": "init"}),
-        Some(ipc(&[r(1, "A", "B", "100", 100.0, 10, "INV-AAAA-1"),
-                   r(2, "B", "A", "100", -100.0, 11, "INV-AAAA-1")])));
+    step(
+        &mut slot,
+        &mut last,
+        "init",
+        json!({"op": "init"}),
+        Some(ipc(&[
+            r(1, "A", "B", "100", 100.0, 10, "INV-AAAA-1"),
+            r(2, "B", "A", "100", -100.0, 11, "INV-AAAA-1"),
+        ])),
+    );
     step(&mut slot, &mut last, "solve", json!({"op": "solve"}), None);
-    step(&mut slot, &mut last, "upsert", json!({"op": "upsert"}),
-        Some(ipc(&[r(3, "A", "B", "200", 50.0, 20, "INV-BBBB-2"),
-                   r(4, "B", "A", "200", -50.0, 22, "INV-BBBB-2")])));
+    step(
+        &mut slot,
+        &mut last,
+        "upsert",
+        json!({"op": "upsert"}),
+        Some(ipc(&[
+            r(3, "A", "B", "200", 50.0, 20, "INV-BBBB-2"),
+            r(4, "B", "A", "200", -50.0, 22, "INV-BBBB-2"),
+        ])),
+    );
     step(&mut slot, &mut last, "solve", json!({"op": "solve"}), None);
-    step(&mut slot, &mut last, "remove", json!({"op": "remove", "ids": [4]}), None);
+    step(
+        &mut slot,
+        &mut last,
+        "remove",
+        json!({"op": "remove", "ids": [4]}),
+        None,
+    );
     step(&mut slot, &mut last, "solve", json!({"op": "solve"}), None);
-    step(&mut slot, &mut last, "pin_clean", json!({"op": "pin", "by": "clean", "tol": 0}), None);
+    step(
+        &mut slot,
+        &mut last,
+        "pin_clean",
+        json!({"op": "pin", "by": "clean", "tol": 0}),
+        None,
+    );
     step(&mut slot, &mut last, "solve", json!({"op": "solve"}), None);
 
     // The typed-error vector: dissolving a pinned group must be refused.
     let pinned = gid_of(&last, 1);
-    step(&mut slot, &mut last, "dissolve_pinned_err",
-        json!({"op": "dissolve", "group_id": pinned}), None);
+    step(
+        &mut slot,
+        &mut last,
+        "dissolve_pinned_err",
+        json!({"op": "dissolve", "group_id": pinned}),
+        None,
+    );
 
-    step(&mut slot, &mut last, "readd", json!({"op": "upsert"}),
-        Some(ipc(&[r(4, "B", "A", "200", -50.0, 22, "INV-BBBB-2")])));
+    step(
+        &mut slot,
+        &mut last,
+        "readd",
+        json!({"op": "upsert"}),
+        Some(ipc(&[r(4, "B", "A", "200", -50.0, 22, "INV-BBBB-2")])),
+    );
     step(&mut slot, &mut last, "solve", json!({"op": "solve"}), None);
     let g34 = gid_of(&last, 3);
-    step(&mut slot, &mut last, "dissolve", json!({"op": "dissolve", "group_id": g34}), None);
-    step(&mut slot, &mut last, "report", json!({"op": "report"}), None);
+    step(
+        &mut slot,
+        &mut last,
+        "dissolve",
+        json!({"op": "dissolve", "group_id": g34}),
+        None,
+    );
+    step(
+        &mut slot,
+        &mut last,
+        "report",
+        json!({"op": "report"}),
+        None,
+    );
 
     steps
 }
@@ -232,7 +322,10 @@ fn golden_vectors() {
         }),
     )
     .unwrap();
-    assert_eq!(want, manifest, "wire drift vs committed golden; regenerate with UPDATE_GOLDEN=1 if intentional");
+    assert_eq!(
+        want, manifest,
+        "wire drift vs committed golden; regenerate with UPDATE_GOLDEN=1 if intentional"
+    );
 
     // The committed arrow fixtures must be exactly what the script ships, since
     // the Python host replays those bytes, not freshly-built ones.

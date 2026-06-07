@@ -15,12 +15,17 @@ pub mod abi;
 pub mod conformance;
 mod describe;
 mod plugin;
+mod record;
 mod table;
 
 pub use abi::Session;
 pub use describe::{DescribeDoc, Domain, Field, FieldType};
 pub use plugin::{Plugin, StableHasher, hash_key};
+pub use record::Record;
 pub use table::{RowView, Table};
+
+/// `#[derive(Record)]` — one struct as schema + projection + identity.
+pub use florecon_derive::Record;
 
 /// FNV-1a of a category string to a signed id lane (re-exported for plugins).
 pub use crate::token::cat;

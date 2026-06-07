@@ -21,6 +21,11 @@ class ContractMismatch(RuntimeError):
     """The plugin wasm speaks a different ABI than this host."""
 
 
+class SchemaError(RuntimeError):
+    """A dataframe handed to :meth:`Workspace.upsert` does not match the
+    plugin's declared input schema (a column is missing or uncastable)."""
+
+
 class PluginError(RuntimeError):
     """A typed failure returned by the plugin's dispatch envelope.
 
@@ -115,17 +120,21 @@ class Workspace:
     """An interactive reconciliation session over one plugin.
 
     The plugin owns the domain (preprocessing, identity, matching). The host
-    just ships the raw columns the plugin's ``describe()`` declares, as rows of
-    ``{column: value}`` dicts, and drives the lifecycle (``pin``/``unpin``) and
+    just ships the raw columns the plugin's ``describe()`` declares — as a
+    **dataframe** (polars / pandas / pyarrow) whose columns are validated and
+    cast against that schema — and drives the lifecycle (``pin``/``unpin``) and
     partition (``merge``/``detach``/``dissolve``) verbs. State lives in the wasm
     module, so repeated :meth:`solve` calls warm re-solve.
+
+    ``config`` (a JSON-able dict) is handed to the plugin at ``init`` — runtime
+    tunables (tolerances, windows) the plugin reads, so tuning needs no rebuild.
 
     A group lives on a lifecycle axis: ``proposed`` groups are the solver's
     current opinion (recomputed each :meth:`solve`); ``pinned`` groups are your
     decisions, kept verbatim across solves.
     """
 
-    def __init__(self, wasm_path=None, _engine: Florecon = None):
+    def __init__(self, wasm_path=None, _engine: Florecon = None, config: dict = None):
         self.fe = _engine or Florecon(wasm_path)
         self.spec = self.fe.describe()
         self.fields = self.spec["input"]
@@ -137,28 +146,68 @@ class Workspace:
         self._schema = pa.schema(
             [pa.field(f["name"], _PA_TYPE[f["type"]]) for f in self.fields]
         )
-        self.last = self.fe.dispatch({"op": "init"}, _ipc(self._batch([])))
+        init_cmd = {"op": "init"}
+        if config is not None:
+            init_cmd["config"] = config
+        self.last = self.fe.dispatch(init_cmd, _ipc(self._empty_batch()))
         _ok(self.last)
 
-    def _batch(self, rows) -> "pa.RecordBatch":
-        """Build an Arrow batch of the declared columns from ``{col: value}``
-        rows. A zero-row batch still carries the full schema."""
+    # --- schema bridge -------------------------------------------------------
+
+    def _empty_batch(self) -> "pa.RecordBatch":
+        """A zero-row batch carrying the declared schema (used by ``init``)."""
+        arrays = [pa.array([], type=_PA_TYPE[f["type"]]) for f in self.fields]
+        return pa.RecordBatch.from_arrays(arrays, schema=self._schema)
+
+    @staticmethod
+    def _as_table(frame) -> "pa.Table":
+        """Normalize a polars / pandas / pyarrow frame to a pyarrow Table."""
+        if isinstance(frame, pa.Table):
+            return frame
+        if isinstance(frame, pa.RecordBatch):
+            return pa.Table.from_batches([frame])
+        mod = type(frame).__module__.split(".", 1)[0]
+        if mod == "polars" and hasattr(frame, "to_arrow"):
+            return frame.to_arrow()
+        if mod == "pandas":
+            return pa.Table.from_pandas(frame, preserve_index=False)
+        raise TypeError(
+            f"upsert expects a polars/pandas/pyarrow dataframe, got {type(frame).__name__}"
+        )
+
+    def _batch(self, frame) -> "pa.RecordBatch":
+        """Validate a frame against the declared schema and project it to the
+        declared columns (extra columns ignored), cast to the declared types."""
+        table = self._as_table(frame)
+        present = set(table.column_names)
+        missing = [f["name"] for f in self.fields if f["name"] not in present]
+        if missing:
+            raise SchemaError(
+                f"dataframe is missing columns declared by {self.domain.get('id')}: {missing}"
+            )
         arrays = []
         for f in self.fields:
-            ty = _PA_TYPE[f["type"]]
-            lane = [r.get(f["name"]) for r in rows]
-            arrays.append(pa.array(lane, type=ty))
+            arr = table.column(f["name"]).combine_chunks()
+            try:
+                arr = arr.cast(_PA_TYPE[f["type"]])
+            except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as e:
+                raise SchemaError(
+                    f"column {f['name']!r}: cannot cast {arr.type} -> {f['type']}: {e}"
+                ) from e
+            arrays.append(arr)
         return pa.RecordBatch.from_arrays(arrays, schema=self._schema)
 
     # --- ledger --------------------------------------------------------------
 
-    def upsert(self, *rows) -> "Workspace":
-        """Insert/replace rows. Each row is a ``{column: value}`` dict using the
-        plugin's declared raw column names."""
-        rows = list(rows)
-        if rows:
-            self.last = self.fe.dispatch({"op": "upsert"}, _ipc(self._batch(rows)))
-            _ok(self.last)
+    def upsert(self, *frames) -> "Workspace":
+        """Insert/replace rows from one or more dataframes (polars / pandas /
+        pyarrow). Each frame must carry the plugin's declared raw columns;
+        extra columns are ignored, declared columns are cast to their wire type."""
+        for frame in frames:
+            batch = self._batch(frame)
+            if batch.num_rows:
+                self.last = self.fe.dispatch({"op": "upsert"}, _ipc(batch))
+                _ok(self.last)
         return self
 
     def remove(self, *ids: int) -> "Workspace":

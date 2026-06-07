@@ -30,7 +30,10 @@ pub struct GroupOut {
     pub status: Status,
     /// Optional human-facing explanation of why the group formed (the plan's
     /// author label), distinct from the machine `origin`. `None` when unlabeled.
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub reason: Option<String>,
 }
 

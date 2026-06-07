@@ -13,6 +13,8 @@ Exits non-zero with a clear message on any regression.
 import pathlib
 import sys
 
+import pyarrow as pa
+
 from florecon import Workspace
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -47,7 +49,7 @@ def matched_pair(rep, a, b):
 
 
 def line(row_id, co, icp, objsub, usd, day, ref):
-    """One ledger line as the raw columns the plugin declared."""
+    """One ledger line as the full set of raw columns the plugin declared."""
     return {
         "row_id": row_id,
         "company": co,
@@ -55,10 +57,22 @@ def line(row_id, co, icp, objsub, usd, day, ref):
         "objsub": objsub,
         "indicative_usd_amt": usd,
         "gl_date": day,
+        "base_currency": "USD",
         "trx_currency": "USD",
         "trx_amt": abs(usd),
+        "fc_amt": 0.0,
         "reference": ref,
+        "reference2": "",
+        "description": "",
+        "name_remark_explanation": "",
+        "invoice_no": "",
+        "is_offset": 0,
     }
+
+
+def frame(*rows):
+    """The raw ledger lines as one dataframe (the only upsert interface)."""
+    return pa.Table.from_pylist(list(rows))
 
 
 if not WASM.exists():
@@ -71,16 +85,20 @@ check(ws.domain.get("id") == "florecon.intercompany", "host should discover the 
 
 # --- first invoice pair: opposite books, shared reference, nets clean --------
 ws.upsert(
-    line(1, "A", "B", "61500", 100.0, 0, "INV0001"),
-    line(2, "B", "A", "61500", -100.0, 1, "INV0001"),
+    frame(
+        line(1, "A", "B", "61500", 100.0, 0, "INV0001"),
+        line(2, "B", "A", "61500", -100.0, 1, "INV0001"),
+    )
 )
 rep = ws.solve()
 check(matched_pair(rep, 1, 2), "first invoice pair (1,2) should net to a matched group")
 
 # --- stream a second pair in and WARM re-solve -------------------------------
 ws.upsert(
-    line(3, "A", "B", "61600", 250.0, 2, "INV0009"),
-    line(4, "B", "A", "61600", -250.0, 3, "INV0009"),
+    frame(
+        line(3, "A", "B", "61600", 250.0, 2, "INV0009"),
+        line(4, "B", "A", "61600", -250.0, 3, "INV0009"),
+    )
 )
 rep = ws.solve()
 check(matched_pair(rep, 1, 2), "original pair (1,2) must stay matched after warm re-solve")
@@ -105,7 +123,7 @@ check(g12 is not None and g12["status"] == "pinned" and g12["size"] >= 2,
       "pinned (1,2) group must survive a subsequent solve")
 
 # --- re-add the partner, re-match, then dissolve the proposed group ----------
-ws.upsert(line(4, "B", "A", "61600", -250.0, 3, "INV0009"))
+ws.upsert(frame(line(4, "B", "A", "61600", -250.0, 3, "INV0009")))
 rep = ws.solve()
 check(matched_pair(rep, 3, 4), "re-adding row 4 must re-form the (3,4) match on warm re-solve")
 ws.dissolve(gid_of(rep, 3))

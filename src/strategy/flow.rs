@@ -265,7 +265,14 @@ impl<E> Flow<E> {
             self.index_match_keys(id, &keys);
             self.entries.insert(
                 id,
-                Entry { node, tx, key, base, keys, arcs: Vec::new() },
+                Entry {
+                    node,
+                    tx,
+                    key,
+                    base,
+                    keys,
+                    arcs: Vec::new(),
+                },
             );
             self.generate_arcs(id);
         }
@@ -688,7 +695,11 @@ mod tests {
         assert_eq!(g.net, 0);
         assert_eq!(g.members.iter().map(|a| a.amount).sum::<i64>(), 0);
         assert_eq!(
-            g.members.iter().filter(|a| a.amount > 0).map(|a| a.amount).sum::<i64>(),
+            g.members
+                .iter()
+                .filter(|a| a.amount > 0)
+                .map(|a| a.amount)
+                .sum::<i64>(),
             250
         );
         assert_eq!(ids(g), vec![1, 2, 3]);
@@ -711,10 +722,18 @@ mod tests {
     fn correction_reprice_is_warm() {
         let mut s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0), item(3, -50, 0)]);
-        assert!(r.groups.iter().any(|g| ids(g).contains(&1) && ids(g).contains(&2)));
+        assert!(
+            r.groups
+                .iter()
+                .any(|g| ids(g).contains(&1) && ids(g).contains(&2))
+        );
         // Correct id 1 down to 50 -> now prefers matching id 3.
         let r = s.run(vec![item(1, 50, 0), item(2, -100, 0), item(3, -50, 0)]);
-        assert!(r.groups.iter().any(|g| g.net == 0 && ids(g).contains(&1) && ids(g).contains(&3)));
+        assert!(
+            r.groups
+                .iter()
+                .any(|g| g.net == 0 && ids(g).contains(&1) && ids(g).contains(&3))
+        );
     }
 
     #[test]
