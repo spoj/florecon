@@ -17,6 +17,35 @@ def strict_assignments(report: dict) -> list[tuple[int, int]]:
     return out
 
 
+def primary_assignments(report: dict, policy: str = "largest_abs") -> list[tuple[int, int]]:
+    """Return one (row id, group id) per row, choosing a primary group when a
+    row is split across several (lot strategies). ``policy`` is one of
+    ``largest_abs`` (default), ``prefer_clean``, or ``first_group``.
+
+    Unlike :func:`strict_assignments` this never raises — use it for row-level
+    exports where every row needs exactly one home.
+    """
+    by_id: dict[int, list[dict]] = {}
+    for a in report.get("allocations", []):
+        by_id.setdefault(int(a["id"]), []).append(a)
+    groups = {int(g["group_id"]): g for g in report.get("groups", [])}
+
+    def score(a: dict):
+        g = groups.get(int(a["group_id"]), {})
+        clean = 1 if abs(int(g.get("net", 0))) == 0 else 0
+        if policy == "first_group":
+            return (-int(a["group_id"]),)
+        if policy == "prefer_clean":
+            return (clean, abs(int(a["amount"])), -int(a["group_id"]))
+        return (abs(int(a["amount"])), clean, -int(a["group_id"]))
+
+    out = []
+    for id_, allocs in sorted(by_id.items()):
+        best = max(allocs, key=score)
+        out.append((id_, int(best["group_id"])))
+    return out
+
+
 def connected_components(report: dict) -> list[dict]:
     """Connected components of the bipartite graph row id <-> group id."""
     row_to_groups = {}

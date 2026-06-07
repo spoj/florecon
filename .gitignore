@@ -5,3 +5,5 @@ hosts/python/src/florecon/_engine.wasm
 hosts/python/dist/
 hosts/python/build/
 **/*.egg-info/
+node_modules/
+hosts/js/node_modules/

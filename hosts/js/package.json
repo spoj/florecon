@@ -1,0 +1,12 @@
+{
+  "name": "@florecon/host",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Browser/Node host + workbench for florecon reconciliation plugins.",
+  "dependencies": {
+    "apache-arrow": "^21.0.0"
+  },
+  "scripts": {
+    "test": "node core/host.test.mjs"
+  }
+}

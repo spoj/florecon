@@ -24,7 +24,17 @@ from ._host import (
     SchemaError,
     Workspace,
 )
-from .projections import connected_components, strict_assignments
+from .persist import (
+    decisions,
+    groups_csv,
+    load_workspace,
+    report_frames,
+    result_json,
+    results_csv,
+    save_workspace,
+)
+from .projections import connected_components, primary_assignments, strict_assignments
+from .tags import TagStore
 
 __all__ = [
     "Florecon",
@@ -33,7 +43,16 @@ __all__ = [
     "ContractMismatch",
     "PluginError",
     "SchemaError",
+    "TagStore",
     "strict_assignments",
+    "primary_assignments",
     "connected_components",
+    "decisions",
+    "save_workspace",
+    "load_workspace",
+    "report_frames",
+    "groups_csv",
+    "results_csv",
+    "result_json",
 ]
 __version__ = "0.1.0"
