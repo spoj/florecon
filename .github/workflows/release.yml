@@ -1,0 +1,66 @@
+name: release
+
+# Fires when you publish a GitHub Release. The tag (vX.Y.Z) must match the
+# version in all three manifests (enforced by the guard job).
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard (tag == versions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-versions.sh "${{ github.event.release.tag_name }}"
+
+  crates:
+    name: publish to crates.io
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # florecon-derive must go first (florecon depends on it); cargo publish
+      # waits for the index, so the second resolve succeeds. Skip any version
+      # already on crates.io so re-runs / unchanged crates are idempotent.
+      - name: publish derive then florecon
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          ver() { grep -m1 '^version' "$1" | sed -E 's/.*"([^"]+)".*/\1/'; }
+          publish() {
+            local crate="$1" manifest="$2" v
+            v=$(ver "$manifest")
+            if curl -sf -A "florecon-release-ci" "https://crates.io/api/v1/crates/$crate/$v" >/dev/null; then
+              echo "✓ $crate@$v already on crates.io — skipping"
+            else
+              echo "→ publishing $crate@$v"
+              cargo publish -p "$crate"
+            fi
+          }
+          publish florecon-derive florecon-derive/Cargo.toml
+          publish florecon Cargo.toml
+
+  pypi:
+    name: publish to PyPI
+    needs: guard
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # OIDC for PyPI Trusted Publishing (no stored token)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: build wheel + sdist
+        working-directory: hosts/python
+        run: uv build
+      - name: publish (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: hosts/python/dist
+          skip-existing: true
