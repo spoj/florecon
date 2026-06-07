@@ -3,17 +3,34 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "florecon"
+name = "florecon-host"
 version = "0.1.0"
-description = "Incremental financial reconciliation by min-cost flow — a generic wasmtime host that drives self-describing domain plugins. Nothing created, nothing lost."
+description = "The Python host for florecon: a generic wasmtime embedder that drives self-describing reconciliation plugins. Brings its own plugin wasm; imports as `florecon`. Nothing created, nothing lost."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 keywords = ["reconciliation", "finance", "matching", "wasm", "min-cost-flow"]
 dependencies = ["wasmtime>=20", "pyarrow>=14"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Financial and Insurance Industry",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Office/Business :: Financial :: Accounting",
+  "Topic :: Scientific/Engineering :: Mathematics",
+]
 
 [project.urls]
-Repository = "https://github.com/florecon/florecon"
+Homepage = "https://github.com/spoj/florecon"
+Repository = "https://github.com/spoj/florecon"
+Issues = "https://github.com/spoj/florecon/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The generic host ships no domain plugin: a `.wasm` is brought by the caller
+# (or a thin per-domain wheel). Exclude the local interco test fixture from
+# both wheel and sdist so the package stays a pure host.
+[tool.setuptools.exclude-package-data]
+"*" = ["_engine.wasm"]
