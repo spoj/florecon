@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "florecon-host"
-version = "0.1.1"
+version = "0.1.2"
 description = "The Python host for florecon: a generic wasmtime embedder that drives self-describing reconciliation plugins. Brings its own plugin wasm; imports as `florecon`. Nothing created, nothing lost."
 readme = "README.md"
 requires-python = ">=3.9"

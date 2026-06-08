@@ -1,6 +1,6 @@
 [package]
 name = "florecon-derive"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "derive(Record) for florecon plugins: one struct is the wire schema, the typed projection, and the identity."
 license = "MIT"
