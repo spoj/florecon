@@ -3,11 +3,7 @@ resolver = "2"
 members = ["solver", "harness"]
 
 [workspace.dependencies]
-# >>> florecon-dep — `florecon new` / the template sync rewrites this block to a
-# crates.io version dep. In this repo it stays a path dep so CI tests the seed
-# against the working tree.
-florecon = { path = "../..", features = ["sdk"] }
-# <<< florecon-dep
+florecon = { version = "0.1", features = ["sdk"] }
 
 # The author loop: optimized runtime (the network-simplex solver lives in the
 # `florecon` dependency and is built at -O3 once, then cached), but no LTO and

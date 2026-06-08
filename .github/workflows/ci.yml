@@ -61,6 +61,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-versions.sh
+      # The host bundles the author starter (florecon._template); keep it byte-
+      # identical to examples/starter-plugin (the CI-tested source of truth).
+      - run: python3 scripts/sync-template.py --check
 
   hosts:
     name: host conformance (wasm + python + js)

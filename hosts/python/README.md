@@ -8,6 +8,23 @@ plugin.
 
 Money is integer minor units; nothing is created or lost.
 
+## Authoring a plugin
+
+This package also ships the `florecon` CLI, so you can build a plugin without
+cloning the florecon repo:
+
+```bash
+florecon new my-recon       # scaffold a Rust plugin (needs a Rust toolchain)
+cd my-recon
+florecon author             # fast native loop on data/sample.csv
+florecon ship               # build the production solver.wasm
+```
+
+Then load `target/wasm32-unknown-unknown/release/solver.wasm` with the host
+below. See the scaffolded `README.md` for the full journey.
+
+## Running a plugin
+
 ```python
 from florecon import Workspace
 

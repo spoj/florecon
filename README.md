@@ -109,7 +109,16 @@ proves identity/derivation/warm-start integrity from one Arrow batch.
 
 Authoring is meant to be LLM-assisted Rust: the closures *are* the strategy
 language (full expressivity, and the compiler is your correctness oracle), so
-there is no separate DSL. The journey has two phases:
+there is no separate DSL. You never clone this repo — the author CLI ships with
+the host, so from your own data project:
+
+```bash
+uv add florecon-host        # (or: pip install florecon-host)
+florecon new my-recon       # scaffold a plugin (crates.io dep, domain = my-recon)
+cd my-recon
+```
+
+The journey then has two phases:
 
 1. **Author (Rust only, fast).** Iterate the strategy natively against a CSV
    sample — no wasm, no Python. The expensive solver lives in the `florecon`
@@ -117,7 +126,8 @@ there is no separate DSL. The journey has two phases:
    under a second and runs at near-release speed:
 
    ```bash
-   just author            # build + run the strategy once on data/sample.csv
+   florecon author          # build + run the strategy once on data/sample.csv
+   florecon check           # type-check only (fastest feedback)
    ```
 
    Edit the four marked spots in `solver/src/lib.rs`, re-run, read the report and
@@ -127,13 +137,15 @@ there is no separate DSL. The journey has two phases:
    production wasm and run it where the data already lives:
 
    ```bash
-   just ship              # the perf-tuned solver.wasm
+   florecon ship            # the perf-tuned solver.wasm
    cd app && uv run python run.py
    ```
 
-The worked starter is [`examples/starter-plugin`](examples/starter-plugin) (its
-README walks the full path); `plugins/interco` is the larger real example
-(intercompany reconciliation).
+`florecon author` / `ship` / `check` are thin, cross-platform `cargo` wrappers
+(they need a Rust toolchain). The worked starter — the exact thing `florecon new`
+scaffolds — is [`examples/starter-plugin`](examples/starter-plugin) (its README
+walks the full path); `plugins/interco` is the larger real example (intercompany
+reconciliation).
 
 ## Developing florecon itself
 
@@ -144,9 +156,13 @@ just build-wasm                            # interco plugin -> wasm, staged into
 just smoke-py                              # drive that wasm through the generic Python host
 just golden-check                          # the cross-language wire contract (Rust + Python)
 just starter                               # build + run the author starter (kept honest by CI)
+python scripts/sync-template.py            # refresh the host-bundled copy of that starter
 ```
 
-The `engine::Snapshot` (behind the `serde` feature) persists a warm basis.
+The author CLI (`florecon._cli`) lives in `hosts/python`; the starter it ships
+is bundled from `examples/starter-plugin` by `scripts/sync-template.py` (CI runs
+it with `--check`). The `engine::Snapshot` (behind the `serde` feature) persists
+a warm basis.
 
 ## Design docs
 
