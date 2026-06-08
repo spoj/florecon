@@ -1,6 +1,6 @@
 [package]
 name = "florecon"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Incremental financial reconciliation by min-cost flow: a conserving combinator algebra over a network-simplex core. Nothing created, nothing lost."
 license = "MIT"
