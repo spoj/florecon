@@ -79,7 +79,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.2.0
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
