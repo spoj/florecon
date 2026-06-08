@@ -9,6 +9,29 @@ default:
 build:
     cargo build --release
 
+# Cut a release: bump all three manifests to <version>, verify, tag, and create
+# the GitHub Release (which triggers .github/workflows/release.yml -> crates.io + PyPI).
+# Usage: just release 0.1.2   (a leading 'v' is accepted too)
+release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v="{{version}}"; v="${v#v}"
+    if [ -n "$(git status --porcelain)" ]; then echo "working tree not clean — commit or stash first" >&2; exit 1; fi
+    echo "bumping all three manifests to $v"
+    sed -i -E '0,/^version = "[^"]*"/s//version = "'"$v"'"/' Cargo.toml
+    sed -i -E '0,/^version = "[^"]*"/s//version = "'"$v"'"/' florecon-derive/Cargo.toml
+    sed -i -E '0,/^version = "[^"]*"/s//version = "'"$v"'"/' hosts/python/pyproject.toml
+    bash scripts/check-versions.sh "v$v"
+    cargo build -q          # refresh Cargo.lock
+    just lint
+    just test
+    git commit -aqm "release: v$v"
+    git tag "v$v"
+    git push origin HEAD "v$v"
+    gh release create "v$v" --title "v$v" --generate-notes
+    echo "released v$v — the release workflow is now publishing. watch it with:"
+    echo "  gh run watch \$(gh run list -w release -L1 --json databaseId -q '.[0].databaseId') --exit-status"
+
 # Run the full test suite (lib + plugins), all features.
 test:
     cargo test --workspace --features sdk
