@@ -15,7 +15,7 @@ jobs:
     name: lint + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -31,7 +31,7 @@ jobs:
     name: author starter (native + wasm)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -47,7 +47,7 @@ jobs:
     name: semver-checks (florecon)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Compares the crate's public API against the last release on crates.io and
@@ -61,7 +61,7 @@ jobs:
     name: version consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - run: bash scripts/check-versions.sh
       # The host bundles the author starter (florecon._template); keep it byte-
       # identical to examples/starter-plugin (the CI-tested source of truth).
@@ -71,7 +71,7 @@ jobs:
     name: host conformance (wasm + python + js)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -79,10 +79,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
-      - uses: astral-sh/setup-uv@v6
-      - uses: actions/setup-node@v5
+      - uses: astral-sh/setup-uv@v8
+      - uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
 
       # Build the interco plugin to wasm (also stages it into the Python host).
       - run: just build-wasm
