@@ -185,7 +185,8 @@ earns nothing.
 | `coalesce` | `coalesce(origin, inner)` | fuse interlocking groups (shared member) into settlement clusters |
 | `trim` | `trim(tol, inner)` | cut sub-`tol` edges to the **residual** |
 | `snap` | `snap(tol, inner)` | fold sub-`tol` edges onto each row's **dominant edge** |
-| `whole_only` *(new)* | `whole_only(inner)` | commit only **self-contained** groups (every member fully consumed); dissolve any group touching a partial fill back to residual |
+| `whole_net` *(new)* | `whole_net(tol, inner)` | commit clusters of **whole lines** whose net clears within `tol`; the break stays **inside** the group |
+| `whole_only` *(new)* | `whole_only(inner)` | commit only **self-contained** clusters (whole lines, net **exactly 0**); partial fills dissolve — `whole_net(Abs(0))` |
 
 `filter` is **removed** as a redundant alias of `accept_if`. Pick the name that
 states the semantics (we *accept* groups passing the predicate and dissolve the
@@ -196,19 +197,41 @@ allocation hypergraph (a row split across groups); these three turn it into the
 coarser, human-actionable cluster view and move dust between matched and
 residual. Already share an `EdgeReshape` impl for `trim`/`snap`.
 
-`whole_only` is the **all-or-nothing acceptor** for a liberal matcher: let `flow`
-discover the N:M structure, then commit only the components that cleared
-*completely*. It keeps a group iff every member row is fully consumed in it (its
-id is absent from the residual) and dissolves any group touching a
-partially-filled boundary row whole back to residual — so a partial fill never
-leaves a lopsided, non-zero "match". This is the decision `accept_if` cannot
-make: a `Group` sheds each row's `original` and never sees the residual, so "is
-this edge whole?" is out of a `Fn(&Group)->bool`'s scope — `whole_only` decides
-against the residual instead. Note `net == 0` is **not** sufficient for wholeness
-(a group can net to zero while a member bleeds into residual), which is exactly
-why this is a distinct primitive rather than an `accept_if(|g| g.abs_net()==0)`
-gate. It is *not* an edge-tolerance like `trim`: "all-or-nothing" is a whole-group
-decision, never a per-edge magnitude cut.
+`whole_net`/`whole_only` are the **commit gate** for a *discovered* grouping, and
+they expose the library's two matching paradigms:
+
+- **Transportation (`flow`):** a line is *divisible*. `flow` splits amounts at
+  the unit level, every matched group nets to **0**, and the difference is a
+  separate **residual** lot. `whole_only(flow)` keeps only clusters that cleared
+  *completely* — a near-miss like `+100 / -97` goes **entirely** to residual.
+- **Netting (whole-line):** a line is *atomic*. `agg_net`/`signal_group` (§4.2)
+  bucket whole lines by a **key** and accept iff the bucket nets within `tol`,
+  the break staying **inside** the group as its `net`. `whole_net(tol, inner)`
+  brings that acceptance to a *discovered* grouping: it makes every member line
+  whole (reclaiming its residual tail) and accepts the cluster iff
+  `|net| <= tol`, so `+100 / -97` becomes one matched group with net `+3`.
+
+`whole_only` is exactly `whole_net(Tol::Abs(0))`. Because a line is atomic in the
+netting view, groups that share a member id are **one settlement**: `whole_net`
+coalesces them first, so a line's tail can only ever go to **ground** (never to a
+sibling group) and the reclaim is unambiguous; conservation holds (each id ends
+up wholly in one group or wholly in residual). `net == 0` is **not** sufficient
+for wholeness (a group can net to zero while a member bleeds into residual),
+which is exactly why this is a distinct primitive and not an
+`accept_if(|g| g.abs_net()==0)` gate — a `Group` sheds each row's `original` and
+never sees the residual, so "is this line whole?" is out of a `Fn(&Group)->bool`'s
+scope. Neither is it an edge-tolerance like `trim`: this is a whole-*cluster*
+decision, never a per-edge magnitude cut. Tolerance basis follows `Tol` (§6):
+`Abs` fixed, `Rel` against the **smallest** leg, `RelMax` against the **largest**
+— there is no total-of-legs basis.
+
+**Choosing the matcher:** use `agg_net` when a **key** already defines the group;
+use `whole_net(tol, flow(spec))` for the **"flow discovers, netting commits"**
+idiom when the grouping must be inferred from amounts/proximity; use
+`whole_only(flow(spec))` when only a *complete* clear counts. `flow` + `soak`
+(net-0 group, the break as a labelled residual bucket) and `whole_net` (break
+kept *inside* the matched group) are the two valid bookkeeping choices for the
+same mismatch — *separate break lot* vs *matched-with-break*.
 
 ### 4.4 Soakers (terminate the tail)
 
@@ -444,14 +467,15 @@ foundation   Item  Group  Resolution  Strategy  Tol  Allocation  ExtId
 
 bag combs    seq  partition_by  partition_by_with  when  windowed  pivot  fixed_point  identity
 leaves       exact_1to1  agg_net  signal_group  running_zero  flow(FlowSpec)
-group combs  labeled  accept_if  coalesce  trim  snap  whole_only
+group combs  labeled  accept_if  coalesce  trim  snap  whole_net  whole_only
 soakers      soak_all  soak_small  soak_if   (SoakMode)
 flow         FlowSpec builder  (+ optional flow_util::tiered cost helper)
 ```
 
-~25 functions + one builder. Net change from today: **−5** (`Model`,
-`exact_1to1_any`, `filter`, `branch`, the `max_bps/max_abs` soak knobs), **+4
-sugar/widening** (`when`, `identity`, `partition_by_with`, `Group` metrics), **2
-renames/reshapes** (`flow`/`FlowSpec`, `soak_small` on `Tol`). Smaller, and every
-node now obeys one closure idiom and belongs to exactly one family.
+~26 functions + one builder. Net change from today: **−5** (`Model`,
+`exact_1to1_any`, `filter`, `branch`, the `max_bps/max_abs` soak knobs), **+6
+sugar/widening** (`when`, `identity`, `partition_by_with`, `Group` metrics, the
+`whole_net`/`whole_only` netting commit gate), **2 renames/reshapes**
+(`flow`/`FlowSpec`, `soak_small` on `Tol`). Smaller, and every node now obeys one
+closure idiom and belongs to exactly one family.
 ```

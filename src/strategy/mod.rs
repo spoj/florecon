@@ -379,77 +379,148 @@ where
     Box::new(Filter { pred, inner })
 }
 
-struct WholeOnly<E> {
+struct WholeNet<E> {
+    tol: Tol,
     inner: Box<dyn Strategy<E>>,
 }
 
-impl<E: Clone> Strategy<E> for WholeOnly<E> {
+impl<E: Clone> Strategy<E> for WholeNet<E> {
     fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
-        // Snapshot the input to rematerialize dissolved lots (a group carries
-        // only `Allocation { id, amount }`).
+        // Snapshot inputs to rematerialize *whole* lines: a group carries only
+        // `Allocation { id, amount }`, so reclaiming a line at its full size
+        // needs `original` and the payload `E`.
         let src: HashMap<ExtId, Item<E>> = bag.iter().map(|i| (i.id, i.clone())).collect();
-        let mut r = self.inner.run(bag);
+        let r = self.inner.run(bag);
 
-        // "Whole" is decided against the inner's *own* residual snapshot: a
-        // member id that appears in residual was only partially consumed, so any
-        // group touching it is a partial fill. Snapshot first so the decision is
-        // stable as rejected groups are dissolved back.
-        let resid_ids: HashSet<ExtId> = r.residual.iter().map(|i| i.id).collect();
+        // Index the inner residual by id so a line's ground tail can be reclaimed
+        // (folded back into the whole line) or left in place if its cluster
+        // dissolves. Merge duplicates defensively.
+        let mut resid: HashMap<ExtId, Item<E>> = HashMap::new();
+        for it in r.residual {
+            resid
+                .entry(it.id)
+                .and_modify(|e| e.amount += it.amount)
+                .or_insert(it);
+        }
 
-        let mut kept = Vec::with_capacity(r.groups.len());
-        let mut residual_ix: HashMap<ExtId, usize> = r
-            .residual
-            .iter()
-            .enumerate()
-            .map(|(ix, item)| (item.id, ix))
-            .collect();
-        for g in r.groups.drain(..) {
-            // Keep only self-contained groups: every member fully consumed here.
-            if g.members.iter().all(|a| !resid_ids.contains(&a.id)) {
-                kept.push(g);
-                continue;
+        // A line is atomic in the whole-line paradigm, so groups that share a
+        // member id are one settlement: collapse them into a single cluster
+        // (this is why a residual "going to another group" can't survive -- it
+        // becomes the *same* group). Within a cluster, the only tails left are
+        // tails to ground, which reclaim unambiguously.
+        let comps = group_components(&r.groups);
+
+        let mut out_groups: Vec<Group> = Vec::new();
+        let mut out_residual: Vec<Item<E>> = Vec::new();
+
+        for comp in comps {
+            // Member ids across every group in the cluster (a line may appear in
+            // more than one of them; dedup, keep first-seen then sort by id).
+            let mut member_ids: Vec<ExtId> = Vec::new();
+            let mut seen: HashSet<ExtId> = HashSet::new();
+            for &gi in &comp {
+                for a in &r.groups[gi].members {
+                    if seen.insert(a.id) {
+                        member_ids.push(a.id);
+                    }
+                }
             }
-            // Reject the whole group back to residual (all-or-nothing): a partial
-            // fill commits nothing. `kept ⊎ residual = input` in summed (id, amount).
-            for a in &g.members {
-                match residual_ix.get(&a.id) {
-                    Some(&ix) => r.residual[ix].amount += a.amount,
-                    None => {
-                        if let Some(orig) = src.get(&a.id) {
-                            residual_ix.insert(a.id, r.residual.len());
-                            r.residual.push(Item {
-                                id: a.id,
-                                original: orig.original,
-                                amount: a.amount,
-                                data: orig.data.clone(),
-                            });
-                        }
+            member_ids.sort_unstable();
+
+            // Whole-line amounts are originals; the cluster net is judged on the
+            // *whole* lines (reclaimed tails included), not the matched parts.
+            let wholes: Vec<(ExtId, i64)> = member_ids
+                .iter()
+                .filter_map(|&id| src.get(&id).map(|i| (id, i.original)))
+                .collect();
+            let net: i64 = wholes.iter().map(|&(_, o)| o).sum();
+            let tol = self.tol.slack_for(wholes.iter().map(|&(_, o)| o));
+
+            if net.abs() <= tol {
+                // Accept the cluster as one whole-line settlement, keeping `net`
+                // as the (in-tolerance) break. Reclaim every member's ground tail.
+                for &(id, _) in &wholes {
+                    resid.remove(&id);
+                }
+                // Preserve the inner origin/reason for a lone group; a genuine
+                // multi-group merge becomes a settlement cluster.
+                let (origin, reason) = if comp.len() == 1 {
+                    let g = &r.groups[comp[0]];
+                    (g.origin.clone(), g.reason.clone())
+                } else {
+                    ("settlement".to_string(), None)
+                };
+                out_groups.push(Group {
+                    members: wholes
+                        .iter()
+                        .map(|&(id, o)| Allocation { id, amount: o })
+                        .collect(),
+                    origin,
+                    net,
+                    reason,
+                });
+            } else {
+                // Dissolve: every member line returns to ground *whole*.
+                for &(id, o) in &wholes {
+                    resid.remove(&id);
+                    if let Some(it) = src.get(&id) {
+                        out_residual.push(Item {
+                            id,
+                            original: it.original,
+                            amount: o,
+                            data: it.data.clone(),
+                        });
                     }
                 }
             }
         }
+        // Ground-only lots (lines that never entered a group) pass through.
+        out_residual.extend(resid.into_values());
+        out_residual.sort_by_key(|i| i.id);
         Resolution {
-            groups: kept,
-            residual: r.residual,
+            groups: out_groups,
+            residual: out_residual,
         }
     }
 }
 
-/// Commit only **self-contained** groups: keep an inner group iff every member
-/// row is fully consumed inside it (its id appears in no residual lot), and
-/// dissolve any group that touches a partially-filled row whole back to
-/// residual. All-or-nothing on a liberal matcher's output -- let [`flow`]
-/// discover the N:M structure, then commit only the components that cleared
-/// completely; boundary rows that flow could only partially fill take their
-/// whole component to residual rather than leaving a lopsided, non-zero match.
+/// Commit groups of **whole lines** whose net clears within `tol` -- the
+/// traditional N:M tolerance match, on a matcher's discovered grouping.
+///
+/// Where [`flow`] splits a line at the unit level (matched part + residual tail)
+/// and leaves net-zero groups, `whole_net` works the other way: it takes the
+/// inner's grouping, makes every member line **whole** (reclaiming its ground
+/// tail), and accepts the cluster iff `|net| <= tol` -- keeping that net as the
+/// visible, in-tolerance break *inside* the matched group. Clusters over
+/// tolerance dissolve, every line returning to residual whole.
+///
+/// Because a line is atomic here, groups that share a member id are one
+/// settlement: `whole_net` coalesces them first, so a line's tail can only ever
+/// go to **ground** (never to a sibling group), and the reclaim is
+/// unambiguous. Conservation holds -- each id ends up wholly in one accepted
+/// group or wholly in residual. `tol` picks its reference leg per [`Tol`]
+/// (smallest leg for `Rel`, largest for `RelMax`, fixed for `Abs`).
+pub fn whole_net<E: Clone + 'static>(
+    tol: impl Into<Tol>,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>> {
+    Box::new(WholeNet {
+        tol: tol.into(),
+        inner,
+    })
+}
+
+/// Commit only **self-contained** groups: the zero-tolerance case of
+/// [`whole_net`]. Let [`flow`] discover the N:M structure, then commit only the
+/// clusters whose whole lines net to *exactly* zero; any cluster carrying a
+/// boundary line flow could only partially fill nets non-zero and dissolves
+/// whole back to residual, rather than leaving a lopsided match.
 ///
 /// This is the acceptor `accept_if` cannot express: a [`Group`] sheds each
 /// row's `original` and never sees the residual, so "is this edge whole?" is
-/// out of scope for a `Fn(&Group) -> bool` predicate. `whole_only` decides
-/// against the residual instead. Conservation holds -- a rejected group's
-/// allocations return to residual (merged by id).
+/// out of scope for a `Fn(&Group) -> bool` predicate.
 pub fn whole_only<E: Clone + 'static>(inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>> {
-    Box::new(WholeOnly { inner })
+    whole_net(Tol::Abs(0), inner)
 }
 
 struct Coalesce<E> {
@@ -2214,6 +2285,89 @@ mod tests {
         for i in &r.residual {
             assert_eq!(i.amount.abs(), 7);
         }
+    }
+
+    #[test]
+    fn whole_net_reclaims_tail_and_keeps_break_within_tol() {
+        // Inner: +100 matched 97 against -97, with a +3 ground tail on line 1.
+        struct Partial;
+        impl Strategy<i64> for Partial {
+            fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+                let m: HashMap<ExtId, Item<i64>> = bag.into_iter().map(|i| (i.id, i)).collect();
+                let groups = vec![Group {
+                    members: vec![
+                        Allocation { id: 1, amount: 97 },
+                        Allocation { id: 2, amount: -97 },
+                    ],
+                    origin: "flow".into(),
+                    net: 0,
+                    reason: None,
+                }];
+                let mut tail = m[&1].clone();
+                tail.amount = 3;
+                Resolution { groups, residual: vec![tail] }
+            }
+        }
+        // tol >= 3: reclaim the tail, match the whole lines, keep net +3 inside.
+        let mut s = whole_net(Tol::Abs(5), Box::new(Partial));
+        let r = s.run(bag(&[(1, 100), (2, -97)]));
+        conserves(2, &r);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].net, 3);
+        assert_eq!(ids(&r.groups[0]), vec![1, 2]);
+        assert!(r.residual.is_empty()); // the +3 tail was reclaimed into the whole line
+
+        // tol < 3: dissolve, both lines return to ground whole.
+        let mut s = whole_net(Tol::Abs(2), Box::new(Partial));
+        let r = s.run(bag(&[(1, 100), (2, -97)]));
+        conserves(2, &r);
+        assert!(r.groups.is_empty());
+        let left: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
+        assert_eq!(left, vec![(1, 100), (2, -97)]); // whole lines, not the 97/3 split
+    }
+
+    #[test]
+    fn whole_net_collapses_groups_sharing_a_line() {
+        // Line 1 (+100) is split across two groups: +60 in A, +40 in B. They
+        // share id 1, so the whole-line view is ONE settlement, not two.
+        struct Split;
+        impl Strategy<i64> for Split {
+            fn run(&mut self, _bag: Vec<Item<i64>>) -> Resolution<i64> {
+                let groups = vec![
+                    Group {
+                        members: vec![
+                            Allocation { id: 1, amount: 60 },
+                            Allocation { id: 2, amount: -60 },
+                        ],
+                        origin: "a".into(),
+                        net: 0,
+                        reason: None,
+                    },
+                    Group {
+                        members: vec![
+                            Allocation { id: 1, amount: 40 },
+                            Allocation { id: 3, amount: -40 },
+                        ],
+                        origin: "b".into(),
+                        net: 0,
+                        reason: None,
+                    },
+                ];
+                Resolution { groups, residual: vec![] }
+            }
+        }
+        let mut s = whole_net(Tol::Abs(0), Box::new(Split));
+        let r = s.run(bag(&[(1, 100), (2, -60), (3, -40)]));
+        conserves(3, &r);
+        // One merged settlement of whole lines, line 1 appearing once at +100.
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].origin, "settlement");
+        assert_eq!(r.groups[0].net, 0);
+        let mut mem: Vec<(ExtId, i64)> =
+            r.groups[0].members.iter().map(|a| (a.id, a.amount)).collect();
+        mem.sort();
+        assert_eq!(mem, vec![(1, 100), (2, -60), (3, -40)]);
+        assert!(r.residual.is_empty());
     }
 
     #[test]
