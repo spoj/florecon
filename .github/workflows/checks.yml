@@ -39,9 +39,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      - uses: astral-sh/setup-uv@v8
       # Build + run the starter seed exactly as an author would, so it can never
-      # drift against the SDK: native harness on the sample, then the ship wasm.
+      # drift against the SDK: native harness on the sample, the ship wasm, then
+      # the distributable wheel (Phase 3 packaging).
       - run: just starter
+      - run: just starter-package
 
   semver:
     name: semver-checks (florecon)

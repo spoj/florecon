@@ -11,16 +11,19 @@ solver/        the plugin -> solver.wasm   (schema + projection + matching)
 harness/       native author loop: CSV -> Recon -> report + conservation
 data/          a representative sample to iterate against
 app/           Phase 2: run the built wasm on real data, in Python
+package/       Phase 3: the plugin as an installable wheel (wasm bundled)
+.github/       CI: build the wasm + wheel on every push, attach to v* releases
 ```
 
 ## Prerequisites
 
-- A **Rust toolchain** (the plugin is Rust): https://rustup.rs. For the ship
-  build also: `rustup target add wasm32-unknown-unknown`.
-- The `florecon` CLI — it ships with the host: `uv add florecon-host` (or
+- A **Rust toolchain** (the plugin is Rust): https://rustup.rs. The wasm target
+  installs itself (pinned in `rust-toolchain.toml`) -- no `rustup target add`.
+- The `florecon` CLI -- it ships with the host: `uv add florecon-host` (or
   `pip install florecon-host`). Run it as `florecon ...` (or `uv run florecon
   ...` from inside a uv project).
-- For Phase 2 only: a Python env with `florecon-host` + `polars`.
+- For Phase 2/3 only: a Python env with `florecon-host` (+ `polars` to run the
+  sample), and `uv` to build the wheel.
 
 ## Phase 1 — author the strategy (Rust only, fast)
 
@@ -66,6 +69,39 @@ config={"tol": 100})`.
 > Native (harness) and wasm (host) run the same strategy, but native ≠ wasm
 > performance. Do a final perf check on the real wasm before relying on it at
 > scale.
+
+## Phase 3 — package & distribute (a wheel your data team installs)
+
+When you want others to *use* the plugin without touching Rust or wasm, build a
+wheel that carries the compiled strategy inside it:
+
+```bash
+florecon package            # builds the wasm, embeds it, -> dist/*.whl
+```
+
+Because the plugin is wasm, the result is **one universal wheel**
+(`…-py3-none-any.whl`): build it once on any machine and it runs everywhere
+`florecon-host` runs — no per-OS/arch build matrix. The data team then:
+
+```python
+pip install ./dist/starter-0.1.0-py3-none-any.whl   # (rename to your project)
+import starter, polars as pl
+ws = starter.workspace(config={"tol": 100})          # the bundled wasm
+ws.upsert(df); report = ws.solve()
+```
+
+### CI does this for you
+
+`.github/workflows/build.yml` runs `florecon package` on **every push** (the
+wheel is downloadable from the Actions run) and **attaches the wheel + the raw
+`solver.wasm` to the GitHub Release** when you push a `v*` tag. It runs the same
+`florecon package` you run locally, then smoke-tests the freshly built wasm — so
+the artifact that ships is known-good. No PyPI, no tokens, no secrets: it just
+builds the file.
+
+```bash
+git tag v0.1.0 && git push --tags     # -> wheel + wasm on the Release page
+```
 
 ## Don't copy this by hand
 

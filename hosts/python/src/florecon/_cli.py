@@ -43,6 +43,20 @@ def _cargo(args: list[str]) -> int:
         return 130
 
 
+def _uv(args: list[str]) -> int:
+    """Run uv in the current directory, with a clear hint if it is missing."""
+    if shutil.which("uv") is None:
+        print(
+            "error: `uv` not found. Install it: https://docs.astral.sh/uv/",
+            file=sys.stderr,
+        )
+        return 127
+    try:
+        return subprocess.call(["uv", *args])
+    except KeyboardInterrupt:
+        return 130
+
+
 def cmd_new(ns: argparse.Namespace) -> int:
     dest = Path(ns.name)
     if dest.exists():
@@ -58,15 +72,29 @@ def cmd_new(ns: argparse.Namespace) -> int:
     shutil.copytree(TEMPLATE, dest)
 
     # Name the domain after the project so the wasm self-identifies.
-    slug = _slug(ns.name)
+    slug = _slug(dest.name)
     lib = dest / "solver/src/lib.rs"
     lib.write_text(lib.read_text().replace('"example.starter"', f'"{slug}"'))
+
+    # Name the distributable wheel + its import package after the project, so the
+    # data team writes `import my_recon` (not the seed's `import starter`).
+    import_name = slug.replace("-", "_")
+    pkg_src = dest / "package/src"
+    seed_pkg = pkg_src / "starter"
+    if seed_pkg.is_dir() and import_name != "starter":
+        seed_pkg.rename(pkg_src / import_name)
+        pyproj = dest / "package/pyproject.toml"
+        pyproj.write_text(
+            pyproj.read_text()
+            .replace('name = "starter"', f'name = "{slug}"')
+            .replace("src/starter", f"src/{import_name}")
+        )
 
     print(f"created {dest}/  (domain: {slug})")
     print("next:")
     print(f"  cd {dest}")
     print("  florecon author        # edit solver/src/lib.rs, then re-run")
-    print("  florecon ship          # build the production wasm")
+    print("  florecon package       # build the wasm + a distributable wheel")
     return 0
 
 
@@ -78,6 +106,27 @@ def cmd_ship(_ns: argparse.Namespace) -> int:
     return _cargo(
         ["build", "-p", "solver", "--release", "--target", "wasm32-unknown-unknown"]
     )
+
+
+WASM_REL = Path("target/wasm32-unknown-unknown/release/solver.wasm")
+
+
+def cmd_package(_ns: argparse.Namespace) -> int:
+    """Build the plugin wasm and package it as a universal wheel in dist/."""
+    rc = cmd_ship(_ns)
+    if rc:
+        return rc
+    if not WASM_REL.is_file():
+        print(f"error: {WASM_REL} not found after build", file=sys.stderr)
+        return 1
+    # The package holds exactly one import dir under package/src/.
+    src = Path("package/src")
+    pkgs = sorted(p for p in src.glob("*") if p.is_dir()) if src.is_dir() else []
+    if not pkgs:
+        print("error: no package found under package/src/", file=sys.stderr)
+        return 1
+    shutil.copyfile(WASM_REL, pkgs[0] / "solver.wasm")
+    return _uv(["build", "package", "--out-dir", "dist"])
 
 
 def cmd_check(_ns: argparse.Namespace) -> int:
@@ -105,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     ship = sub.add_parser("ship", help="build the production solver.wasm")
     ship.set_defaults(func=cmd_ship)
+
+    package = sub.add_parser(
+        "package", help="build the wasm and a distributable wheel (dist/*.whl)"
+    )
+    package.set_defaults(func=cmd_package)
 
     check = sub.add_parser("check", help="type-check the plugin (clippy)")
     check.set_defaults(func=cmd_check)

@@ -36,7 +36,11 @@ where = ["src"]
 # Ship the plugin starter that `florecon new` scaffolds. Kept in sync with
 # examples/starter-plugin by scripts/sync-template.py (CI enforces it).
 [tool.setuptools.package-data]
-florecon = ["_template/**/*", "_template/**/.gitignore"]
+florecon = [
+  "_template/**/*",
+  "_template/**/.gitignore",
+  "_template/.github/workflows/*",
+]
 
 # The generic host ships no domain plugin: a `.wasm` is brought by the caller
 # (or a thin per-domain wheel). Exclude the local interco test fixture from

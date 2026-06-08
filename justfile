@@ -61,6 +61,14 @@ starter:
     cd examples/starter-plugin && cargo run --profile author -p harness -- data/sample.csv
     cd examples/starter-plugin && cargo build -p solver --release --target wasm32-unknown-unknown
 
+# Build the starter's distributable wheel (Phase 3), exactly as `florecon
+# package` does: embed the ship wasm and produce a universal py3-none-any wheel.
+# Guards the packaging path against rot. Requires `uv`.
+starter-package:
+    cd examples/starter-plugin && cargo build -p solver --release --target wasm32-unknown-unknown
+    cd examples/starter-plugin && cp target/wasm32-unknown-unknown/release/solver.wasm package/src/starter/solver.wasm
+    cd examples/starter-plugin && uv build package --out-dir dist
+
 # Drive the interco plugin wasm through the generic Python host.
 # Uses the repo .venv if present, else whatever `python` is on PATH.
 smoke-py: build-wasm
