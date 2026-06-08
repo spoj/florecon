@@ -10,7 +10,7 @@
 > (polars / pandas / pyarrow), validated and cast against `describe()` — no dict
 > rows. `Config` is delivered in the `init` command, so tolerances/windows tune
 > at runtime without rebuilding the wasm. See the `Plugin`/`Record` rustdoc and
-> `templates/plugin/` for the current shape; the sections below are the original
+> `examples/starter-plugin/` for the current shape; the sections below are the original
 > rationale.
 
 Status: proposal. Companion to `recon-surface.md` (the workspace) and

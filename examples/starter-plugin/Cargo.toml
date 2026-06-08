@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["solver", "harness"]
+
+[workspace.dependencies]
+# In-repo this is a path dep so CI catches any SDK drift against the working
+# tree. When you copy this folder out to start your own plugin, change it to:
+#     florecon = { version = "0.1", features = ["sdk"] }
+florecon = { path = "../..", features = ["sdk"] }
+
+# The author loop: optimized runtime (the network-simplex solver lives in the
+# `florecon` dependency and is built at -O3 once, then cached), but no LTO and
+# many codegen units so *your* crate recompiles in seconds. Run it with
+# `cargo run --profile author -p harness -- data/sample.csv` (or `just author`).
+[profile.author]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
+# The ship build: the production wasm. Perf-tuned (full opt + LTO) rather than
+# size-tuned — a reconciliation solver over large data wants speed.
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

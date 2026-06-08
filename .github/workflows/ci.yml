@@ -25,6 +25,22 @@ jobs:
       - run: just lint
       - run: just test
 
+  starter:
+    name: author starter (native + wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      # Build + run the starter seed exactly as an author would, so it can never
+      # drift against the SDK: native harness on the sample, then the ship wasm.
+      - run: just starter
+
   semver:
     name: semver-checks (florecon)
     runs-on: ubuntu-latest

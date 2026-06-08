@@ -36,6 +36,9 @@ serde_json = "1"
 
 [workspace]
 members = [".", "florecon-derive", "plugins/interco"]
+# A self-contained author starter with its own workspace + profiles; built and
+# run by CI as a real plugin (so it can't drift), but not a member here.
+exclude = ["examples/starter-plugin"]
 
 [profile.release]
 opt-level = "z"

@@ -54,16 +54,12 @@ build-wasm:
 dev:
     watchexec -e rs -- just build-wasm
 
-# Scaffold a new plugin project from templates/plugin (default: ../<name>).
-new-plugin name dest='..':
-    mkdir -p {{dest}}
-    cp -r templates/plugin {{dest}}/{{name}}
-    cd {{dest}}/{{name}} && grep -rl '__CRATE__\|__LIB__\|__DOMAIN__' . | xargs sed -i \
-        -e 's/__CRATE__/{{name}}/g' \
-        -e "s/__LIB__/$(echo {{name}} | tr '-' '_')/g" \
-        -e 's/__DOMAIN__/example.{{name}}/g'
-    chmod +x {{dest}}/{{name}}/build_wasm.sh
-    @echo "scaffolded {{dest}}/{{name}} — edit solver/src/lib.rs (4 marked spots), then: cd {{dest}}/{{name}} && just run"
+# Build + run the author starter (examples/starter-plugin) as an author would.
+# Keeps the seed (which CI also runs) from drifting against the SDK: native
+# harness on the sample, then the ship wasm.
+starter:
+    cd examples/starter-plugin && cargo run --profile author -p harness -- data/sample.csv
+    cd examples/starter-plugin && cargo build -p solver --release --target wasm32-unknown-unknown
 
 # Drive the interco plugin wasm through the generic Python host.
 # Uses the repo .venv if present, else whatever `python` is on PATH.

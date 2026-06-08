@@ -107,9 +107,35 @@ projection to a typed row, the conserved numeraire, and the strategy — then
 zero. The conformance kit (`sdk::conformance::assert_conformance`) mechanically
 proves identity/derivation/warm-start integrity from one Arrow batch.
 
-`plugins/interco` is the worked example (intercompany reconciliation).
+Authoring is meant to be LLM-assisted Rust: the closures *are* the strategy
+language (full expressivity, and the compiler is your correctness oracle), so
+there is no separate DSL. The journey has two phases:
 
-## Build & test
+1. **Author (Rust only, fast).** Iterate the strategy natively against a CSV
+   sample — no wasm, no Python. The expensive solver lives in the `florecon`
+   dependency (built once at `-O3`, then cached), so your strategy recompiles in
+   under a second and runs at near-release speed:
+
+   ```bash
+   just author            # build + run the strategy once on data/sample.csv
+   ```
+
+   Edit the four marked spots in `solver/src/lib.rs`, re-run, read the report and
+   the conservation line. Repeat.
+
+2. **Ship + consume (wasm + Python).** When the strategy fits, build the
+   production wasm and run it where the data already lives:
+
+   ```bash
+   just ship              # the perf-tuned solver.wasm
+   cd app && uv run python run.py
+   ```
+
+The worked starter is [`examples/starter-plugin`](examples/starter-plugin) (its
+README walks the full path); `plugins/interco` is the larger real example
+(intercompany reconciliation).
+
+## Developing florecon itself
 
 ```bash
 cargo test --workspace --features sdk      # lib + plugin + doctests
@@ -117,6 +143,7 @@ cargo clippy --workspace --all-targets --features sdk -- -D warnings
 just build-wasm                            # interco plugin -> wasm, staged into hosts/python/
 just smoke-py                              # drive that wasm through the generic Python host
 just golden-check                          # the cross-language wire contract (Rust + Python)
+just starter                               # build + run the author starter (kept honest by CI)
 ```
 
 The `engine::Snapshot` (behind the `serde` feature) persists a warm basis.

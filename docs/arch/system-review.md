@@ -147,8 +147,9 @@ test that the boundary is real.
 - **Correctness you can trust without reading the strategy.** Conservation is
   structural; the worst a bug does is mis-group, and that's visible in `net`.
 - **Write-once host, write-many plugins.** A new domain is a 557-line plugin +
-  zero host changes; `describe()` drives the generic host. The template + `just
-  new-plugin` makes this a 30-second scaffold.
+  zero host changes; `describe()` drives the generic host. The
+  `examples/starter-plugin` seed (native author loop + ship wasm) makes this a
+  fast scaffold.
 - **Portability as a first-class property.** One kernel runs in a notebook, a
   browser (no install, no data egress — the compliance win), or an embedded ERP
   runtime, behind one contract.
