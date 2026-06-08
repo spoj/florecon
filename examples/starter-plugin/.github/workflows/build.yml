@@ -22,7 +22,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.2.0
 
       # Build the wasm and the wheel in one step -- the same command you run
       # locally (`florecon package`), so CI and your machine stay in lockstep.
