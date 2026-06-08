@@ -118,6 +118,25 @@ input ──▶ seq/partition_by/             ──▶ exact_1to1/agg_net/  ─
 | `fixed_point` | `fixed_point(inner, max_passes)` | iterate `inner` on its own residual to convergence |
 | `identity` *(new)* | `identity()` | no-op passthrough; the unit of `seq` |
 
+**Two loop shapes.** `fixed_point(inner, n)` is *convergence-driven*: it re-runs
+one warm `inner` on its own residual until the residual stops changing (or `n`
+passes elapse). The complementary shape is *schedule-driven* — run a fixed
+sequence of stages whose parameters vary by index, the canonical use being an
+**expanding-window** ladder (match same-day, then ±1wk, then ±1mo), each stage
+committing its confident matches and handing the residual down. That is just
+`seq` over a built range, with the closure capturing the pass index:
+
+```rust
+seq((0..n).map(|i| whole_only(flow(spec.window(7 << i)))).collect())
+```
+
+A one-line `for_n(n, |i| …)` sugar over that `seq` reads better and signals
+"schedule, not converge", but it is *sugar*, not a core primitive — the
+expressive content already lives in `seq`. Reach for `fixed_point` when the
+parameters are fixed and you iterate to stability; reach for the scheduled
+`seq`/`for_n` when the parameters must change per pass (and rebuild a fresh
+child each pass, so a warm basis is never reused against re-priced edges).
+
 **`branch` is removed; there is no `cond`.** Predicate routing is expressed two
 ways, chosen by whether you want *cascade* or *hard partition*:
 
@@ -166,6 +185,7 @@ earns nothing.
 | `coalesce` | `coalesce(origin, inner)` | fuse interlocking groups (shared member) into settlement clusters |
 | `trim` | `trim(tol, inner)` | cut sub-`tol` edges to the **residual** |
 | `snap` | `snap(tol, inner)` | fold sub-`tol` edges onto each row's **dominant edge** |
+| `whole_only` *(new)* | `whole_only(inner)` | commit only **self-contained** groups (every member fully consumed); dissolve any group touching a partial fill back to residual |
 
 `filter` is **removed** as a redundant alias of `accept_if`. Pick the name that
 states the semantics (we *accept* groups passing the predicate and dissolve the
@@ -175,6 +195,20 @@ rest); `filter` wrongly suggests filtering *items*.
 allocation hypergraph (a row split across groups); these three turn it into the
 coarser, human-actionable cluster view and move dust between matched and
 residual. Already share an `EdgeReshape` impl for `trim`/`snap`.
+
+`whole_only` is the **all-or-nothing acceptor** for a liberal matcher: let `flow`
+discover the N:M structure, then commit only the components that cleared
+*completely*. It keeps a group iff every member row is fully consumed in it (its
+id is absent from the residual) and dissolves any group touching a
+partially-filled boundary row whole back to residual — so a partial fill never
+leaves a lopsided, non-zero "match". This is the decision `accept_if` cannot
+make: a `Group` sheds each row's `original` and never sees the residual, so "is
+this edge whole?" is out of a `Fn(&Group)->bool`'s scope — `whole_only` decides
+against the residual instead. Note `net == 0` is **not** sufficient for wholeness
+(a group can net to zero while a member bleeds into residual), which is exactly
+why this is a distinct primitive rather than an `accept_if(|g| g.abs_net()==0)`
+gate. It is *not* an edge-tolerance like `trim`: "all-or-nothing" is a whole-group
+decision, never a per-edge magnitude cut.
 
 ### 4.4 Soakers (terminate the tail)
 
@@ -410,12 +444,12 @@ foundation   Item  Group  Resolution  Strategy  Tol  Allocation  ExtId
 
 bag combs    seq  partition_by  partition_by_with  when  windowed  pivot  fixed_point  identity
 leaves       exact_1to1  agg_net  signal_group  running_zero  flow(FlowSpec)
-group combs  labeled  accept_if  coalesce  trim  snap
+group combs  labeled  accept_if  coalesce  trim  snap  whole_only
 soakers      soak_all  soak_small  soak_if   (SoakMode)
 flow         FlowSpec builder  (+ optional flow_util::tiered cost helper)
 ```
 
-~24 functions + one builder. Net change from today: **−5** (`Model`,
+~25 functions + one builder. Net change from today: **−5** (`Model`,
 `exact_1to1_any`, `filter`, `branch`, the `max_bps/max_abs` soak knobs), **+4
 sugar/widening** (`when`, `identity`, `partition_by_with`, `Group` metrics), **2
 renames/reshapes** (`flow`/`FlowSpec`, `soak_small` on `Tol`). Smaller, and every
