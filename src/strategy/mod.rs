@@ -1471,6 +1471,12 @@ where
             .map(|g| vec![0; g.members.len()])
             .collect();
         let mut residual_amounts: Vec<i64> = vec![0; res.residual.len()];
+        // Ids the inner matcher actually returned (groups ∪ residual). Any
+        // incoming id missing from this set was dropped by inner -- its lane
+        // amount forward-floored to 0 and a zero-dropping leaf (e.g. `flow`)
+        // discarded it. Such rows are unmatchable in this numeraire and must be
+        // returned whole to residual below, or their parent mass leaks.
+        let accounted: BTreeSet<ExtId> = parts.keys().copied().collect();
         for (id, ps) in parts {
             let Some(m) = meta.get(&id) else { continue };
             let mut converted = Vec::with_capacity(ps.len());
@@ -1512,7 +1518,7 @@ where
                 Some(g)
             })
             .collect();
-        let residual = res
+        let mut residual: Vec<Item<E>> = res
             .residual
             .into_iter()
             .enumerate()
@@ -1523,6 +1529,20 @@ where
                 (i.amount != 0).then_some(i)
             })
             .collect();
+        // Conservation closure: re-emit any incoming id the inner matcher
+        // dropped entirely (see `accounted`). It is unmatched in this numeraire,
+        // so return it to residual at its full incoming parent amount. `meta`
+        // still owns every such id (only group/residual ids were removed above).
+        for (id, m) in meta {
+            if !accounted.contains(&id) && m.outer.amount != 0 {
+                residual.push(Item {
+                    id,
+                    original: m.outer.original,
+                    amount: m.outer.amount,
+                    data: m.outer.data,
+                });
+            }
+        }
         Resolution { groups, residual }
     }
 }
@@ -2446,6 +2466,49 @@ mod tests {
         let mut res: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
         res.sort();
         assert_eq!(res, vec![(1, 5), (2, 50)]);
+    }
+
+    // Inner that drops zero-amount lots, exactly like `flow` and the soakers.
+    // Used to exercise the pivot forward-floor conservation closure.
+    struct DropZeros;
+    impl Strategy<(i64,)> for DropZeros {
+        fn run(&mut self, bag: Vec<Item<(i64,)>>) -> Resolution<(i64,)> {
+            Resolution {
+                groups: Vec::new(),
+                residual: bag.into_iter().filter(|i| i.amount != 0).collect(),
+            }
+        }
+    }
+
+    #[test]
+    fn pivot_reemits_forward_floored_rows() {
+        // id 1: a parent residual of 1 (of original 100) at lane 3 forward-maps
+        // to floor(3*1/100) = 0, so a zero-dropping inner discards it. The pivot
+        // conservation closure must return it whole to residual at parent 1, or
+        // the cent leaks and the recon airlock aborts. This is the exact leak in
+        // `fixed_point(seq(pivot(l1), pivot(l2), pivot(l3, flow)))` when an
+        // earlier lane leaves a sub-lane-unit residual.
+        // id 2: parent 50 at lane 50 survives untouched.
+        let b = vec![
+            Item {
+                id: 1,
+                original: 100,
+                amount: 1,
+                data: (3i64,),
+            },
+            Item {
+                id: 2,
+                original: 50,
+                amount: 50,
+                data: (50i64,),
+            },
+        ];
+        let mut s = pivot(|d: &(i64,)| d.0, Box::new(DropZeros));
+        let r = s.run(b);
+        assert!(r.groups.is_empty());
+        let mut res: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
+        res.sort();
+        assert_eq!(res, vec![(1, 1), (2, 50)]);
     }
 
     // --- soakers ---------------------------------------------------------
