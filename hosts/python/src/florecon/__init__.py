@@ -36,6 +36,13 @@ from .persist import (
 from .projections import connected_components, primary_assignments, strict_assignments
 from .tags import TagStore
 
+try:
+    from importlib.metadata import PackageNotFoundError, version
+
+    __version__ = version("florecon-host")
+except PackageNotFoundError:  # not installed (e.g. running from a source checkout)
+    __version__ = "0+unknown"
+
 __all__ = [
     "Florecon",
     "Workspace",
@@ -54,5 +61,5 @@ __all__ = [
     "groups_csv",
     "results_csv",
     "result_json",
+    "__version__",
 ]
-__version__ = "0.1.0"
