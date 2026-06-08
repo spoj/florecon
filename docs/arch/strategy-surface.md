@@ -472,10 +472,11 @@ soakers      soak_all  soak_small  soak_if   (SoakMode)
 flow         FlowSpec builder  (+ optional flow_util::tiered cost helper)
 ```
 
-~26 functions + one builder. Net change from today: **−5** (`Model`,
-`exact_1to1_any`, `filter`, `branch`, the `max_bps/max_abs` soak knobs), **+6
-sugar/widening** (`when`, `identity`, `partition_by_with`, `Group` metrics, the
-`whole_net`/`whole_only` netting commit gate), **2 renames/reshapes**
+**23 constructor functions** (8 bag combinators + 7 group combinators + 5 leaves
++ 3 soakers) **+ one builder** (`FlowSpec`). Net change from today: **−5**
+(`Model`, `exact_1to1_any`, `filter`, `branch`, the `max_bps/max_abs` soak knobs),
+**+6 sugar/widening** (`when`, `identity`, `partition_by_with`, `Group` metrics,
+the `whole_net`/`whole_only` netting commit gate), **2 renames/reshapes**
 (`flow`/`FlowSpec`, `soak_small` on `Tol`). Smaller, and every node now obeys one
 closure idiom and belongs to exactly one family.
 ```
