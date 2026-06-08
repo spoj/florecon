@@ -30,7 +30,7 @@
 //! rows they are certain about; [`flow`] is the global *arbiter* for the
 //! ambiguous residual where strategies would otherwise compete.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 // The incremental min-cost-flow matcher is just the arbiter behind the `flow`
 // strategy leaf, so it lives here as one strategy among many. Kept in its own
@@ -377,6 +377,79 @@ where
     FP: Fn(&Group) -> bool + 'static,
 {
     Box::new(Filter { pred, inner })
+}
+
+struct WholeOnly<E> {
+    inner: Box<dyn Strategy<E>>,
+}
+
+impl<E: Clone> Strategy<E> for WholeOnly<E> {
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        // Snapshot the input to rematerialize dissolved lots (a group carries
+        // only `Allocation { id, amount }`).
+        let src: HashMap<ExtId, Item<E>> = bag.iter().map(|i| (i.id, i.clone())).collect();
+        let mut r = self.inner.run(bag);
+
+        // "Whole" is decided against the inner's *own* residual snapshot: a
+        // member id that appears in residual was only partially consumed, so any
+        // group touching it is a partial fill. Snapshot first so the decision is
+        // stable as rejected groups are dissolved back.
+        let resid_ids: HashSet<ExtId> = r.residual.iter().map(|i| i.id).collect();
+
+        let mut kept = Vec::with_capacity(r.groups.len());
+        let mut residual_ix: HashMap<ExtId, usize> = r
+            .residual
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| (item.id, ix))
+            .collect();
+        for g in r.groups.drain(..) {
+            // Keep only self-contained groups: every member fully consumed here.
+            if g.members.iter().all(|a| !resid_ids.contains(&a.id)) {
+                kept.push(g);
+                continue;
+            }
+            // Reject the whole group back to residual (all-or-nothing): a partial
+            // fill commits nothing. `kept ⊎ residual = input` in summed (id, amount).
+            for a in &g.members {
+                match residual_ix.get(&a.id) {
+                    Some(&ix) => r.residual[ix].amount += a.amount,
+                    None => {
+                        if let Some(orig) = src.get(&a.id) {
+                            residual_ix.insert(a.id, r.residual.len());
+                            r.residual.push(Item {
+                                id: a.id,
+                                original: orig.original,
+                                amount: a.amount,
+                                data: orig.data.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Resolution {
+            groups: kept,
+            residual: r.residual,
+        }
+    }
+}
+
+/// Commit only **self-contained** groups: keep an inner group iff every member
+/// row is fully consumed inside it (its id appears in no residual lot), and
+/// dissolve any group that touches a partially-filled row whole back to
+/// residual. All-or-nothing on a liberal matcher's output -- let [`flow`]
+/// discover the N:M structure, then commit only the components that cleared
+/// completely; boundary rows that flow could only partially fill take their
+/// whole component to residual rather than leaving a lopsided, non-zero match.
+///
+/// This is the acceptor `accept_if` cannot express: a [`Group`] sheds each
+/// row's `original` and never sees the residual, so "is this edge whole?" is
+/// out of scope for a `Fn(&Group) -> bool` predicate. `whole_only` decides
+/// against the residual instead. Conservation holds -- a rejected group's
+/// allocations return to residual (merged by id).
+pub fn whole_only<E: Clone + 'static>(inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>> {
+    Box::new(WholeOnly { inner })
 }
 
 struct Coalesce<E> {
@@ -2141,6 +2214,52 @@ mod tests {
         for i in &r.residual {
             assert_eq!(i.amount.abs(), 7);
         }
+    }
+
+    #[test]
+    fn whole_only_commits_complete_components_only() {
+        // Inner emits a fully-cleared pair (1,2) and a partial fill: 3 matches
+        // part of 4, but 4 leaves -70 in residual, so the (3,4) group touches a
+        // partially-consumed row.
+        struct Scenario;
+        impl Strategy<i64> for Scenario {
+            fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+                let m: HashMap<ExtId, Item<i64>> = bag.into_iter().map(|i| (i.id, i)).collect();
+                let groups = vec![
+                    Group {
+                        members: vec![
+                            Allocation { id: 1, amount: m[&1].amount },
+                            Allocation { id: 2, amount: m[&2].amount },
+                        ],
+                        origin: "x".into(),
+                        net: m[&1].amount + m[&2].amount,
+                        reason: None,
+                    },
+                    Group {
+                        members: vec![
+                            Allocation { id: 3, amount: 30 },
+                            Allocation { id: 4, amount: -30 },
+                        ],
+                        origin: "x".into(),
+                        net: 0,
+                        reason: None,
+                    },
+                ];
+                let mut r4 = m[&4].clone();
+                r4.amount = -70;
+                Resolution { groups, residual: vec![r4] }
+            }
+        }
+        let b = bag(&[(1, 50), (2, -50), (3, 30), (4, -100)]);
+        let mut s = whole_only(Box::new(Scenario));
+        let r = s.run(b);
+        conserves(4, &r);
+        // Only the self-contained (1,2) clears; the partial (3,4) group dissolves.
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(ids(&r.groups[0]), vec![1, 2]);
+        let mut left: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
+        left.sort();
+        assert_eq!(left, vec![(3, 30), (4, -100)]);
     }
 
     #[test]
