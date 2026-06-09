@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "florecon"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow",
  "csv",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "florecon-derive"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
