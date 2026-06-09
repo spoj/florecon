@@ -100,7 +100,7 @@ Type shapes:
 ```
             bag combinators                    leaves                group combinators
 input ──▶ seq/partition_by/             ──▶ exact_1to1/agg_net/  ──▶ labeled/accept_if/   ──▶ groups
-          partition_by_with/when/            signal_group/             coalesce/whole_net
+          partition_by_with/when/            signal_group/             coalesce/whole_net/material
           windowed/pivot/fixed_point         running_zero/flow
                                                                    soakers terminate ──▶ groups (∅ residual)
 ```
@@ -185,6 +185,7 @@ earns nothing.
 | `coalesce` | `coalesce(origin, inner)` | fuse interlocking groups (shared member) into settlement clusters — the **settlement authority** |
 | `settle` | `settle(spec) = coalesce("flow", flow(spec))` | the blessed settlement view over `flow`: discover arcs, fold them into clusters |
 | `whole_net` | `whole_net(tol, inner)` | commit clusters of **whole lines** whose net clears within `tol`; the break stays **inside** the group. `whole_net(0, inner)` commits only self-contained (net-exactly-0) clusters |
+| `material` | `material(tol, inner)` | drop **immaterial** groups: keep iff moved volume `M=Σ\|leg\|` exceeds `tol` (`Rel` measures `M` against `Σ\|original\|`), else dissolve back to residual |
 
 `filter` is **removed** as a redundant alias of `accept_if`. Pick the name that
 states the semantics (we *accept* groups passing the predicate and dissolve the
@@ -366,6 +367,7 @@ tiered(&[
 | **keep** | `labeled, accept_if, coalesce` | the post-matching group algebra |
 | **add** | `settle(spec)` | `coalesce("flow", flow(spec))` sugar: the settlement view of the arcs `flow` now emits raw |
 | **add** | `whole_net(tol, inner)` | commit whole-line clusters within tolerance; `whole_net(0, ..)` = self-contained only |
+| **add** | `material(tol, inner)` | drop groups whose moved volume `Σ\|leg\|` is immaterial (`Rel`: vs `Σ\|original\|`); the relative-to-original gate `accept_if` can't express |
 | **remove** | `trim, snap` | speculative edge-reshapers with a lopsided-severing sharp edge; revisit from real partial-lot use-cases |
 | **remove** | `whole_only` | exactly `whole_net(0, inner)`; the sugar earns nothing |
 | **reshape** | `flow(spec)` | now a strict primitive returning **raw arcs**; grouping moves to `coalesce`/`settle` |
@@ -478,16 +480,18 @@ foundation   Item  Group  Resolution  Strategy  Tol  Allocation  ExtId
 
 bag combs    seq  partition_by  partition_by_with  when  windowed  pivot  fixed_point  identity
 leaves       exact_1to1  agg_net  signal_group  running_zero  flow(FlowSpec)  settle(FlowSpec)
-group combs  labeled  accept_if  coalesce  whole_net
+group combs  labeled  accept_if  coalesce  whole_net  material
 soakers      soak_all  soak_small  soak_if   (SoakMode)
 flow         FlowSpec builder  (+ optional flow_util::tiered cost helper)
 ```
 
-**21 constructor functions** (8 bag combinators + 4 group combinators + 5 leaves
-+ `settle` flow-sugar + 3 soakers) **+ one builder** (`FlowSpec`). `flow` is now a
-strict primitive node returning raw arcs; `coalesce` is the sole settlement
-authority and `settle` its one-token `flow` sugar; `trim`/`snap`/`whole_only`
-were removed (the first two as speculative edge-reshapers, the last as exactly
-`whole_net(0, ..)`). Every node obeys one closure idiom and belongs to exactly
-one family.
+**22 constructor functions** (8 bag combinators + 5 group combinators + 5 leaves
++ `settle` flow-sugar + 3 soakers) **+ one builder** (`FlowSpec`). `material` is
+the third materiality cell alongside `whole_net` (keep a small *break* inside)
+and `soak_small` (absorb a small *residual*): it kicks a small *match* out,
+measuring moved volume against each row's **original** — the relative case an
+[`accept_if`] closure cannot express, since `Group` sheds `original`. `flow` is a
+strict primitive returning raw arcs; `coalesce` is the sole settlement authority
+and `settle` its one-token `flow` sugar. Every node obeys one closure idiom and
+belongs to exactly one family.
 ```

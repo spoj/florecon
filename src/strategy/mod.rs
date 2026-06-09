@@ -379,6 +379,101 @@ where
     Box::new(Filter { pred, inner })
 }
 
+struct Material<E> {
+    tol: Tol,
+    inner: Box<dyn Strategy<E>>,
+}
+
+impl<E: Clone> Strategy<E> for Material<E> {
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        // Snapshot the input to recover each row's `original` (the materiality
+        // reference) and its payload for the dissolve, exactly as `Filter` does.
+        let src: HashMap<ExtId, Item<E>> = bag.iter().map(|i| (i.id, i.clone())).collect();
+        let mut r = self.inner.run(bag);
+
+        let mut kept = Vec::with_capacity(r.groups.len());
+        let mut residual_ix: HashMap<ExtId, usize> = r
+            .residual
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| (item.id, ix))
+            .collect();
+        for g in r.groups.drain(..) {
+            // Moved volume: sum of |leg| across the group's allocations.
+            let moved: i64 = g.members.iter().map(|a| a.amount.abs()).sum();
+            // Reference base: sum of |original| over the group's *distinct*
+            // member ids (original is per-row, so a repeated id counts once).
+            let mut seen: HashSet<ExtId> = HashSet::new();
+            let base: i64 = g
+                .members
+                .iter()
+                .filter(|a| seen.insert(a.id))
+                .filter_map(|a| src.get(&a.id))
+                .map(|i| i.original.abs())
+                .sum();
+            // `Tol::slack` with our own `base` as the scale: `Abs(t)` ignores it
+            // and returns `t`; `Rel`/`RelMax` return `bps`-of-`base` (floored).
+            // The two relative forms coincide here -- the reference is the total
+            // original, not a single leg -- so there is no smallest/largest pick.
+            if moved > self.tol.slack(base) {
+                kept.push(g);
+                continue;
+            }
+            // Immaterial: dissolve every leg back to residual (merged by id), so
+            // `kept ⊎ residual = input` in summed (id, amount). A later stage gets
+            // to rematch those lots.
+            for a in &g.members {
+                match residual_ix.get(&a.id) {
+                    Some(&ix) => r.residual[ix].amount += a.amount,
+                    None => {
+                        if let Some(orig) = src.get(&a.id) {
+                            residual_ix.insert(a.id, r.residual.len());
+                            r.residual.push(Item {
+                                id: a.id,
+                                original: orig.original,
+                                amount: a.amount,
+                                data: orig.data.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Resolution {
+            groups: kept,
+            residual: r.residual,
+        }
+    }
+}
+
+/// Drop **immaterial** groups: keep a group only if its *moved volume*
+/// `M = Σ |leg|` (the sum of its allocation magnitudes) exceeds the tolerance,
+/// otherwise dissolve it back into the residual (conserving) for a later stage
+/// to reconsider. The mirror of [`whole_net`]: that keeps a small *break*
+/// **inside** a group, this kicks a small *match* **out**; [`soak_small`]
+/// absorbs a small *residual* into a bucket — three distinct materiality cells.
+///
+/// Tolerance basis ([`Tol`], §6):
+/// - `Abs(t)` — keep iff `M > t`. (Already expressible as
+///   `accept_if(|g| Σ|leg| > t, ..)`; offered here so authors don't switch
+///   primitives for the absolute case.)
+/// - `Rel { bps, floor }` — keep iff `M > max(floor, bps·R/10_000)`, where the
+///   reference `R = Σ |original|` is summed over the group's **distinct member
+///   ids**. This is the load-bearing case: a `Group` sheds each row's
+///   `original`, so "is this match small *relative to the rows' original size*?"
+///   is out of an [`accept_if`] predicate's reach. `RelMax` behaves identically
+///   — the reference is the total original, not a single leg.
+///
+/// `material` measures slices against each row's **birth** size, not the
+/// residual entering this stage: a row already 99% cleared upstream whose final
+/// sliver matches cleanly here reads as immaterial and returns to residual. It
+/// is a general per-group gate (no internal coalesce) — compose [`coalesce`] /
+/// [`settle`] before it for settlement-granularity, or run it on raw [`flow`]
+/// arcs for arc-granularity.
+pub fn material<E: Clone + 'static>(tol: Tol, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>> {
+    Box::new(Material { tol, inner })
+}
+
 struct WholeNet<E> {
     tol: Tol,
     inner: Box<dyn Strategy<E>>,
@@ -2061,6 +2156,104 @@ mod tests {
         for i in &r.residual {
             assert_eq!(i.amount.abs(), 7);
         }
+    }
+
+    // Inner that fully matches a small slice of two big rows: a +M/-M pair drawn
+    // from rows whose `original` is `big`, leaving the rest as ground residual.
+    struct Slice {
+        moved: i64,
+    }
+    impl Strategy<i64> for Slice {
+        fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+            let m: HashMap<ExtId, Item<i64>> = bag.into_iter().map(|i| (i.id, i)).collect();
+            let groups = vec![Group {
+                members: vec![
+                    Allocation {
+                        id: 1,
+                        amount: self.moved,
+                    },
+                    Allocation {
+                        id: 2,
+                        amount: -self.moved,
+                    },
+                ],
+                origin: "flow".into(),
+                net: 0,
+                reason: None,
+            }];
+            let mut t1 = m[&1].clone();
+            t1.amount = m[&1].original - self.moved;
+            let mut t2 = m[&2].clone();
+            t2.amount = m[&2].original + self.moved;
+            let residual = [t1, t2].into_iter().filter(|i| i.amount != 0).collect();
+            Resolution { groups, residual }
+        }
+    }
+
+    #[test]
+    fn material_rel_prunes_a_sliver_of_a_big_row() {
+        // Rows born at 1000/-1000; flow cleared only 30/-30. Moved volume M=60,
+        // reference R=2000. 5% of R is 100, so 60 <= 100 -> immaterial, dissolved
+        // back to residual whole.
+        let mut s = material(
+            Tol::Rel { bps: 500, floor: 0 },
+            Box::new(Slice { moved: 30 }),
+        );
+        let r = s.run(bag(&[(1, 1000), (2, -1000)]));
+        assert!(r.groups.is_empty(), "60 <= 5% of 2000");
+        let mut left: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
+        left.sort();
+        assert_eq!(left, vec![(1, 1000), (2, -1000)], "rows return whole");
+    }
+
+    #[test]
+    fn material_rel_keeps_a_substantial_match() {
+        // Same rows, but 300/-300 cleared. M=600 > 5% of 2000 (=100), so the
+        // match is material and survives; only the uncleared tail is residual.
+        let mut s = material(
+            Tol::Rel { bps: 500, floor: 0 },
+            Box::new(Slice { moved: 300 }),
+        );
+        let r = s.run(bag(&[(1, 1000), (2, -1000)]));
+        assert_eq!(r.groups.len(), 1, "600 > 5% of 2000");
+        assert_eq!(ids(&r.groups[0]), vec![1, 2]);
+        // Conservation in amount: matched 300 + residual 700 per side = original.
+        let by_id = |id: ExtId| {
+            r.residual
+                .iter()
+                .filter(|i| i.id == id)
+                .map(|i| i.amount)
+                .sum::<i64>()
+        };
+        assert_eq!(by_id(1), 700);
+        assert_eq!(by_id(2), -700);
+    }
+
+    #[test]
+    fn material_abs_prunes_below_fixed_floor_ignoring_original() {
+        // Abs measures moved volume against a fixed magnitude, not original.
+        // M=60: dropped at Abs(100), kept at Abs(50).
+        let mut s = material(Tol::Abs(100), Box::new(Slice { moved: 30 }));
+        let r = s.run(bag(&[(1, 1000), (2, -1000)]));
+        assert!(r.groups.is_empty(), "60 <= 100");
+
+        let mut s = material(Tol::Abs(50), Box::new(Slice { moved: 30 }));
+        let r = s.run(bag(&[(1, 1000), (2, -1000)]));
+        assert_eq!(r.groups.len(), 1, "60 > 50");
+    }
+
+    #[test]
+    fn material_dissolve_merges_onto_existing_residual_and_conserves() {
+        // The dissolved legs fold onto the rows' surviving residual tails rather
+        // than appearing as duplicate lots: one residual entry per id, summing
+        // to the original.
+        let mut s = material(Tol::Abs(1000), Box::new(Slice { moved: 30 }));
+        let r = s.run(bag(&[(1, 1000), (2, -1000)]));
+        assert!(r.groups.is_empty());
+        assert_eq!(r.residual.len(), 2, "no duplicate lots");
+        let mut left: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
+        left.sort();
+        assert_eq!(left, vec![(1, 1000), (2, -1000)]);
     }
 
     #[test]
