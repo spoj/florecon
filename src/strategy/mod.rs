@@ -1345,6 +1345,289 @@ where
     })
 }
 
+/// A pure seeded hash (splitmix64) of a 64-bit word. The *only* source of
+/// "randomness" in the stochastic strategies, so every choice is a reproducible
+/// function of row ids and an explicit seed -- never an RNG or the clock, which
+/// keeps warm-vs-cold parity and golden replays intact.
+fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+fn seed_mix(a: u64, b: u64) -> u64 {
+    splitmix64(a ^ splitmix64(b))
+}
+
+/// Candidate cap per anchor. Blocking ([`partition_by`]/[`windowed`]) should
+/// keep pools well below this; beyond it the meet-in-the-middle halves blow up,
+/// so a degenerate block is truncated to its largest-magnitude candidates.
+const SUBSET_CAND_CAP: usize = 32;
+
+struct SubsetSum<E> {
+    tol: i64,
+    max_group: usize,
+    seed: u64,
+    _e: PhantomData<E>,
+}
+
+impl<E> Strategy<E> for SubsetSum<E> {
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let n = bag.len();
+        let mut consumed = vec![false; n];
+        let max_partners = self.max_group.saturating_sub(1);
+
+        // Anchor order: largest |amount| first (decompose a big lot into smaller
+        // partners), ties broken by a seeded hash so distinct seeds explore
+        // distinct matchings under `restart`.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| {
+            (
+                std::cmp::Reverse(bag[i].amount.unsigned_abs()),
+                seed_mix(bag[i].id, self.seed),
+            )
+        });
+
+        let mut groups = Vec::new();
+        for &ai in &order {
+            if consumed[ai] || bag[ai].amount == 0 || max_partners == 0 {
+                continue;
+            }
+            let target = bag[ai].amount.unsigned_abs() as i64;
+            let want_sign = -bag[ai].amount.signum();
+
+            // Opposite-sign, unconsumed lots no larger than the band (a single
+            // partner above `target + tol` cannot belong to any in-band subset).
+            let mut cands: Vec<(usize, ExtId, i64)> = (0..n)
+                .filter(|&j| {
+                    !consumed[j]
+                        && j != ai
+                        && bag[j].amount.signum() == want_sign
+                        && bag[j].amount.unsigned_abs() as i64 <= target + self.tol
+                })
+                .map(|j| (j, bag[j].id, bag[j].amount.unsigned_abs() as i64))
+                .collect();
+            if cands.is_empty() {
+                continue;
+            }
+            if cands.len() > SUBSET_CAND_CAP {
+                cands.sort_by_key(|&(_, _, mag)| std::cmp::Reverse(mag));
+                cands.truncate(SUBSET_CAND_CAP);
+            }
+
+            if let Some(chosen) = best_subset(target, self.tol, max_partners, &cands, self.seed) {
+                consumed[ai] = true;
+                let mut members = vec![Allocation {
+                    id: bag[ai].id,
+                    amount: bag[ai].amount,
+                }];
+                for &ci in &chosen {
+                    let j = cands[ci].0;
+                    consumed[j] = true;
+                    members.push(Allocation {
+                        id: bag[j].id,
+                        amount: bag[j].amount,
+                    });
+                }
+                let net = members.iter().map(|m| m.amount).sum();
+                let size = members.len();
+                groups.push(Group {
+                    members,
+                    origin: "subset-sum".to_string(),
+                    net,
+                    reason: Some(format!("subset sum of {size} lots")),
+                });
+            }
+        }
+
+        let residual = bag
+            .into_iter()
+            .zip(consumed)
+            .filter_map(|(item, used)| (!used).then_some(item))
+            .collect();
+        Resolution { groups, residual }
+    }
+}
+
+/// Meet-in-the-middle: find a subset of `cands` (each `(global_idx, id,
+/// magnitude > 0)`) whose magnitudes sum within `tol` of `target`, of size at
+/// most `k_max`, picked by *closest to `target`*, then *fewest lots*, then a
+/// seeded canonical key. Returns the chosen positions into `cands`, or `None`
+/// when nothing lands in the band. Splitting `m` lots into halves makes this
+/// `O(2^(m/2))` rather than `O(2^m)`, and it works in value space so the target
+/// can be arbitrarily large (unlike a DP table keyed by amount).
+fn best_subset(
+    target: i64,
+    tol: i64,
+    k_max: usize,
+    cands: &[(usize, ExtId, i64)],
+    seed: u64,
+) -> Option<Vec<usize>> {
+    if k_max == 0 || cands.is_empty() {
+        return None;
+    }
+    let m = cands.len();
+    let mid = m / 2;
+
+    // Every subset of a half (capped at `k_max` lots): (sum, popcount, bitmask,
+    // seeded canonical key). `xor` of per-id seeded hashes is order-independent.
+    let enumerate = |lo: usize, len: usize| -> Vec<(i64, u32, u32, u64)> {
+        let mut out = Vec::new();
+        for mask in 0u32..(1u32 << len) {
+            let pc = mask.count_ones();
+            if pc as usize > k_max {
+                continue;
+            }
+            let mut sum = 0i64;
+            let mut key = 0u64;
+            for b in 0..len {
+                if mask & (1u32 << b) != 0 {
+                    sum += cands[lo + b].2;
+                    key ^= seed_mix(cands[lo + b].1, seed);
+                }
+            }
+            out.push((sum, pc, mask, key));
+        }
+        out
+    };
+
+    let left = enumerate(0, mid);
+    let mut right = enumerate(mid, m - mid);
+    right.sort_by_key(|&(s, _, _, _)| s);
+    let rsums: Vec<i64> = right.iter().map(|&(s, _, _, _)| s).collect();
+
+    // best = (err, card, key, left_mask, right_mask), minimized lexicographically
+    // on (err, card, key).
+    let mut best: Option<(i64, u32, u64, u32, u32)> = None;
+    for &(sl, cl, ml, kl) in &left {
+        let lo = target - tol - sl;
+        let hi = target + tol - sl;
+        let start = rsums.partition_point(|&s| s < lo);
+        for &(sr, cr, mr, kr) in &right[start..] {
+            if sr > hi {
+                break;
+            }
+            let card = cl + cr;
+            if card == 0 || card as usize > k_max {
+                continue;
+            }
+            let cand = ((sl + sr - target).abs(), card, kl ^ kr, ml, mr);
+            if best.is_none_or(|b| (cand.0, cand.1, cand.2) < (b.0, b.1, b.2)) {
+                best = Some(cand);
+            }
+        }
+    }
+
+    best.map(|(_, _, _, ml, mr)| {
+        let mut picks = Vec::new();
+        for b in 0..mid {
+            if ml & (1u32 << b) != 0 {
+                picks.push(b);
+            }
+        }
+        for b in 0..(m - mid) {
+            if mr & (1u32 << b) != 0 {
+                picks.push(mid + b);
+            }
+        }
+        picks
+    })
+}
+
+/// **Atomic many-to-one clearing.** For each anchor lot (largest first), find a
+/// subset of opposite-sign lots whose magnitudes sum within `tol` of the
+/// anchor's, forming a clearing group of *whole* lots (no splitting) of size at
+/// most `max_group`; the small break stays **inside** the group as its `net`
+/// (`|net| <= tol`), like [`agg_net`]. Unmatched lots pass to residual; a later
+/// stage gets to reconsider them.
+///
+/// This fills the gap [`flow`] cannot: flow splits amounts fractionally, so it
+/// can never enforce "use this credit *wholly or not at all*". `subset_sum`
+/// works in whole-lot selection space (meet-in-the-middle, see [`best_subset`]),
+/// which is exactly the canonical "one payment clears several invoices" shape.
+/// It sits between [`agg_net`] (nets a bucket you *already keyed*) and [`flow`]
+/// (divisible): it *discovers* the clearing set by amount search.
+///
+/// **Seeded, not random.** Anchor-order ties and equally-good subsets break on a
+/// pure hash of row ids and `seed`, so a run is reproducible and distinct seeds
+/// surface distinct matchings -- feed it to [`restart`] to try several and keep
+/// the best. There is no warm basis (each shard is recomputed cold), but the
+/// recompute is deterministic. Subset search is exponential, so keep pools small
+/// with blocking ([`partition_by`]/[`windowed`]); degenerate blocks are capped.
+///
+/// A high-recall *proposer*: pair it with a strict *verifier* ([`material`],
+/// [`whole_net`], [`accept_if`]) that dissolves weak groups back to residual.
+pub fn subset_sum<E: 'static>(tol: i64, max_group: usize, seed: u64) -> Box<dyn Strategy<E>> {
+    Box::new(SubsetSum {
+        tol,
+        max_group,
+        seed,
+        _e: PhantomData,
+    })
+}
+
+struct Restart<E, F> {
+    n: usize,
+    seed: u64,
+    factory: F,
+    _e: PhantomData<E>,
+}
+
+impl<E, F> Strategy<E> for Restart<E, F>
+where
+    E: Clone,
+    F: Fn(u64) -> Box<dyn Strategy<E>>,
+{
+    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+        let runs = self.n.max(1);
+        // Keep the run with the most matched volume, then the fewest residual
+        // lots, then the earliest seed (strict-`>` replacement leaves ties with
+        // the lower index).
+        let mut best: Option<Resolution<E>> = None;
+        let mut best_score = (i64::MIN, i64::MIN);
+        for i in 0..runs {
+            let s = seed_mix(self.seed, i as u64);
+            let r = (self.factory)(s).run(bag.clone());
+            let matched: i64 = r
+                .groups
+                .iter()
+                .flat_map(|g| &g.members)
+                .map(|a| a.amount.abs())
+                .sum();
+            let score = (matched, -(r.residual.len() as i64));
+            if best.is_none() || score > best_score {
+                best_score = score;
+                best = Some(r);
+            }
+        }
+        best.expect("restart runs at least once")
+    }
+}
+
+/// Run a seeded family of `n` attempts and keep the **best** result — the most
+/// matched volume (`Σ|leg|` across groups), ties broken by fewest residual lots
+/// then earliest seed. `factory(seed)` builds a fresh inner per attempt, each
+/// fed a distinct seed derived from `seed` (e.g. `|s| subset_sum(tol, 4, s)`),
+/// so a stochastic proposer's random-restart search stays fully reproducible.
+///
+/// The outer half of the *propose / verify* pattern: a high-recall stochastic
+/// inner explores; `restart` selects the best whole [`Resolution`]; a strict
+/// verifier ([`material`]/[`whole_net`]) downstream still gates what commits.
+/// Each attempt re-runs on a clone of the same bag, so `inner` need not be
+/// warm-startable. `n == 0` is treated as one attempt.
+pub fn restart<E, F>(n: usize, seed: u64, factory: F) -> Box<dyn Strategy<E>>
+where
+    E: Clone + 'static,
+    F: Fn(u64) -> Box<dyn Strategy<E>> + 'static,
+{
+    Box::new(Restart {
+        n,
+        seed,
+        factory,
+        _e: PhantomData,
+    })
+}
+
 #[derive(Clone)]
 struct PivotMeta<E> {
     outer: Item<E>,
@@ -2254,6 +2537,131 @@ mod tests {
         let mut left: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
         left.sort();
         assert_eq!(left, vec![(1, 1000), (2, -1000)]);
+    }
+
+    #[test]
+    fn subset_sum_clears_one_against_many_whole_lots() {
+        // +100 anchor clears the {-60, -40} subset exactly; the -25 stays whole
+        // in residual (atomic: never split to top up the match).
+        let mut s = subset_sum(0, 8, 0);
+        let r = s.run(bag(&[(1, 100), (2, -60), (3, -40), (4, -25)]));
+        conserves(4, &r);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].origin, "subset-sum");
+        assert_eq!(r.groups[0].net, 0);
+        assert_eq!(ids(&r.groups[0]), vec![1, 2, 3]);
+        assert_eq!(r.residual.len(), 1);
+        assert_eq!(r.residual[0].id, 4);
+        assert_eq!(r.residual[0].amount, -25, "unmatched lot stays whole");
+    }
+
+    #[test]
+    fn subset_sum_keeps_break_inside_within_tol() {
+        // -98 subset against +100: net +2 stays inside the group when tol >= 2.
+        let mut s = subset_sum(2, 8, 0);
+        let r = s.run(bag(&[(1, 100), (2, -60), (3, -38)]));
+        conserves(3, &r);
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(r.groups[0].net, 2);
+        assert_eq!(ids(&r.groups[0]), vec![1, 2, 3]);
+        assert!(r.residual.is_empty());
+
+        // tol 1 < 2: no in-band subset, everything stays residual.
+        let mut s = subset_sum(1, 8, 0);
+        let r = s.run(bag(&[(1, 100), (2, -60), (3, -38)]));
+        conserves(3, &r);
+        assert!(r.groups.is_empty());
+        assert_eq!(r.residual.len(), 3);
+    }
+
+    #[test]
+    fn subset_sum_respects_the_group_size_cap() {
+        // max_group = 2 admits only 1:1; +100 has no single partner here, so the
+        // three-lot clear is forbidden and all rows stay residual.
+        let mut s = subset_sum(0, 2, 0);
+        let r = s.run(bag(&[(1, 100), (2, -60), (3, -40)]));
+        conserves(3, &r);
+        assert!(r.groups.is_empty());
+        assert_eq!(r.residual.len(), 3);
+
+        // Raising the cap lets the {-60,-40} subset clear the anchor.
+        let mut s = subset_sum(0, 3, 0);
+        let r = s.run(bag(&[(1, 100), (2, -60), (3, -40)]));
+        assert_eq!(r.groups.len(), 1);
+        assert_eq!(ids(&r.groups[0]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn subset_sum_is_reproducible_across_runs() {
+        // Same seed -> byte-identical grouping, twice.
+        let run = || {
+            let mut s = subset_sum(0, 8, 7);
+            let r = s.run(bag(&[(1, 100), (2, -50), (3, -50), (4, -100), (5, 100)]));
+            r.groups.iter().map(|g| (ids(g), g.net)).collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn restart_keeps_the_attempt_that_matches_most() {
+        // A toy inner that matches a clean pair only on odd seeds, nothing on
+        // even. Across several seeds `restart` must surface the matching run.
+        struct Toy {
+            seed: u64,
+        }
+        impl Strategy<i64> for Toy {
+            fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+                if self.seed % 2 == 1 {
+                    let members = bag
+                        .iter()
+                        .map(|i| Allocation {
+                            id: i.id,
+                            amount: i.amount,
+                        })
+                        .collect();
+                    Resolution {
+                        groups: vec![Group {
+                            members,
+                            origin: "toy".into(),
+                            net: bag.iter().map(|i| i.amount).sum(),
+                            reason: None,
+                        }],
+                        residual: vec![],
+                    }
+                } else {
+                    Resolution {
+                        groups: vec![],
+                        residual: bag,
+                    }
+                }
+            }
+        }
+        let mut s = restart(6, 0, |seed| Box::new(Toy { seed }));
+        let r = s.run(bag(&[(1, 5), (2, -5)]));
+        conserves(2, &r);
+        assert_eq!(r.groups.len(), 1, "the matching seed wins");
+        assert!(r.residual.is_empty());
+    }
+
+    #[test]
+    fn restart_drives_subset_sum_to_a_full_clear() {
+        // Two interleaved +100/{-50,-50} settlements plus a distractor. A strict
+        // verifier keeps only exact clears; `restart` searches seeds for the
+        // anchor order that clears the most. End state conserves regardless.
+        let factory = |seed: u64| material(Tol::Abs(0), subset_sum(0, 8, seed));
+        let mut s = restart(8, 42, factory);
+        let r = s.run(bag(&[(1, 100), (2, -50), (3, -50), (4, -50), (5, 50)]));
+        conserves(5, &r);
+        // Whatever it commits nets exactly zero (the verifier's bar).
+        assert!(r.groups.iter().all(|g| g.net == 0));
+        let matched: i64 = r
+            .groups
+            .iter()
+            .flat_map(|g| &g.members)
+            .map(|a| a.amount.abs())
+            .sum();
+        let residual: i64 = r.residual.iter().map(|i| i.amount.abs()).sum();
+        assert_eq!(matched + residual, 300, "conservation in amount");
     }
 
     #[test]

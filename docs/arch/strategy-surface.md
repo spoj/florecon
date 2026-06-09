@@ -116,6 +116,7 @@ input ──▶ seq/partition_by/             ──▶ exact_1to1/agg_net/  ─
 | `windowed` | `windowed(order: Fn(&E)->i64, width, inner)` | sort + sweep bands with carry; locality for the cheap leaves |
 | `pivot` | `pivot(amount: Fn(&E)->i64, inner)` | run `inner` in a different numeraire, translate back |
 | `fixed_point` | `fixed_point(inner, max_passes)` | iterate `inner` on its own residual to convergence |
+| `restart` | `restart(n, seed, factory: Fn(u64)->Strategy)` | run a seeded family of `n` attempts, keep the **best** (most matched volume); the outer half of *propose/verify* |
 | `identity` *(new)* | `identity()` | no-op passthrough; the unit of `seq` |
 
 **Two loop shapes.** `fixed_point(inner, n)` is *convergence-driven*: it re-runs
@@ -165,6 +166,7 @@ race footgun.
 | `agg_net` | `agg_net(key: Fn(&E)->u64, tol)` | a **whole bucket** that nets to zero within `tol` |
 | `signal_group` | `signal_group(signals: Fn(&E)->Vec<u64>, tol, cap)` | multi-key (token) buckets that net; greedy specific-first, `cap`-bounded |
 | `running_zero` | `running_zero(order: Fn(&E)->i64, tol)` | ordered running-balance **clearing segments** |
+| `subset_sum` | `subset_sum(tol, max_group, seed)` | **atomic many-to-one clearing**: a whole-lot subset summing within `tol` of an anchor (meet-in-the-middle); seeded |
 | `flow` | `flow(FlowSpec<E>)` | the global **min-cost-flow arbiter** over the ambiguous remainder; emits the matching as **raw arcs** (one 2-member net-0 group per positive-flow arc), *not* settlements |
 
 These four-plus-one share one shape — *bucket, then accept-if-balanced* —
@@ -172,6 +174,16 @@ differing only in how buckets form (key / multi-key / order / proximity-graph)
 and the acceptance rule (pairwise / whole-net / running / optimized). That shared
 shape is worth documenting but **not** worth collapsing into a god-leaf: the
 disjoint-vs-overlapping and pairwise-vs-whole distinctions are the point.
+
+`subset_sum` is the **atomic** counterpart to divisible `flow`: it selects whole
+lots (no fractional splitting), filling the canonical "one payment clears several
+invoices" shape that a flow LP cannot express (it would split a credit to top up
+the target). The small break stays **inside** the group as its `net`, like
+`agg_net`. Its search is exponential, so it relies on blocking
+(`partition_by`/`windowed`) to keep pools small; it is **seeded** (anchor-order
+and subset ties break on a pure hash of ids + `seed`), making it a reproducible
+*high-recall proposer* in the propose/verify idiom — pair it with a strict
+verifier (`material`/`whole_net`/`accept_if`) and the `restart` combinator (§4.1).
 
 `exact_1to1_any()` is **removed** — it is `exact_1to1(|_| Some(0))`; the sugar
 earns nothing.
@@ -368,6 +380,8 @@ tiered(&[
 | **add** | `settle(spec)` | `coalesce("flow", flow(spec))` sugar: the settlement view of the arcs `flow` now emits raw |
 | **add** | `whole_net(tol, inner)` | commit whole-line clusters within tolerance; `whole_net(0, ..)` = self-contained only |
 | **add** | `material(tol, inner)` | drop groups whose moved volume `Σ\|leg\|` is immaterial (`Rel`: vs `Σ\|original\|`); the relative-to-original gate `accept_if` can't express |
+| **add** | `subset_sum(tol, max_group, seed)` | atomic whole-lot many-to-one clearing (meet-in-the-middle); the hard-cardinality shape `flow`'s LP can't express |
+| **add** | `restart(n, seed, factory)` | seeded random-restart over a stochastic proposer, keep the best; the outer half of propose/verify |
 | **remove** | `trim, snap` | speculative edge-reshapers with a lopsided-severing sharp edge; revisit from real partial-lot use-cases |
 | **remove** | `whole_only` | exactly `whole_net(0, inner)`; the sugar earns nothing |
 | **reshape** | `flow(spec)` | now a strict primitive returning **raw arcs**; grouping moves to `coalesce`/`settle` |
@@ -478,18 +492,22 @@ group-metric atoms.
 foundation   Item  Group  Resolution  Strategy  Tol  Allocation  ExtId
              Group::{member_ids,size,abs_net,max_abs,min_side,clean}
 
-bag combs    seq  partition_by  partition_by_with  when  windowed  pivot  fixed_point  identity
-leaves       exact_1to1  agg_net  signal_group  running_zero  flow(FlowSpec)  settle(FlowSpec)
+bag combs    seq  partition_by  partition_by_with  when  windowed  pivot  fixed_point  restart  identity
+leaves       exact_1to1  agg_net  signal_group  running_zero  subset_sum  flow(FlowSpec)  settle(FlowSpec)
 group combs  labeled  accept_if  coalesce  whole_net  material
 soakers      soak_all  soak_small  soak_if   (SoakMode)
 flow         FlowSpec builder  (+ optional flow_util::tiered cost helper)
 ```
 
-**22 constructor functions** (8 bag combinators + 5 group combinators + 5 leaves
-+ `settle` flow-sugar + 3 soakers) **+ one builder** (`FlowSpec`). `material` is
-the third materiality cell alongside `whole_net` (keep a small *break* inside)
-and `soak_small` (absorb a small *residual*): it kicks a small *match* out,
-measuring moved volume against each row's **original** — the relative case an
+**24 constructor functions** (9 bag combinators + 5 group combinators + 6 leaves
++ `settle` flow-sugar + 3 soakers) **+ one builder** (`FlowSpec`). The newest cell
+is the **propose/verify** pair: `subset_sum` is a seeded high-recall *proposer*
+(the atomic whole-lot clearing `flow` can't express), `restart` runs a seeded
+family and keeps the best, and a strict verifier (`material`/`whole_net`) gates
+what commits — randomness is always a pure hash of ids + seed, never an RNG.
+`material` is the third materiality cell beside `whole_net` (keep a small *break*
+inside) and `soak_small` (absorb a small *residual*): it kicks a small *match*
+out, measuring moved volume against each row's **original** — the relative case an
 [`accept_if`] closure cannot express, since `Group` sheds `original`. `flow` is a
 strict primitive returning raw arcs; `coalesce` is the sole settlement authority
 and `settle` its one-token `flow` sugar. Every node obeys one closure idiom and
