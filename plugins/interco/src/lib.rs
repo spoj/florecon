@@ -19,7 +19,7 @@
 use florecon::export_plugin;
 use florecon::sdk::{Domain, Plugin, Record};
 use florecon::strategy::{
-    FlowSpec, Strategy, agg_net, exact_1to1, flow, partition_by, seq, signal_group,
+    FlowSpec, Strategy, agg_net, exact_1to1, partition_by, seq, settle, signal_group,
 };
 use florecon::token::fnv1a;
 
@@ -184,7 +184,7 @@ impl Plugin for IntercoPlugin {
                             agg_net(|t: &Row| t.objsub, TOL),
                             exact_1to1(|_t: &Row| Some(0)),
                             signal_group(|t: &Row| t.tokens.clone(), TOL, CAP),
-                            flow(interco_spec(1000.0)),
+                            settle(interco_spec(1000.0)),
                         ])
                     },
                 )

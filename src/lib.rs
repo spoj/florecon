@@ -6,7 +6,7 @@
 //!
 //! - [`strategy`] — **the spine.** A combinator algebra over an unordered bag of
 //!   items. Cheap deterministic primitives (`exact_1to1`, `agg_net`,
-//!   `signal_group`, `running_zero`, `pivot`, `trim`, `snap`) cascade and shard
+//!   `signal_group`, `running_zero`, `pivot`) cascade and shard
 //!   via `seq`, `partition_by`, `when`, and `windowed`. One leaf —
 //!   [`strategy::flow`] — is the min-cost-flow arbiter: describe a domain via a
 //!   [`strategy::FlowSpec`] and the leaf drives the [`engine`] over it. The

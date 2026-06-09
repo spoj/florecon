@@ -308,70 +308,22 @@ impl<E> Flow<E> {
         self.entries.values().map(|e| e.arcs.len()).sum::<usize>() / 2
     }
 
-    /// Matched allocations grouped by connected component of positive-flow real
-    /// arcs, each with its residual net. A partially consumed row appears with
-    /// only the consumed amount; its remainder is returned by
-    /// [`Self::unmatched_allocations`].
-    fn allocation_groups(&self) -> Vec<(Vec<Allocation>, i64)> {
-        let (matched_by_id, adj) = self.flow_readback();
-        let mut visited: HashMap<ExtId, bool> = HashMap::new();
-        let mut groups = Vec::new();
-        for &start in adj.keys() {
-            if visited.get(&start).copied().unwrap_or(false) {
-                continue;
-            }
-            let mut stack = vec![start];
-            let mut ids = Vec::new();
-            visited.insert(start, true);
-            while let Some(n) = stack.pop() {
-                ids.push(n);
-                if let Some(neighbors) = adj.get(&n) {
-                    for &nb in neighbors {
-                        if !visited.get(&nb).copied().unwrap_or(false) {
-                            visited.insert(nb, true);
-                            stack.push(nb);
-                        }
-                    }
-                }
-            }
-            ids.sort_unstable();
-            let mut members: Vec<Allocation> = ids
-                .into_iter()
-                .filter_map(|id| {
-                    let amount = *matched_by_id.get(&id).unwrap_or(&0);
-                    (amount != 0).then_some(Allocation { id, amount })
-                })
-                .collect();
-            members.sort_by_key(|a| a.id);
-            let net: i64 = members.iter().map(|a| a.amount).sum();
-            groups.push((members, net));
-        }
-        groups
-    }
-
-    /// Matched amount plus unmatched remainder per row/lot id. Remainders keep
-    /// the sign of the original base amount.
-    fn unmatched_allocations(&self) -> Vec<Allocation> {
-        let (matched_by_id, _adj) = self.flow_readback();
-        let mut out = Vec::new();
-        for (&id, e) in &self.entries {
-            let matched = *matched_by_id.get(&id).unwrap_or(&0);
-            let rem = e.base - matched;
-            if rem != 0 {
-                out.push(Allocation { id, amount: rem });
-            }
-        }
-        out.sort_by_key(|a| a.id);
-        out
-    }
-
-    fn flow_readback(&self) -> (HashMap<ExtId, i64>, HashMap<ExtId, Vec<ExtId>>) {
+    /// Positive-flow real arcs as `(source id, sink id, amount)`, source being
+    /// the positive-base side. This is flow's primitive output: the **matching
+    /// itself**, one edge per arc -- not a settlement view. Grouping arcs into
+    /// connected-component settlements is [`super::coalesce`]'s job (and is what
+    /// the `settle`/`whole_*` combinators compose on top).
+    ///
+    /// Sorted canonically by `(src, snk, amount)` so the readback is stable run
+    /// to run, independent of the warm leaf's internal arc-vec layout (which
+    /// differs warm vs cold even at an identical objective; the optimum is
+    /// unique in cost but degenerate in which equal-cost arcs carry flow).
+    fn matched_arcs(&self) -> Vec<(ExtId, ExtId, i64)> {
         let mut slot_to_ext: HashMap<NodeId, ExtId> = HashMap::new();
         for (id, e) in &self.entries {
             slot_to_ext.insert(e.node, *id);
         }
-        let mut matched_by_id: HashMap<ExtId, i64> = HashMap::new();
-        let mut adj: HashMap<ExtId, Vec<ExtId>> = HashMap::new();
+        let mut arcs: Vec<(ExtId, ExtId, i64)> = Vec::new();
         for (from, to, f) in self.net.matches() {
             if let (Some(&a), Some(&b)) = (slot_to_ext.get(&from), slot_to_ext.get(&to)) {
                 let ea = &self.entries[&a];
@@ -383,13 +335,38 @@ impl<E> Flow<E> {
                 } else {
                     continue;
                 };
-                *matched_by_id.entry(src).or_insert(0) += f;
-                *matched_by_id.entry(snk).or_insert(0) -= f;
-                adj.entry(a).or_default().push(b);
-                adj.entry(b).or_default().push(a);
+                arcs.push((src, snk, f));
             }
         }
-        (matched_by_id, adj)
+        arcs.sort_unstable();
+        arcs
+    }
+
+    /// Matched mass per id (positive on sources, negative on sinks), summed over
+    /// every arc. Used only to compute each row's unmatched remainder.
+    fn matched_by_id(&self) -> HashMap<ExtId, i64> {
+        let mut m: HashMap<ExtId, i64> = HashMap::new();
+        for (src, snk, f) in self.matched_arcs() {
+            *m.entry(src).or_insert(0) += f;
+            *m.entry(snk).or_insert(0) -= f;
+        }
+        m
+    }
+
+    /// Matched amount plus unmatched remainder per row/lot id. Remainders keep
+    /// the sign of the original base amount.
+    fn unmatched_allocations(&self) -> Vec<Allocation> {
+        let matched_by_id = self.matched_by_id();
+        let mut out = Vec::new();
+        for (&id, e) in &self.entries {
+            let matched = *matched_by_id.get(&id).unwrap_or(&0);
+            let rem = e.base - matched;
+            if rem != 0 {
+                out.push(Allocation { id, amount: rem });
+            }
+        }
+        out.sort_by_key(|a| a.id);
+        out
     }
 
     // --- candidate generation -------------------------------------------
@@ -577,12 +554,18 @@ where
         }
 
         let groups = self
-            .allocation_groups()
+            .matched_arcs()
             .into_iter()
-            .map(|(members, net)| Group {
-                members,
+            .map(|(src, snk, f)| Group {
+                members: vec![
+                    Allocation { id: src, amount: f },
+                    Allocation {
+                        id: snk,
+                        amount: -f,
+                    },
+                ],
                 origin: "flow".to_string(),
-                net,
+                net: 0,
                 reason: Some("min-cost flow".to_string()),
             })
             .collect();
@@ -605,11 +588,22 @@ where
 }
 
 /// The global arbiter: hand the residual to the min-cost-flow engine, which
-/// resolves competing candidates into one consistent grouping. This is where
+/// resolves competing candidates into one consistent matching. This is where
 /// *proposing* signals (reference + amount + date, via the [`FlowSpec`]) become
-/// a committed partition. The returned leaf is *stateful* — it keeps its basis
-/// warm across solves — but that is invisible to the caller: a one-shot solve
-/// just runs it once.
+/// committed **arcs**.
+///
+/// `flow` is a strict primitive node: it returns the matching at its most
+/// atomic -- **one two-member group per positive-flow arc** (`{source: +f,
+/// sink: -f}`, net 0), plus the residual -- and nothing else. It deliberately
+/// does *not* fold those arcs into settlement clusters; grouping is a separate
+/// concern owned by the composition layer (`coalesce`, and the `settle` /
+/// `whole_net` sugar built on it). Reaching for bare `flow`
+/// means you want the raw edges (per-arc reshaping, who-matched-whom analysis);
+/// note they carry the optimizer's optimal-face degeneracy that aggregation
+/// collapses, so canonical run-to-run identity comes only after coalescing.
+///
+/// The returned leaf is *stateful* -- it keeps its basis warm across solves --
+/// but that is invisible to the caller: a one-shot solve just runs it once.
 pub fn flow<E>(spec: FlowSpec<E>) -> Box<dyn Strategy<E>>
 where
     E: Clone + 'static,
@@ -671,6 +665,30 @@ mod tests {
     }
 
     #[test]
+    fn bare_flow_emits_raw_arcs_not_settlements() {
+        // A partial-match shape: id 3 (-250) draws from id 1 (100) and id 2
+        // (200). Bare `flow` exposes that as *two arcs* (the primitive
+        // matching); `settle`/`coalesce` fold them into one {1,2,3} settlement.
+        let mut s = flow(demo());
+        let r = s.run(vec![item(1, 100, 0), item(2, 200, 1), item(3, -250, 0)]);
+        assert_eq!(r.groups.len(), 2, "one group per positive-flow arc");
+        // Every arc is a clean two-member, net-0 edge sharing the -250 sink.
+        assert!(r.groups.iter().all(|g| g.members.len() == 2 && g.net == 0));
+        assert!(r.groups.iter().all(|g| ids(g).contains(&3)));
+        let matched: i64 = r
+            .groups
+            .iter()
+            .flat_map(|g| &g.members)
+            .filter(|a| a.amount > 0)
+            .map(|a| a.amount)
+            .sum();
+        assert_eq!(matched, 250);
+        // Residual is identical to the settled view: 50 of the 300 unmatched.
+        assert_eq!(r.residual.iter().map(|i| i.amount).sum::<i64>(), 50);
+        assert_eq!(r.residual.len(), 1);
+    }
+
+    #[test]
     fn streaming_add_is_warm() {
         let mut s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0)]);
@@ -684,28 +702,6 @@ mod tests {
         ]);
         assert_eq!(r.groups.len(), 2);
         assert!(r.groups.iter().all(|g| g.net == 0));
-    }
-
-    #[test]
-    fn allocation_readback_exposes_partial_matches() {
-        let mut s = flow(demo());
-        let r = s.run(vec![item(1, 100, 0), item(2, 200, 1), item(3, -250, 0)]);
-        assert_eq!(r.groups.len(), 1);
-        let g = &r.groups[0];
-        assert_eq!(g.net, 0);
-        assert_eq!(g.members.iter().map(|a| a.amount).sum::<i64>(), 0);
-        assert_eq!(
-            g.members
-                .iter()
-                .filter(|a| a.amount > 0)
-                .map(|a| a.amount)
-                .sum::<i64>(),
-            250
-        );
-        assert_eq!(ids(g), vec![1, 2, 3]);
-        // 50 of the 300 source remains unmatched.
-        assert_eq!(r.residual.iter().map(|i| i.amount).sum::<i64>(), 50);
-        assert_eq!(r.residual.len(), 1);
     }
 
     #[test]

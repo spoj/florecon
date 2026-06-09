@@ -100,7 +100,7 @@ Type shapes:
 ```
             bag combinators                    leaves                group combinators
 input ──▶ seq/partition_by/             ──▶ exact_1to1/agg_net/  ──▶ labeled/accept_if/   ──▶ groups
-          partition_by_with/when/            signal_group/             coalesce/trim/snap
+          partition_by_with/when/            signal_group/             coalesce/whole_net
           windowed/pivot/fixed_point         running_zero/flow
                                                                    soakers terminate ──▶ groups (∅ residual)
 ```
@@ -127,7 +127,7 @@ committing its confident matches and handing the residual down. That is just
 `seq` over a built range, with the closure capturing the pass index:
 
 ```rust
-seq((0..n).map(|i| whole_only(flow(spec.window(7 << i)))).collect())
+seq((0..n).map(|i| whole_net(0, flow(spec.window(7 << i)))).collect())
 ```
 
 A one-line `for_n(n, |i| …)` sugar over that `seq` reads better and signals
@@ -165,7 +165,7 @@ race footgun.
 | `agg_net` | `agg_net(key: Fn(&E)->u64, tol)` | a **whole bucket** that nets to zero within `tol` |
 | `signal_group` | `signal_group(signals: Fn(&E)->Vec<u64>, tol, cap)` | multi-key (token) buckets that net; greedy specific-first, `cap`-bounded |
 | `running_zero` | `running_zero(order: Fn(&E)->i64, tol)` | ordered running-balance **clearing segments** |
-| `flow` | `flow(FlowSpec<E>)` | the global **min-cost-flow arbiter** over the ambiguous remainder |
+| `flow` | `flow(FlowSpec<E>)` | the global **min-cost-flow arbiter** over the ambiguous remainder; emits the matching as **raw arcs** (one 2-member net-0 group per positive-flow arc), *not* settlements |
 
 These four-plus-one share one shape — *bucket, then accept-if-balanced* —
 differing only in how buckets form (key / multi-key / order / proximity-graph)
@@ -182,28 +182,35 @@ earns nothing.
 |---|---|---|
 | `labeled` | `labeled(tag, inner)` | stamp a human `reason` on every group a subtree forms |
 | `accept_if` | `accept_if(pred: Fn(&Group)->bool, inner)` | gate groups; **dissolve rejects back to residual** (conserving) |
-| `coalesce` | `coalesce(origin, inner)` | fuse interlocking groups (shared member) into settlement clusters |
-| `trim` | `trim(tol, inner)` | cut sub-`tol` edges to the **residual** |
-| `snap` | `snap(tol, inner)` | fold sub-`tol` edges onto each row's **dominant edge** |
-| `whole_net` *(new)* | `whole_net(tol, inner)` | commit clusters of **whole lines** whose net clears within `tol`; the break stays **inside** the group |
-| `whole_only` *(new)* | `whole_only(inner)` | commit only **self-contained** clusters (whole lines, net **exactly 0**); partial fills dissolve — `whole_net(Abs(0))` |
+| `coalesce` | `coalesce(origin, inner)` | fuse interlocking groups (shared member) into settlement clusters — the **settlement authority** |
+| `settle` | `settle(spec) = coalesce("flow", flow(spec))` | the blessed settlement view over `flow`: discover arcs, fold them into clusters |
+| `whole_net` | `whole_net(tol, inner)` | commit clusters of **whole lines** whose net clears within `tol`; the break stays **inside** the group. `whole_net(0, inner)` commits only self-contained (net-exactly-0) clusters |
 
 `filter` is **removed** as a redundant alias of `accept_if`. Pick the name that
 states the semantics (we *accept* groups passing the predicate and dissolve the
 rest); `filter` wrongly suggests filtering *items*.
 
-`coalesce`/`trim`/`snap` are the "post-flow group algebra": `flow` emits an
-allocation hypergraph (a row split across groups); these three turn it into the
-coarser, human-actionable cluster view and move dust between matched and
-residual. Already share an `EdgeReshape` impl for `trim`/`snap`.
+`trim`/`snap` (edge-materiality reshapers) are **removed**: speculative surface
+with a sharp edge (per-row-original trimming could sever a shared edge into a
+lopsided net-≠0 group). The partial-lot reshaping niche will be revisited from
+real use-cases; for now `whole_net` (commit-whole-or-dissolve) and the `soak`
+family (absorb residual into auditable buckets) cover the demonstrated needs.
 
-`whole_net`/`whole_only` are the **commit gate** for a *discovered* grouping, and
-they expose the library's two matching paradigms:
+`flow` is a **strict primitive**: it emits the matching as raw arcs and nothing
+else. `coalesce` is the single **settlement authority** that folds an allocation
+hypergraph (a row split across arcs/groups) into the coarser, human-actionable
+cluster view; `settle` is the one-token `coalesce("flow", flow(spec))` sugar for
+the common case. This keeps connected-components logic in exactly one place
+(`coalesce`) instead of duplicated inside `flow`.
+
+`whole_net` is the **commit gate** for a *discovered* grouping, and together with
+`flow` it exposes the library's two matching paradigms:
 
 - **Transportation (`flow`):** a line is *divisible*. `flow` splits amounts at
-  the unit level, every matched group nets to **0**, and the difference is a
-  separate **residual** lot. `whole_only(flow)` keeps only clusters that cleared
-  *completely* — a near-miss like `+100 / -97` goes **entirely** to residual.
+  the unit level, every matched cluster nets to **0**, and the difference is a
+  separate **residual** lot. `whole_net(0, flow(..))` keeps only clusters that
+  cleared *completely* — a near-miss like `+100 / -97` goes **entirely** to
+  residual.
 - **Netting (whole-line):** a line is *atomic*. `agg_net`/`signal_group` (§4.2)
   bucket whole lines by a **key** and accept iff the bucket nets within `tol`,
   the break staying **inside** the group as its `net`. `whole_net(tol, inner)`
@@ -211,27 +218,26 @@ they expose the library's two matching paradigms:
   whole (reclaiming its residual tail) and accepts the cluster iff
   `|net| <= tol`, so `+100 / -97` becomes one matched group with net `+3`.
 
-`whole_only` is exactly `whole_net(Tol::Abs(0))`. Because a line is atomic in the
-netting view, groups that share a member id are **one settlement**: `whole_net`
-coalesces them first, so a line's tail can only ever go to **ground** (never to a
-sibling group) and the reclaim is unambiguous; conservation holds (each id ends
-up wholly in one group or wholly in residual). `net == 0` is **not** sufficient
-for wholeness (a group can net to zero while a member bleeds into residual),
-which is exactly why this is a distinct primitive and not an
-`accept_if(|g| g.abs_net()==0)` gate — a `Group` sheds each row's `original` and
-never sees the residual, so "is this line whole?" is out of a `Fn(&Group)->bool`'s
-scope. Neither is it an edge-tolerance like `trim`: this is a whole-*cluster*
-decision, never a per-edge magnitude cut. Tolerance basis follows `Tol` (§6):
-`Abs` fixed, `Rel` against the **smallest** leg, `RelMax` against the **largest**
-— there is no total-of-legs basis.
+Because a line is atomic in the netting view, groups that share a member id are
+**one settlement**: `whole_net` coalesces them first, so a line's tail can only
+ever go to **ground** (never to a sibling group) and the reclaim is unambiguous;
+conservation holds (each id ends up wholly in one group or wholly in residual).
+`net == 0` is **not** sufficient for wholeness (a group can net to zero while a
+member bleeds into residual), which is exactly why this is a distinct primitive
+and not an `accept_if(|g| g.abs_net()==0)` gate — a `Group` sheds each row's
+`original` and never sees the residual, so "is this line whole?" is out of a
+`Fn(&Group)->bool`'s scope. Tolerance basis follows `Tol` (§6): `Abs` fixed,
+`Rel` against the **smallest** leg, `RelMax` against the **largest** — there is
+no total-of-legs basis.
 
 **Choosing the matcher:** use `agg_net` when a **key** already defines the group;
 use `whole_net(tol, flow(spec))` for the **"flow discovers, netting commits"**
 idiom when the grouping must be inferred from amounts/proximity; use
-`whole_only(flow(spec))` when only a *complete* clear counts. `flow` + `soak`
-(net-0 group, the break as a labelled residual bucket) and `whole_net` (break
-kept *inside* the matched group) are the two valid bookkeeping choices for the
-same mismatch — *separate break lot* vs *matched-with-break*.
+`whole_net(0, flow(spec))` when only a *complete* clear counts; use `settle` when
+you just want the discovered settlements without a tolerance commit. `flow` +
+`soak` (net-0 group, the break as a labelled residual bucket) and `whole_net`
+(break kept *inside* the matched group) are the two valid bookkeeping choices for
+the same mismatch — *separate break lot* vs *matched-with-break*.
 
 ### 4.4 Soakers (terminate the tail)
 
@@ -357,7 +363,12 @@ tiered(&[
 | **reject** | `cond([(pred, inner), …])` | first-match *race* semantics (order-dependent, shadowing); not needed |
 | **keep** | `seq, partition_by, windowed, pivot, fixed_point` | the structural spine, already orthogonal |
 | **keep** | `agg_net, signal_group, running_zero, exact_1to1, flow` | distinct matchers, shared shape documented |
-| **keep** | `labeled, accept_if, coalesce, trim, snap` | the post-matching group algebra |
+| **keep** | `labeled, accept_if, coalesce` | the post-matching group algebra |
+| **add** | `settle(spec)` | `coalesce("flow", flow(spec))` sugar: the settlement view of the arcs `flow` now emits raw |
+| **add** | `whole_net(tol, inner)` | commit whole-line clusters within tolerance; `whole_net(0, ..)` = self-contained only |
+| **remove** | `trim, snap` | speculative edge-reshapers with a lopsided-severing sharp edge; revisit from real partial-lot use-cases |
+| **remove** | `whole_only` | exactly `whole_net(0, inner)`; the sugar earns nothing |
+| **reshape** | `flow(spec)` | now a strict primitive returning **raw arcs**; grouping moves to `coalesce`/`settle` |
 | **keep** | `soak_all, soak_if, SoakMode` | terminal classifiers |
 
 ### 6.D One open semantic decision: relative-tolerance scale
@@ -404,7 +415,7 @@ fn safe_flow(tag: &str, win: i64, max_size: usize, max_side: usize,
         .cost(cost);
     accept_if(
         move |g| g.size() <= max_size && g.min_side() <= max_side && g.clean(REL),
-        coalesce(tag, snap(FLOOR, labeled(tag, flow(spec.clone())))),
+        coalesce(tag, labeled(tag, flow(spec.clone()))),
     )
 }
 
@@ -466,17 +477,17 @@ foundation   Item  Group  Resolution  Strategy  Tol  Allocation  ExtId
              Group::{member_ids,size,abs_net,max_abs,min_side,clean}
 
 bag combs    seq  partition_by  partition_by_with  when  windowed  pivot  fixed_point  identity
-leaves       exact_1to1  agg_net  signal_group  running_zero  flow(FlowSpec)
-group combs  labeled  accept_if  coalesce  trim  snap  whole_net  whole_only
+leaves       exact_1to1  agg_net  signal_group  running_zero  flow(FlowSpec)  settle(FlowSpec)
+group combs  labeled  accept_if  coalesce  whole_net
 soakers      soak_all  soak_small  soak_if   (SoakMode)
 flow         FlowSpec builder  (+ optional flow_util::tiered cost helper)
 ```
 
-**23 constructor functions** (8 bag combinators + 7 group combinators + 5 leaves
-+ 3 soakers) **+ one builder** (`FlowSpec`). Net change from today: **−5**
-(`Model`, `exact_1to1_any`, `filter`, `branch`, the `max_bps/max_abs` soak knobs),
-**+6 sugar/widening** (`when`, `identity`, `partition_by_with`, `Group` metrics,
-the `whole_net`/`whole_only` netting commit gate), **2 renames/reshapes**
-(`flow`/`FlowSpec`, `soak_small` on `Tol`). Smaller, and every node now obeys one
-closure idiom and belongs to exactly one family.
+**21 constructor functions** (8 bag combinators + 4 group combinators + 5 leaves
++ `settle` flow-sugar + 3 soakers) **+ one builder** (`FlowSpec`). `flow` is now a
+strict primitive node returning raw arcs; `coalesce` is the sole settlement
+authority and `settle` its one-token `flow` sugar; `trim`/`snap`/`whole_only`
+were removed (the first two as speculative edge-reshapers, the last as exactly
+`whole_net(0, ..)`). Every node obeys one closure idiom and belongs to exactly
+one family.
 ```
