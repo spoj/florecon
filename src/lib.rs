@@ -42,7 +42,7 @@
 //!     .cost(|a: &Tx, b: &Tx| Some(1.0 + (a.date - b.date).abs() as f64));
 //!
 //! // The conserved amount rides on `Item::amount`, not the spec.
-//! let mut s = flow(spec);
+//! let s = flow(spec);
 //! let r = s.run(vec![Item::new(1, 100, Tx { date: 0 }), Item::new(2, -100, Tx { date: 0 })]);
 //! assert_eq!(r.groups[0].net, 0); // nets clean
 //! ```

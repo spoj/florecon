@@ -196,19 +196,17 @@ pub struct Resolution<E> {
 
 /// A reconciliation strategy: pull groups from a bag, return the residual.
 ///
-/// `run` takes `&mut self`, so a node *may* carry state across calls (e.g. the
-/// stateful [`flow`] leaf keeps a live warm basis, and [`partition_by`] holds
-/// one warm child per shard). Statefulness
-/// is an opt-in capability, not a mandate: the cheap leaves (`agg_net`,
-/// `exact_1to1`, `signal_group`, …) ignore `&mut` and recompute, staying
-/// stateless by convention. A node that *does* hold state owes a warm-vs-cold
-/// determinism guarantee (see [`flow`]'s cross-check).
+/// `run` takes `&self` and is a **pure** function of the bag: every strategy
+/// recomputes from scratch, holds no cross-call state, and is therefore
+/// trivially reproducible and shard-parallel. (The min-cost-flow engine is still
+/// incremental internally, but [`flow`] rebuilds it cold each run, so that is an
+/// implementation detail the strategy layer never threads.)
 pub trait Strategy<E> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E>;
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E>;
 }
 
 impl<E> Strategy<E> for Box<dyn Strategy<E>> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         (**self).run(bag)
     }
 }
@@ -222,14 +220,14 @@ struct Seq<E> {
 }
 
 impl<E> Strategy<E> for Seq<E> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         #[cfg(not(target_arch = "wasm32"))]
         let timed = std::env::var_os("FLORECON_TIME").is_some();
         #[cfg(target_arch = "wasm32")]
         let timed = false;
         let mut groups = Vec::new();
         let mut residual = bag;
-        for (i, step) in self.steps.iter_mut().enumerate() {
+        for (i, step) in self.steps.iter().enumerate() {
             let n_in = residual.len();
             // Instant is only touched when profiling; wasm has no clock source.
             let t = timed.then(std::time::Instant::now);
@@ -261,7 +259,7 @@ struct Labeled<E> {
 }
 
 impl<E> Strategy<E> for Labeled<E> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut r = self.inner.run(bag);
         for g in &mut r.groups {
             g.reason = Some(match g.reason.take() {
@@ -298,7 +296,7 @@ where
     E: Clone,
     FP: Fn(&Group) -> bool,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         // Snapshot the input so a rejected group can be dissolved back into the
         // residual: a group only carries `Allocation { id, amount }`, having
         // shed the payload `E`, so reconstructing a residual lot needs the
@@ -385,7 +383,7 @@ struct Material<E> {
 }
 
 impl<E: Clone> Strategy<E> for Material<E> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         // Snapshot the input to recover each row's `original` (the materiality
         // reference) and its payload for the dissolve, exactly as `Filter` does.
         let src: HashMap<ExtId, Item<E>> = bag.iter().map(|i| (i.id, i.clone())).collect();
@@ -480,7 +478,7 @@ struct WholeNet<E> {
 }
 
 impl<E: Clone> Strategy<E> for WholeNet<E> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         // Snapshot inputs to rematerialize *whole* lines: a group carries only
         // `Allocation { id, amount }`, so reclaiming a line at its full size
         // needs `original` and the payload `E`.
@@ -696,7 +694,7 @@ fn coalesce_groups(groups: &[Group], origin: &str) -> Vec<Group> {
 }
 
 impl<E> Strategy<E> for Coalesce<E> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let r = self.inner.run(bag);
         // Residual is untouched -- coalesce only regroups what was already
         // matched, stamping every cluster with `origin`.
@@ -764,7 +762,7 @@ fn residual_fingerprint<E>(items: &[Item<E>]) -> Vec<(ExtId, i64)> {
 }
 
 impl<E> Strategy<E> for FixedPoint<E> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut groups = Vec::new();
         let mut residual = bag;
         let mut fp = residual_fingerprint(&residual);
@@ -821,14 +819,11 @@ type ShardFactory<E, K> = dyn Fn(&K) -> Box<dyn Strategy<E>>;
 
 struct PartitionBy<E, K, FK> {
     key: FK,
-    /// Builds a fresh child subtree the first time a shard key is seen. Receives
-    /// the shard key, so [`partition_by_with`] can choose a per-key subtree;
-    /// [`partition_by`] passes a key-ignoring factory.
+    /// Builds a child subtree for a shard key. Receives the shard key, so
+    /// [`partition_by_with`] can choose a per-key subtree; [`partition_by`]
+    /// passes a key-ignoring factory. A fresh child is built per shard per run
+    /// (the strategy is stateless).
     factory: Box<ShardFactory<E, K>>,
-    /// One independent child per shard key. Each child owns its own state
-    /// (notably its own warm flow basis), so per-shard warm-start is
-    /// automatic and the flow leaf never needs to know it is sharded.
-    children: HashMap<K, Box<dyn Strategy<E>>>,
 }
 
 impl<E, K, FK> Strategy<E> for PartitionBy<E, K, FK>
@@ -836,28 +831,15 @@ where
     K: Hash + Eq + Clone,
     FK: Fn(&E) -> K,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut shards: HashMap<K, Vec<Item<E>>> = HashMap::new();
         for item in bag {
             shards.entry((self.key)(&item.data)).or_default().push(item);
         }
-        // Re-run existing children whose shard received no items this solve with
-        // an empty bag, so their warm state drops the departed rows instead of
-        // retaining stale members until the shard happens to reappear.
-        for k in self.children.keys() {
-            shards.entry(k.clone()).or_default();
-        }
-        // Split the borrows: `factory` builds new children, `children` is the
-        // map being mutated. Both fields, disjoint, so no clone of self.
-        let factory = &self.factory;
-        let children = &mut self.children;
         let mut groups = Vec::new();
         let mut residual = Vec::new();
         for (k, items) in shards {
-            if !children.contains_key(&k) {
-                children.insert(k.clone(), factory(&k));
-            }
-            let r = children.get_mut(&k).unwrap().run(items);
+            let r = (self.factory)(&k).run(items);
             groups.extend(r.groups);
             residual.extend(r.residual);
         }
@@ -880,7 +862,6 @@ where
     Box::new(PartitionBy {
         key,
         factory: Box::new(move |_k| factory()),
-        children: HashMap::new(),
     })
 }
 
@@ -900,7 +881,6 @@ where
     Box::new(PartitionBy {
         key,
         factory: Box::new(factory),
-        children: HashMap::new(),
     })
 }
 
@@ -913,7 +893,7 @@ impl<E, FP> Strategy<E> for When<E, FP>
 where
     FP: Fn(&E) -> bool,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut yes = Vec::new();
         let mut no = Vec::new();
         for item in bag {
@@ -954,7 +934,7 @@ where
 struct Identity;
 
 impl<E> Strategy<E> for Identity {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         Resolution {
             groups: Vec::new(),
             residual: bag,
@@ -980,7 +960,7 @@ impl<E, FO> Strategy<E> for Windowed<E, FO>
 where
     FO: Fn(&E) -> i64,
 {
-    fn run(&mut self, mut bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, mut bag: Vec<Item<E>>) -> Resolution<E> {
         // Soft locality, not hard segmentation: sort by `order`, sweep in bands
         // of `width`, and run `inner` on each band together with a carry of
         // still-matchable items from earlier bands. An item gets a full window
@@ -1058,7 +1038,7 @@ impl<E, FK> Strategy<E> for ExactOneToOne<E, FK>
 where
     FK: Fn(&E) -> Option<u64>,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut buckets: HashMap<u64, Vec<Item<E>>> = HashMap::new();
         let mut residual = Vec::new();
         for item in bag {
@@ -1141,7 +1121,7 @@ impl<E, FK> Strategy<E> for AggNet<E, FK>
 where
     FK: Fn(&E) -> u64,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut buckets: HashMap<u64, Vec<Item<E>>> = HashMap::new();
         for item in bag {
             buckets
@@ -1204,7 +1184,7 @@ impl<E, FO> Strategy<E> for RunningZero<E, FO>
 where
     FO: Fn(&E) -> i64,
 {
-    fn run(&mut self, mut bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, mut bag: Vec<Item<E>>) -> Resolution<E> {
         // Order the bag (finance bags are a timeline), then walk the running
         // balance. Each time it returns to zero, everything since the last zero
         // is a closed clearing segment -- e.g. a payment that settles all
@@ -1268,7 +1248,7 @@ impl<E, FS> Strategy<E> for SignalGroup<E, FS>
 where
     FS: Fn(&E) -> Vec<u64>,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let n = bag.len();
         let amt: Vec<i64> = bag.iter().map(|i| i.amount).collect();
         let sigs: Vec<Vec<u64>> = bag.iter().map(|i| (self.signals)(&i.data)).collect();
@@ -1372,7 +1352,7 @@ struct SubsetSum<E> {
 }
 
 impl<E> Strategy<E> for SubsetSum<E> {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let n = bag.len();
         let mut consumed = vec![false; n];
         let max_partners = self.max_group.saturating_sub(1);
@@ -1578,7 +1558,7 @@ where
     E: Clone,
     F: Fn(u64) -> Box<dyn Strategy<E>>,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let runs = self.n.max(1);
         // Keep the run with the most matched volume, then the fewest residual
         // lots, then the earliest seed (strict-`>` replacement leaves ties with
@@ -1653,7 +1633,7 @@ where
     E: Clone,
     FA: Fn(&E) -> i64,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut meta: BTreeMap<ExtId, PivotMeta<E>> = BTreeMap::new();
         let inner_bag: Vec<Item<E>> = bag
             .into_iter()
@@ -1938,7 +1918,7 @@ where
     K: Hash + Eq + Clone + ToString,
     FK: Fn(&Item<E>) -> K,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut groups = Vec::new();
         let mut residual = Vec::new();
         let mut buckets: HashMap<K, Vec<Item<E>>> = HashMap::new();
@@ -2003,7 +1983,7 @@ where
     FP: Fn(&Item<E>) -> bool,
     FK: Fn(&Item<E>) -> K,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut groups = Vec::new();
         let mut residual = Vec::new();
         let mut buckets: HashMap<K, Vec<Item<E>>> = HashMap::new();
@@ -2058,7 +2038,7 @@ where
     K: Hash + Eq + Clone + ToString,
     FK: Fn(&Item<E>) -> K,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         let mut groups = Vec::new();
         let mut buckets: HashMap<K, Vec<Item<E>>> = HashMap::new();
         for item in bag {
@@ -2121,13 +2101,13 @@ mod tests {
         // is accepted; 5 bps = 5, so it is rejected. Absolute tol would need to
         // know the magnitude up front; Rel derives it from the bucket.
         let b = bag(&[(1, 10_000), (2, -9_991)]);
-        let mut s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 10, floor: 0 });
+        let s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 10, floor: 0 });
         let r = s.run(b);
         conserves(2, &r);
         assert_eq!(r.groups.len(), 1, "9 <= 10 (10bps of 10_000)");
 
         let b = bag(&[(1, 10_000), (2, -9_991)]);
-        let mut s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 5, floor: 0 });
+        let s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 5, floor: 0 });
         let r = s.run(b);
         conserves(2, &r);
         assert_eq!(r.groups.len(), 0, "9 > 5 (5bps of 10_000)");
@@ -2137,7 +2117,7 @@ mod tests {
     fn agg_net_relative_floor_applies_to_tiny_buckets() {
         // 10 bps of 100 is 0, but the floor of 3 lets a residual of 2 net.
         let b = bag(&[(1, 100), (2, -98)]);
-        let mut s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 10, floor: 3 });
+        let s = agg_net(|_a: &i64| 0u64, Tol::Rel { bps: 10, floor: 3 });
         let r = s.run(b);
         conserves(2, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2146,7 +2126,7 @@ mod tests {
     #[test]
     fn labeled_stamps_reason_on_groups_but_not_residual() {
         let b = bag(&[(1, 5), (2, -5), (3, 7)]);
-        let mut s = labeled("S3a exact", exact_1to1(|_| Some(0)));
+        let s = labeled("S3a exact", exact_1to1(|_| Some(0)));
         let r = s.run(b);
         conserves(3, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2163,7 +2143,7 @@ mod tests {
     fn labeled_prepends_to_inner_detail() {
         // An inner label is preserved as detail when an outer label wraps it.
         let b = bag(&[(1, 5), (2, -5)]);
-        let mut s = labeled("outer", labeled("inner", exact_1to1(|_| Some(0))));
+        let s = labeled("outer", labeled("inner", exact_1to1(|_| Some(0))));
         let r = s.run(b);
         assert_eq!(
             r.groups[0].reason.as_deref(),
@@ -2174,7 +2154,7 @@ mod tests {
     #[test]
     fn exact_pairs_and_leaves_residual() {
         let b = bag(&[(1, 5), (2, -5), (3, 5), (4, 3)]);
-        let mut s = exact_1to1(|_| Some(0));
+        let s = exact_1to1(|_| Some(0));
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2185,12 +2165,12 @@ mod tests {
     #[test]
     fn agg_accepts_netting_bucket() {
         let b = bag(&[(1, 100), (2, -60), (3, -40), (4, 7)]);
-        let mut s = agg_net(|_a: &i64| 0u64, 0);
+        let s = agg_net(|_a: &i64| 0u64, 0);
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 0);
         let b = bag(&[(1, 100), (2, -60), (3, -40), (4, 7)]);
-        let mut s = agg_net(|_a: &i64| 0u64, 10);
+        let s = agg_net(|_a: &i64| 0u64, 10);
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2200,7 +2180,7 @@ mod tests {
     #[test]
     fn signal_groups_net_and_cascade() {
         let b = bag(&[(1, 50), (2, -50), (3, 9)]);
-        let mut s = signal_group(
+        let s = signal_group(
             |a: &i64| if *a == 9 { vec![] } else { vec![10] },
             Tol::Abs(0),
             16,
@@ -2219,12 +2199,12 @@ mod tests {
         // have to know the leg magnitude up front; Rel derives it from the
         // bucket, matching `agg_net`.
         let b = bag(&[(1, 1000), (2, -995)]);
-        let mut tight = signal_group(|_: &i64| vec![7u64], Tol::Rel { bps: 10, floor: 0 }, 16);
+        let tight = signal_group(|_: &i64| vec![7u64], Tol::Rel { bps: 10, floor: 0 }, 16);
         let r = tight.run(b.clone());
         assert_eq!(r.groups.len(), 0);
         assert_eq!(r.residual.len(), 2);
 
-        let mut loose = signal_group(|_: &i64| vec![7u64], Tol::Rel { bps: 60, floor: 0 }, 16);
+        let loose = signal_group(|_: &i64| vec![7u64], Tol::Rel { bps: 60, floor: 0 }, 16);
         let r = loose.run(b);
         conserves(2, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2237,7 +2217,7 @@ mod tests {
     /// honest probe for the fixed-point loop's repeat-until-stable contract.
     struct OnePair;
     impl Strategy<i64> for OnePair {
-        fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+        fn run(&self, bag: Vec<Item<i64>>) -> Resolution<i64> {
             for i in 0..bag.len() {
                 for j in (i + 1)..bag.len() {
                     if bag[i].amount == -bag[j].amount && bag[i].amount != 0 {
@@ -2276,13 +2256,13 @@ mod tests {
     #[test]
     fn fixed_point_drives_a_non_maximal_leaf_to_completion() {
         // A single pass of OnePair clears exactly one pair.
-        let mut once = OnePair;
+        let once = OnePair;
         let r = once.run(bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]));
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.residual.len(), 2);
 
         // Wrapped in fixed_point, it iterates until nothing more matches.
-        let mut fp = fixed_point(Box::new(OnePair), 16);
+        let fp = fixed_point(Box::new(OnePair), 16);
         let r = fp.run(bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]));
         conserves(4, &r);
         assert_eq!(r.groups.len(), 2, "both pairs found across passes");
@@ -2292,7 +2272,7 @@ mod tests {
     #[test]
     fn fixed_point_leaves_unmatchable_residual_and_terminates() {
         // 3 and 4 (+7, +3) can never pair: the loop must converge, not spin.
-        let mut fp = fixed_point(Box::new(OnePair), 16);
+        let fp = fixed_point(Box::new(OnePair), 16);
         let r = fp.run(bag(&[(1, 5), (2, -5), (3, 7), (4, 3)]));
         conserves(4, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2304,7 +2284,7 @@ mod tests {
     #[test]
     fn fixed_point_respects_the_pass_cap() {
         // With a 1-pass cap it behaves exactly like a single OnePair run.
-        let mut fp = fixed_point(Box::new(OnePair), 1);
+        let fp = fixed_point(Box::new(OnePair), 1);
         let r = fp.run(bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]));
         conserves(4, &r);
         assert_eq!(r.groups.len(), 1, "cap of 1 means one pass");
@@ -2317,7 +2297,7 @@ mod tests {
         // two-way `branch`: the |·|==5 pair nets in the first child, the rest
         // flow on to the second.
         let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
-        let mut s = seq(vec![
+        let s = seq(vec![
             when(|a: &i64| a.unsigned_abs() == 5, agg_net(|_a: &i64| 1u64, 0)),
             agg_net(|_a: &i64| 2u64, 0),
         ]);
@@ -2331,7 +2311,7 @@ mod tests {
     fn partition_by_with_picks_a_per_key_subtree() {
         // Key 0 nets its bucket; key 1 gets identity() and passes through.
         let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
-        let mut s = partition_by_with(
+        let s = partition_by_with(
             |a: &i64| (a.unsigned_abs() == 5) as u8,
             |k: &u8| {
                 if *k == 1 {
@@ -2355,7 +2335,7 @@ mod tests {
         let b = vec![Item::new(1, 5, (1i64, 5i64)), Item::new(2, -5, (100, -5))];
         let inner = exact_1to1(|_| Some(0));
         let r = {
-            let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner);
+            let w = windowed(|d: &(i64, i64)| d.0, 3, inner);
             w.run(b)
         };
         assert_eq!(r.groups.len(), 0);
@@ -2367,7 +2347,7 @@ mod tests {
         let b = vec![Item::new(1, 5, (4i64, 5i64)), Item::new(2, -5, (7, -5))];
         let inner = exact_1to1(|_| Some(0));
         let r = {
-            let mut w = windowed(|d: &(i64, i64)| d.0, 3, inner);
+            let w = windowed(|d: &(i64, i64)| d.0, 3, inner);
             w.run(b)
         };
         assert_eq!(r.groups.len(), 1);
@@ -2383,7 +2363,7 @@ mod tests {
             Item::new(4, -30, (4, -30)),
             Item::new(5, -20, (5, -20)),
         ];
-        let mut s = running_zero(|d: &(i64, i64)| d.0, 0);
+        let s = running_zero(|d: &(i64, i64)| d.0, 0);
         let r = s.run(b);
         conserves(5, &r);
         assert_eq!(r.groups.len(), 2);
@@ -2398,7 +2378,7 @@ mod tests {
             Item::new(2, -100, (2, -100)),
             Item::new(3, 7, (3, 7)),
         ];
-        let mut s = running_zero(|d: &(i64, i64)| d.0, 0);
+        let s = running_zero(|d: &(i64, i64)| d.0, 0);
         let r = s.run(b);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.residual.len(), 1);
@@ -2407,7 +2387,7 @@ mod tests {
 
     #[test]
     fn seq_then_partition_compose() {
-        let mut pipeline = partition_by(
+        let pipeline = partition_by(
             |a: &i64| a.signum().unsigned_abs(),
             || seq(vec![exact_1to1(|_| Some(0))]),
         );
@@ -2423,7 +2403,7 @@ mod tests {
         // magnitude is 5. The rejected pair (magnitude 7) must reappear in the
         // residual, fully intact, so nothing is lost.
         let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
-        let mut s = accept_if(
+        let s = accept_if(
             |g: &Group| g.members.iter().all(|a| a.amount.abs() == 5),
             exact_1to1(|_| Some(0)),
         );
@@ -2447,7 +2427,7 @@ mod tests {
         moved: i64,
     }
     impl Strategy<i64> for Slice {
-        fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+        fn run(&self, bag: Vec<Item<i64>>) -> Resolution<i64> {
             let m: HashMap<ExtId, Item<i64>> = bag.into_iter().map(|i| (i.id, i)).collect();
             let groups = vec![Group {
                 members: vec![
@@ -2478,7 +2458,7 @@ mod tests {
         // Rows born at 1000/-1000; flow cleared only 30/-30. Moved volume M=60,
         // reference R=2000. 5% of R is 100, so 60 <= 100 -> immaterial, dissolved
         // back to residual whole.
-        let mut s = material(
+        let s = material(
             Tol::Rel { bps: 500, floor: 0 },
             Box::new(Slice { moved: 30 }),
         );
@@ -2493,7 +2473,7 @@ mod tests {
     fn material_rel_keeps_a_substantial_match() {
         // Same rows, but 300/-300 cleared. M=600 > 5% of 2000 (=100), so the
         // match is material and survives; only the uncleared tail is residual.
-        let mut s = material(
+        let s = material(
             Tol::Rel { bps: 500, floor: 0 },
             Box::new(Slice { moved: 300 }),
         );
@@ -2516,11 +2496,11 @@ mod tests {
     fn material_abs_prunes_below_fixed_floor_ignoring_original() {
         // Abs measures moved volume against a fixed magnitude, not original.
         // M=60: dropped at Abs(100), kept at Abs(50).
-        let mut s = material(Tol::Abs(100), Box::new(Slice { moved: 30 }));
+        let s = material(Tol::Abs(100), Box::new(Slice { moved: 30 }));
         let r = s.run(bag(&[(1, 1000), (2, -1000)]));
         assert!(r.groups.is_empty(), "60 <= 100");
 
-        let mut s = material(Tol::Abs(50), Box::new(Slice { moved: 30 }));
+        let s = material(Tol::Abs(50), Box::new(Slice { moved: 30 }));
         let r = s.run(bag(&[(1, 1000), (2, -1000)]));
         assert_eq!(r.groups.len(), 1, "60 > 50");
     }
@@ -2530,7 +2510,7 @@ mod tests {
         // The dissolved legs fold onto the rows' surviving residual tails rather
         // than appearing as duplicate lots: one residual entry per id, summing
         // to the original.
-        let mut s = material(Tol::Abs(1000), Box::new(Slice { moved: 30 }));
+        let s = material(Tol::Abs(1000), Box::new(Slice { moved: 30 }));
         let r = s.run(bag(&[(1, 1000), (2, -1000)]));
         assert!(r.groups.is_empty());
         assert_eq!(r.residual.len(), 2, "no duplicate lots");
@@ -2543,7 +2523,7 @@ mod tests {
     fn subset_sum_clears_one_against_many_whole_lots() {
         // +100 anchor clears the {-60, -40} subset exactly; the -25 stays whole
         // in residual (atomic: never split to top up the match).
-        let mut s = subset_sum(0, 8, 0);
+        let s = subset_sum(0, 8, 0);
         let r = s.run(bag(&[(1, 100), (2, -60), (3, -40), (4, -25)]));
         conserves(4, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2558,7 +2538,7 @@ mod tests {
     #[test]
     fn subset_sum_keeps_break_inside_within_tol() {
         // -98 subset against +100: net +2 stays inside the group when tol >= 2.
-        let mut s = subset_sum(2, 8, 0);
+        let s = subset_sum(2, 8, 0);
         let r = s.run(bag(&[(1, 100), (2, -60), (3, -38)]));
         conserves(3, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2567,7 +2547,7 @@ mod tests {
         assert!(r.residual.is_empty());
 
         // tol 1 < 2: no in-band subset, everything stays residual.
-        let mut s = subset_sum(1, 8, 0);
+        let s = subset_sum(1, 8, 0);
         let r = s.run(bag(&[(1, 100), (2, -60), (3, -38)]));
         conserves(3, &r);
         assert!(r.groups.is_empty());
@@ -2578,14 +2558,14 @@ mod tests {
     fn subset_sum_respects_the_group_size_cap() {
         // max_group = 2 admits only 1:1; +100 has no single partner here, so the
         // three-lot clear is forbidden and all rows stay residual.
-        let mut s = subset_sum(0, 2, 0);
+        let s = subset_sum(0, 2, 0);
         let r = s.run(bag(&[(1, 100), (2, -60), (3, -40)]));
         conserves(3, &r);
         assert!(r.groups.is_empty());
         assert_eq!(r.residual.len(), 3);
 
         // Raising the cap lets the {-60,-40} subset clear the anchor.
-        let mut s = subset_sum(0, 3, 0);
+        let s = subset_sum(0, 3, 0);
         let r = s.run(bag(&[(1, 100), (2, -60), (3, -40)]));
         assert_eq!(r.groups.len(), 1);
         assert_eq!(ids(&r.groups[0]), vec![1, 2, 3]);
@@ -2595,7 +2575,7 @@ mod tests {
     fn subset_sum_is_reproducible_across_runs() {
         // Same seed -> byte-identical grouping, twice.
         let run = || {
-            let mut s = subset_sum(0, 8, 7);
+            let s = subset_sum(0, 8, 7);
             let r = s.run(bag(&[(1, 100), (2, -50), (3, -50), (4, -100), (5, 100)]));
             r.groups.iter().map(|g| (ids(g), g.net)).collect::<Vec<_>>()
         };
@@ -2610,7 +2590,7 @@ mod tests {
             seed: u64,
         }
         impl Strategy<i64> for Toy {
-            fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+            fn run(&self, bag: Vec<Item<i64>>) -> Resolution<i64> {
                 if self.seed % 2 == 1 {
                     let members = bag
                         .iter()
@@ -2636,7 +2616,7 @@ mod tests {
                 }
             }
         }
-        let mut s = restart(6, 0, |seed| Box::new(Toy { seed }));
+        let s = restart(6, 0, |seed| Box::new(Toy { seed }));
         let r = s.run(bag(&[(1, 5), (2, -5)]));
         conserves(2, &r);
         assert_eq!(r.groups.len(), 1, "the matching seed wins");
@@ -2649,7 +2629,7 @@ mod tests {
         // verifier keeps only exact clears; `restart` searches seeds for the
         // anchor order that clears the most. End state conserves regardless.
         let factory = |seed: u64| material(Tol::Abs(0), subset_sum(0, 8, seed));
-        let mut s = restart(8, 42, factory);
+        let s = restart(8, 42, factory);
         let r = s.run(bag(&[(1, 100), (2, -50), (3, -50), (4, -50), (5, 50)]));
         conserves(5, &r);
         // Whatever it commits nets exactly zero (the verifier's bar).
@@ -2669,7 +2649,7 @@ mod tests {
         // Inner: +100 matched 97 against -97, with a +3 ground tail on line 1.
         struct Partial;
         impl Strategy<i64> for Partial {
-            fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+            fn run(&self, bag: Vec<Item<i64>>) -> Resolution<i64> {
                 let m: HashMap<ExtId, Item<i64>> = bag.into_iter().map(|i| (i.id, i)).collect();
                 let groups = vec![Group {
                     members: vec![
@@ -2689,7 +2669,7 @@ mod tests {
             }
         }
         // tol >= 3: reclaim the tail, match the whole lines, keep net +3 inside.
-        let mut s = whole_net(Tol::Abs(5), Box::new(Partial));
+        let s = whole_net(Tol::Abs(5), Box::new(Partial));
         let r = s.run(bag(&[(1, 100), (2, -97)]));
         conserves(2, &r);
         assert_eq!(r.groups.len(), 1);
@@ -2698,7 +2678,7 @@ mod tests {
         assert!(r.residual.is_empty()); // the +3 tail was reclaimed into the whole line
 
         // tol < 3: dissolve, both lines return to ground whole.
-        let mut s = whole_net(Tol::Abs(2), Box::new(Partial));
+        let s = whole_net(Tol::Abs(2), Box::new(Partial));
         let r = s.run(bag(&[(1, 100), (2, -97)]));
         conserves(2, &r);
         assert!(r.groups.is_empty());
@@ -2712,7 +2692,7 @@ mod tests {
         // share id 1, so the whole-line view is ONE settlement, not two.
         struct Split;
         impl Strategy<i64> for Split {
-            fn run(&mut self, _bag: Vec<Item<i64>>) -> Resolution<i64> {
+            fn run(&self, _bag: Vec<Item<i64>>) -> Resolution<i64> {
                 let groups = vec![
                     Group {
                         members: vec![
@@ -2739,7 +2719,7 @@ mod tests {
                 }
             }
         }
-        let mut s = whole_net(Tol::Abs(0), Box::new(Split));
+        let s = whole_net(Tol::Abs(0), Box::new(Split));
         let r = s.run(bag(&[(1, 100), (2, -60), (3, -40)]));
         conserves(3, &r);
         // One merged settlement of whole lines, line 1 appearing once at +100.
@@ -2769,7 +2749,7 @@ mod tests {
             (6, 8),
             (7, -8),
         ]);
-        let mut s = accept_if(
+        let s = accept_if(
             |g: &Group| g.members.len() <= 3,
             agg_net(|a: &i64| if a.unsigned_abs() == 8 { 1u64 } else { 0u64 }, 0),
         );
@@ -2785,7 +2765,7 @@ mod tests {
     /// `coalesce` with a known hypergraph regardless of any matcher's heuristics.
     struct EmitGroups(Vec<Vec<(ExtId, i64)>>);
     impl Strategy<i64> for EmitGroups {
-        fn run(&mut self, bag: Vec<Item<i64>>) -> Resolution<i64> {
+        fn run(&self, bag: Vec<Item<i64>>) -> Resolution<i64> {
             let claimed: BTreeSet<ExtId> = self.0.iter().flatten().map(|&(id, _)| id).collect();
             let groups = self
                 .0
@@ -2817,7 +2797,7 @@ mod tests {
             vec![(2, -40), (3, 100), (4, -100)],
         ]);
         let b = bag(&[(1, 100), (2, -100), (3, 100), (4, -100), (9, 7)]);
-        let mut s = coalesce("settlement", Box::new(inner));
+        let s = coalesce("settlement", Box::new(inner));
         let r = s.run(b);
         conserves(5, &r);
         assert_eq!(r.groups.len(), 1, "the two interlocking groups merge");
@@ -2839,7 +2819,7 @@ mod tests {
         // uniformly stamped with the coalesce origin.
         let inner = EmitGroups(vec![vec![(1, 5), (2, -5)], vec![(3, 7), (4, -7)]]);
         let b = bag(&[(1, 5), (2, -5), (3, 7), (4, -7)]);
-        let mut s = coalesce("settlement", Box::new(inner));
+        let s = coalesce("settlement", Box::new(inner));
         let r = s.run(b);
         conserves(4, &r);
         assert_eq!(r.groups.len(), 2, "disjoint components stay separate");
@@ -2863,7 +2843,7 @@ mod tests {
             .cost_lot(|a: &Tx, a_amt, b: &Tx, b_amt| {
                 Some(1.0 + (a_amt + b_amt).abs() as f64 * 0.1 + (a.date - b.date).abs() as f64)
             });
-        let mut s = settle(spec);
+        let s = settle(spec);
         let r = s.run(vec![
             Item::new(1, 100, Tx { date: 0 }),
             Item::new(2, 200, Tx { date: 1 }),
@@ -2882,7 +2862,7 @@ mod tests {
     #[test]
     fn pivot_converts_back_to_outer_amount() {
         let b = vec![Item::new(1, 110, (100i64,)), Item::new(2, -110, (-100i64,))];
-        let mut s = pivot(|d: &(i64,)| d.0, exact_1to1(|_| Some(0)));
+        let s = pivot(|d: &(i64,)| d.0, exact_1to1(|_| Some(0)));
         let r = s.run(b);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].net, 0);
@@ -2903,7 +2883,7 @@ mod tests {
     // pivot conservation airlock.
     struct HalfMatch;
     impl Strategy<(i64,)> for HalfMatch {
-        fn run(&mut self, bag: Vec<Item<(i64,)>>) -> Resolution<(i64,)> {
+        fn run(&self, bag: Vec<Item<(i64,)>>) -> Resolution<(i64,)> {
             let mut members = Vec::new();
             let mut residual = Vec::new();
             for it in bag {
@@ -2935,7 +2915,7 @@ mod tests {
         // Z (id 2): parent 100, pivot 4. Half-matched (2/4) = 50 parent units,
         // representable -> kept in the group untouched.
         let b = vec![Item::new(1, 1, (4i64,)), Item::new(2, 100, (4i64,))];
-        let mut s = pivot(|d: &(i64,)| d.0, Box::new(HalfMatch));
+        let s = pivot(|d: &(i64,)| d.0, Box::new(HalfMatch));
         let r = s.run(b);
 
         // Group retains only Z at 50; the phantom 0-mass X edge is gone.
@@ -2954,7 +2934,7 @@ mod tests {
         // (prorate guards the zero denominator), the full parent flows to
         // residual, and no phantom 0-mass member is left in the group.
         let b = vec![Item::new(1, 5, (0i64,)), Item::new(2, 100, (4i64,))];
-        let mut s = pivot(|d: &(i64,)| d.0, Box::new(HalfMatch));
+        let s = pivot(|d: &(i64,)| d.0, Box::new(HalfMatch));
         let r = s.run(b);
 
         // Group keeps only Z; X carries no mass and is not present.
@@ -2971,7 +2951,7 @@ mod tests {
     // Used to exercise the pivot forward-floor conservation closure.
     struct DropZeros;
     impl Strategy<(i64,)> for DropZeros {
-        fn run(&mut self, bag: Vec<Item<(i64,)>>) -> Resolution<(i64,)> {
+        fn run(&self, bag: Vec<Item<(i64,)>>) -> Resolution<(i64,)> {
             Resolution {
                 groups: Vec::new(),
                 residual: bag.into_iter().filter(|i| i.amount != 0).collect(),
@@ -3002,7 +2982,7 @@ mod tests {
                 data: (50i64,),
             },
         ];
-        let mut s = pivot(|d: &(i64,)| d.0, Box::new(DropZeros));
+        let s = pivot(|d: &(i64,)| d.0, Box::new(DropZeros));
         let r = s.run(b);
         assert!(r.groups.is_empty());
         let mut res: Vec<(ExtId, i64)> = r.residual.iter().map(|i| (i.id, i.amount)).collect();
@@ -3018,7 +2998,7 @@ mod tests {
     #[test]
     fn soak_small_abs_threshold_singletons() {
         // amounts: two immaterial (<=5), one material.
-        let mut s = soak_small(5, SoakMode::Singleton, "rounding", |_: &Item<i64>| 0u64);
+        let s = soak_small(5, SoakMode::Singleton, "rounding", |_: &Item<i64>| 0u64);
         let r = s.run(bag(&[(1, 3), (2, -2), (3, 100)]));
         conserves(3, &r);
         // Two soaked singletons, one material lot left as residual.
@@ -3049,7 +3029,7 @@ mod tests {
                 data: 0,
             }, // material:   500 bps
         ];
-        let mut s = soak_small(
+        let s = soak_small(
             Tol::Rel { bps: 200, floor: 0 },
             SoakMode::Singleton,
             "var",
@@ -3065,7 +3045,7 @@ mod tests {
     fn soak_small_bucket_groups_by_key() {
         // Soak immaterial lots, bucketing by sign of the amount.
         let key = |i: &Item<i64>| if i.amount > 0 { "pos" } else { "neg" };
-        let mut s = soak_small(5, SoakMode::Bucket, "tail", key);
+        let s = soak_small(5, SoakMode::Bucket, "tail", key);
         let r = s.run(bag(&[(1, 3), (2, 4), (3, -2), (4, 100)]));
         conserves(4, &r);
         // One bucket per sign among the soaked lots; the material lot stays.
@@ -3077,7 +3057,7 @@ mod tests {
     #[test]
     fn soak_if_predicate_selects() {
         // Soak only negative residual lots; positives pass through.
-        let mut s = soak_if(
+        let s = soak_if(
             |i: &Item<i64>| i.amount < 0,
             SoakMode::Singleton,
             "shorts",
@@ -3093,7 +3073,7 @@ mod tests {
 
     #[test]
     fn soak_all_terminates_residual() {
-        let mut s = soak_all(SoakMode::Singleton, "unmatched", |_: &Item<i64>| 0u64);
+        let s = soak_all(SoakMode::Singleton, "unmatched", |_: &Item<i64>| 0u64);
         let r = s.run(bag(&[(1, 50), (2, -30), (3, 0)]));
         // Zero-amount lots are dropped (nothing to classify); the rest soak and
         // the residual is fully drained.
@@ -3107,7 +3087,7 @@ mod tests {
     #[test]
     fn soak_all_bucket_nets_per_key() {
         let key = |i: &Item<i64>| if i.amount > 0 { 1u64 } else { 2u64 };
-        let mut s = soak_all(SoakMode::Bucket, "class", key);
+        let s = soak_all(SoakMode::Bucket, "class", key);
         let r = s.run(bag(&[(1, 50), (2, 30), (3, -20)]));
         assert!(r.residual.is_empty());
         // pos bucket nets 80, neg bucket nets -20.
@@ -3168,9 +3148,9 @@ mod tests {
         // Same shape as a leaf bucket: the large leg lets RelMax accept a net
         // that Rel (smallest-leg) would reject.
         let b = bag(&[(1, 1_000_000), (2, -999_000), (3, -1_200)]);
-        let mut rel = agg_net(|_: &i64| 0u64, Tol::Rel { bps: 5, floor: 100 });
+        let rel = agg_net(|_: &i64| 0u64, Tol::Rel { bps: 5, floor: 100 });
         assert_eq!(rel.run(b.clone()).groups.len(), 0);
-        let mut relmax = agg_net(|_: &i64| 0u64, Tol::RelMax { bps: 5, floor: 100 });
+        let relmax = agg_net(|_: &i64| 0u64, Tol::RelMax { bps: 5, floor: 100 });
         let r = relmax.run(b);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].net, -200);

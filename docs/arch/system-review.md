@@ -8,7 +8,7 @@ shape, the load-bearing invariants, the boundaries, and the tensions.
 
 ## 1. One-sentence characterization
 
-> **Florecon is a portable, warm-stateful reconciliation *kernel* with a strict
+> **Florecon is a portable, stateless reconciliation *kernel* with a strict
 > host/guest ABI, programmed by closures over a conservation-preserving strategy
 > algebra, and delivered as a swappable back-end behind a thin multi-host wire
 > contract.**
@@ -50,8 +50,8 @@ counts tell the story of where the mass is:
 | Stratum | Module | LOC | Character |
 |---|---|---|---|
 | hot core | `engine.rs` | 1,988 | warm-started min-cost-flow (network simplex, cached basis) |
-| algebra | `strategy/mod.rs` + `flow.rs` | 3,380 | the combinator vocabulary + the one stateful leaf |
-| workspace | `recon.rs` | 761 | the stateful facade: pin/merge/solve lifecycle |
+| algebra | `strategy/mod.rs` + `flow.rs` | 3,380 | the combinator vocabulary + a stateless min-cost-flow leaf |
+| workspace | `recon.rs` | 761 | the facade holding durable pins/tags: pin/merge/solve lifecycle |
 | ABI | `sdk/*` | ~1,000 | wire contract: describe, Arrow tables, packed-u64, conformance |
 | plugin | `lf_solver/src/lib.rs` | 557 | **all the domain knowledge, in one file** |
 | hosts | py ~640 + js ~254 | ~900 | thin per-runtime adapters |
@@ -94,9 +94,12 @@ These are what make it a *system* and not a pile of functions. Each is enforced
    input struct the *only* declaration of the wire schema; `describe()` is
    generated from it. A missing column is a `SchemaError`, never a silent null.
 
-6. **Warm state is preserved, not assumed.** The flow leaf keeps a live simplex
-   basis; `partition_by` keeps one warm child per shard. Determinism is guarded
-   (debug rebuilds a cold leaf and asserts equal objective).
+6. **The strategy layer is stateless by design.** Every strategy is a pure
+   `Bag -> Resolution`; `flow` rebuilds the network cold each `run` and
+   `partition_by` builds a fresh child per shard. The *engine* retains its
+   warm-incremental capability (§4), but the kernel deliberately does not thread
+   it across solves — reproducibility and shard-parallelism over incremental
+   speed. Durable state is only pins + tags, held by the workspace facade.
 
 ---
 
@@ -111,14 +114,16 @@ Measured (40k nodes, 1M arcs): cold 18.26 s → warm supply edit **6.9 ms**
 (~2,650×), warm arc removal **5.9 ms** (~3,100×). This is the "each node retains
 state, recalc is fast" capability — a real what-if engine for one large network.
 
-**Crucial system-level caveat:** warm-start's payoff is *workload-shaped*. On
-lf_solver's real matrix (131k rows, thousands of tiny per-pair shards) a warm
-re-solve is only ~1.2× faster than cold, because per-solve cost is dominated by
-work the basis never touches: re-sharding all rows, recomputing the *stateless*
-leaves (`agg_net`/`exact`/`signal` hold no basis), and Arrow-in/JSON-out
-marshalling. **Warm-start is a single-large-network, localized-edit capability,
-not a batch-throughput one.** The architecture supports it; the current batch
-delivery path doesn't exploit it. (An interactive single-pair re-solve path would.)
+**Crucial system-level decision:** the strategy layer **does not use** this warm
+capability. `flow` rebuilds the network cold every `run`, because warm-start's
+payoff is *workload-shaped*: on lf_solver's real matrix (131k rows, thousands of
+tiny per-pair shards) a warm re-solve was only ~1.2× faster than cold — per-solve
+cost is dominated by work the basis never touches (re-sharding, the stateless
+cheap leaves, Arrow-in/JSON-out marshalling). **Warm-start is a
+single-large-network, localized-edit capability, not a batch-throughput one.** So
+the kernel chose statelessness (uniform pure strategies, trivial reproducibility,
+shard-parallelism); the engine *retains* the capability for a future interactive
+single-pair path, but nothing threads it today.
 
 ---
 
@@ -181,10 +186,11 @@ whole DSL.
 
 ## 8. Risks / open edges (honest)
 
-1. **Batch path leaves warm-start on the table** (§4). The marquee algorithmic
-   asset is dormant in the only production workload. Either build the interactive
-   single-pair path that exploits it, or accept that for batch it's correctness
-   insurance, not speed.
+1. **Warm-start is dormant by deliberate choice** (§4). The engine's marquee
+   incremental capability is intentionally unused by the stateless strategy
+   layer. To exploit it later, reintroduce warmth as a transparent in-process
+   memo at the `flow` leaf (keyed by a bag hash) — without re-threading `&mut`
+   through the combinators — or build the interactive single-pair path.
 2. **Marshalling tax.** Arrow-in/JSON-out of 131k rows + 129k allocations every
    solve is a fixed cost. Fine for batch; it caps interactivity. Levers: keep the
    Arrow blob opaque (done), an all-Rust linked path (no IPC), or a `solve(frame)`
@@ -200,9 +206,10 @@ whole DSL.
    (Python layer done + tested; JS host + workbench in progress). Until that
    lands, the "browser tool, no install, no data egress" play exists only as a
    kernel, not a product.
-6. **Two solve semantics to keep honest.** Stateless batch solve vs warm stateful
-   workspace must agree; the determinism guard enforces equal objective but
-   degenerate grouping can differ — a documented, tested, but live concern.
+6. **One solve semantics now.** Strategies are pure, so a multi-solve workspace
+   load and a single cold batch solve are identical by construction (the former
+   is just the latter on an incrementally-built row set). The previous
+   warm-vs-cold degeneracy concern is gone with the warm path.
 
 ---
 

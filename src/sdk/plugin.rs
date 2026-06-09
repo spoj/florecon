@@ -1,8 +1,7 @@
 //! The plugin authoring trait: the entire surface a domain author implements.
 //!
-//! Everything stateful — warm-start, group-id minting, freeze stability,
-//! conservation, the Report, the wasm ABI — is owned by [`Recon`](crate::Recon)
-//! and `export_plugin!`. The author supplies only the domain: how to project the
+//! Everything mechanical — group-id minting, freeze stability, conservation,
+//! the Report, the wasm ABI — is owned by [`Recon`](crate::Recon) and `export_plugin!`. The author supplies only the domain: how to project the
 //! host's columnar table into typed items, the stable identity of a row, the
 //! conserved numeraire, and which [`Strategy`] to run.
 

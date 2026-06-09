@@ -223,8 +223,9 @@ impl<E: Clone> Recon<E> {
     /// the rows, the groups (pinned decisions included), and the monotonic id
     /// allocator. The next [`solve`](Self::solve) recomputes the proposed pool
     /// under the new strategy; pinned groups are preserved verbatim with stable
-    /// ids. The fresh strategy starts cold (no warm flow state) — correct, since
-    /// a changed plan invalidates the old basis anyway.
+    /// ids. The next [`solve`](Self::solve) recomputes the proposed pool under
+    /// the new strategy (strategies are stateless, so every solve recomputes
+    /// from the rows); pinned groups are preserved verbatim with stable ids.
     pub fn replace_strategy(
         &mut self,
         strategy: Box<dyn Strategy<E>>,

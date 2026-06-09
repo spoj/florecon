@@ -1,8 +1,7 @@
 //! The `flow` strategy leaf: the global min-cost-flow arbiter.
 //!
-//! This is one [`Strategy`](super::Strategy) among many, but a special one — it
-//! is the only stateful leaf, keeping a live network-simplex basis warm across
-//! solves. You describe your domain once via a [`FlowSpec`] (closures for
+//! This is one [`Strategy`](super::Strategy) among many. You describe your
+//! domain once via a [`FlowSpec`] (closures for
 //! penalty / block_key / window / match_keys / cost); the leaf owns
 //! candidate-arc generation (a 1-D proximity window over `block_key` plus
 //! exact-join `match_keys`) and maps solved flow back to netted [`Group`]s.
@@ -11,11 +10,11 @@
 //! the single shared numeraire carried on each [`Item::amount`](super::Item) and
 //! reads only whatever your `cost`/`match_keys`/`block_key` closures inspect. An
 //! "FX reprice" is therefore just a re-`run` with an updated amount — no special
-//! verb, no FX table in the engine. Warm vs cold is decided purely by whether
-//! the caller keeps the compiled strategy alive between runs.
+//! verb, no FX table in the engine. The leaf is stateless: each `run` builds the
+//! network cold from the bag and solves it.
 use super::{Group, Item, Resolution, Strategy};
 use crate::engine::{ArcId, Network, NodeId, SolveStatus};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// External, caller-owned identity for a transaction/lot.
@@ -38,8 +37,8 @@ pub struct Allocation {
 /// [`Item::amount`](super::Item), so a residual an upstream leaf shrank flows
 /// through unchanged.
 ///
-/// Closures live behind `Arc`, so `FlowSpec` is cheaply `Clone` (the warm-vs-
-/// cold determinism guard rebuilds a cold leaf from a clone each solve).
+/// Closures live behind `Arc`, so `FlowSpec` is cheaply `Clone` (each `run`
+/// clones the spec into a fresh cold build).
 ///
 /// ```ignore
 /// flow(
@@ -161,7 +160,7 @@ impl<E> FlowSpec<E> {
 /// they are skipped during candidate generation to bound work.
 const MATCH_BUCKET_CAP: usize = 256;
 
-/// One transaction loaded into the warm engine.
+/// One transaction loaded into a flow build.
 struct Entry<E> {
     node: NodeId,
     tx: E,
@@ -173,23 +172,13 @@ struct Entry<E> {
     arcs: Vec<(ExtId, ArcId)>,
 }
 
-/// The candidate-generation fingerprint of a loaded row. A run re-`upsert`s an
-/// id only when this changes, so a no-op recalc touches the engine not at all.
-#[derive(Clone, PartialEq, Eq)]
-struct FlowSig {
-    amount: i64,
-    penalty_bits: u64,
-    key: i64,
-    keys: Vec<u64>,
-}
-
-/// The warm min-cost-flow leaf: a live [`Network`] basis, the transaction index
-/// that maps it back to `ExtId`s, and the fingerprint of what is loaded. Each
-/// `run` applies only the membership/lane delta — upsert changed ids, remove
-/// departed ones — then re-solves off the cached basis. Sharding is the
-/// caller's job ([`partition_by`](super::partition_by) gives each shard its own
-/// `Flow`), so this leaf only ever sees one shard's rows.
-struct Flow<E> {
+/// The transient min-cost-flow build for a single `run`: a fresh [`Network`],
+/// the transaction index that maps it back to `ExtId`s, and the candidate
+/// lookups. Built cold from the bag every solve -- the leaf holds no state, so
+/// there is no warm basis to keep and no diff to maintain. Sharding is the
+/// caller's job ([`partition_by`](super::partition_by) hands each shard its own
+/// bag), so this build only ever sees one shard's rows.
+struct FlowRun<E> {
     spec: FlowSpec<E>,
     net: Network,
     entries: HashMap<ExtId, Entry<E>>,
@@ -197,110 +186,39 @@ struct Flow<E> {
     by_key: BTreeMap<i64, Vec<ExtId>>,
     /// exact-join key -> ExtIds carrying it (reference/amount bridges).
     by_match_key: HashMap<u64, Vec<ExtId>>,
-    /// What is currently loaded, by fingerprint, to diff against next run.
-    loaded: HashMap<ExtId, FlowSig>,
 }
 
-impl<E> Flow<E> {
+impl<E> FlowRun<E> {
     fn new(spec: FlowSpec<E>) -> Self {
-        Flow {
+        FlowRun {
             spec,
             net: Network::new(),
             entries: HashMap::new(),
             by_key: BTreeMap::new(),
             by_match_key: HashMap::new(),
-            loaded: HashMap::new(),
         }
     }
 
-    fn flow_sig(&self, item: &Item<E>) -> FlowSig {
-        let amount = item.amount;
-        let mut keys = (self.spec.match_keys)(&item.data, amount);
-        keys.sort_unstable();
-        FlowSig {
-            amount,
-            penalty_bits: (self.spec.penalty)(&item.data).to_bits(),
-            key: (self.spec.block_key)(&item.data),
-            keys,
-        }
-    }
-
-    /// Add a new transaction or correct/reprice an existing one. `base` is the
-    /// conserved lot amount (the [`Item::amount`](super::Item)); a single verb
-    /// covers insert, amount correction, and lane edits.
-    fn upsert(&mut self, id: ExtId, tx: E, base: i64) {
+    /// Add a transaction to the build. `base` is the conserved lot amount (the
+    /// [`Item::amount`](super::Item)); each id is inserted exactly once.
+    fn insert(&mut self, id: ExtId, tx: E, base: i64) {
         let key = (self.spec.block_key)(&tx);
         let keys = (self.spec.match_keys)(&tx, base);
-
-        if self.entries.contains_key(&id) {
-            // Drop old candidate arcs and re-key; we will regenerate.
-            self.detach_arcs(id);
-            let (old_node, old_key, old_base, old_keys) = {
-                let e = &self.entries[&id];
-                (e.node, e.key, e.base, e.keys.clone())
-            };
-            if old_key != key {
-                self.unindex_key(old_key, id);
-                self.by_key.entry(key).or_default().push(id);
-            }
-            if old_keys != keys {
-                self.unindex_match_keys(id, &old_keys);
-                self.index_match_keys(id, &keys);
-            }
-            if old_base != base {
-                self.net.set_supply(old_node, base);
-            }
-            self.net.set_penalty(old_node, (self.spec.penalty)(&tx));
-            {
-                let e = self.entries.get_mut(&id).unwrap();
-                e.tx = tx;
-                e.key = key;
-                e.base = base;
-                e.keys = keys;
-            }
-            self.generate_arcs(id);
-        } else {
-            let node = self.net.add_node(base, (self.spec.penalty)(&tx));
-            self.by_key.entry(key).or_default().push(id);
-            self.index_match_keys(id, &keys);
-            self.entries.insert(
-                id,
-                Entry {
-                    node,
-                    tx,
-                    key,
-                    base,
-                    keys,
-                    arcs: Vec::new(),
-                },
-            );
-            self.generate_arcs(id);
-        }
-    }
-
-    /// Remove a transaction and all its candidate arcs.
-    fn remove(&mut self, id: ExtId) {
-        if let Some(e) = self.entries.remove(&id) {
-            self.unindex_key(e.key, id);
-            self.unindex_match_keys(id, &e.keys);
-            for (other, _) in &e.arcs {
-                if let Some(oe) = self.entries.get_mut(other) {
-                    oe.arcs.retain(|(x, _)| *x != id);
-                }
-            }
-            self.net.remove_node(e.node);
-        }
-    }
-
-    /// Re-optimize incrementally (warm when a basis was already loaded).
-    fn solve(&mut self) -> SolveStatus {
-        self.net.solve()
-    }
-
-    /// Total objective (matched arc costs plus unmatched penalties). The unique
-    /// invariant a warm re-solve preserves exactly versus a cold rebuild.
-    fn objective(&self) -> f64 {
-        self.net.total_cost()
+        let node = self.net.add_node(base, (self.spec.penalty)(&tx));
+        self.by_key.entry(key).or_default().push(id);
+        self.index_match_keys(id, &keys);
+        self.entries.insert(
+            id,
+            Entry {
+                node,
+                tx,
+                key,
+                base,
+                keys,
+                arcs: Vec::new(),
+            },
+        );
+        self.generate_arcs(id);
     }
 
     /// Total real candidate arcs in the graph (diagnostics only).
@@ -315,9 +233,9 @@ impl<E> Flow<E> {
     /// the `settle`/`whole_*` combinators compose on top).
     ///
     /// Sorted canonically by `(src, snk, amount)` so the readback is stable run
-    /// to run, independent of the warm leaf's internal arc-vec layout (which
-    /// differs warm vs cold even at an identical objective; the optimum is
-    /// unique in cost but degenerate in which equal-cost arcs carry flow).
+    /// to run, independent of this build's internal arc-vec layout (insertion
+    /// order can change which equal-cost arcs carry flow at a degenerate
+    /// optimum; the optimum is unique in cost, not in arc selection).
     fn matched_arcs(&self) -> Vec<(ExtId, ExtId, i64)> {
         let mut slot_to_ext: HashMap<NodeId, ExtId> = HashMap::new();
         for (id, e) in &self.entries {
@@ -439,121 +357,55 @@ impl<E> Flow<E> {
         }
     }
 
-    fn detach_arcs(&mut self, id: ExtId) {
-        let arcs = std::mem::take(&mut self.entries.get_mut(&id).unwrap().arcs);
-        for (other, arc) in arcs {
-            self.net.remove_arc(arc);
-            if let Some(oe) = self.entries.get_mut(&other) {
-                oe.arcs.retain(|(x, _)| *x != id);
-            }
-        }
-    }
-
-    fn unindex_key(&mut self, key: i64, id: ExtId) {
-        if let Some(v) = self.by_key.get_mut(&key) {
-            v.retain(|x| *x != id);
-            if v.is_empty() {
-                self.by_key.remove(&key);
-            }
-        }
-    }
-
     fn index_match_keys(&mut self, id: ExtId, keys: &[u64]) {
         for &k in keys {
             self.by_match_key.entry(k).or_default().push(id);
         }
     }
+}
 
-    fn unindex_match_keys(&mut self, id: ExtId, keys: &[u64]) {
-        for &k in keys {
-            if let Some(v) = self.by_match_key.get_mut(&k) {
-                v.retain(|x| *x != id);
-                if v.is_empty() {
-                    self.by_match_key.remove(&k);
-                }
-            }
-        }
-    }
+/// The stateless min-cost-flow leaf: it owns only the [`FlowSpec`]. Every `run`
+/// builds a fresh [`FlowRun`] from the bag, solves cold, and reads the matching
+/// back -- no warm basis, no cross-call state, so shards never interfere and
+/// repeated solves are trivially reproducible.
+struct Flow<E> {
+    spec: FlowSpec<E>,
 }
 
 impl<E> Strategy<E> for Flow<E>
 where
     E: Clone,
 {
-    fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E> {
+    fn run(&self, bag: Vec<Item<E>>) -> Resolution<E> {
         #[cfg(not(target_arch = "wasm32"))]
         let timed = std::env::var_os("FLORECON_TIME").is_some();
         #[cfg(target_arch = "wasm32")]
         let timed = false;
-        let want: BTreeSet<ExtId> = bag.iter().map(|i| i.id).collect();
-        // id -> lot reference (no clones unless we actually upsert). The leaf
-        // conserves the lot's *current* amount, so partial residuals compose
-        // through `seq`.
-        let data: HashMap<ExtId, &Item<E>> = bag.iter().map(|i| (i.id, i)).collect();
-        let sigs: HashMap<ExtId, FlowSig> = bag.iter().map(|i| (i.id, self.flow_sig(i))).collect();
 
-        // Diff want vs loaded. Upsert new ids and same-id rows whose amount or
-        // candidate signature changed; this keeps warm lot recalc correct when
-        // an upstream step shrinks the residual of an id that remains present.
-        let mut upserts: Vec<ExtId> = sigs
-            .iter()
-            .filter_map(|(&id, sig)| (self.loaded.get(&id) != Some(sig)).then_some(id))
-            .collect();
-        upserts.sort_by_key(|&id| flow_upsert_rank(id));
-        let drops: Vec<ExtId> = self
-            .loaded
-            .keys()
-            .copied()
-            .filter(|id| !want.contains(id))
-            .collect();
-
+        // Build the network cold. Insert in a stable, well-mixed id order so the
+        // ambiguous tail of equal-cost arcs resolves identically run to run,
+        // independent of the host's feed order.
+        let mut order: Vec<&Item<E>> = bag.iter().collect();
+        order.sort_by_key(|i| flow_upsert_rank(i.id));
+        let mut run = FlowRun::new(self.spec.clone());
         let tb = timed.then(std::time::Instant::now);
-        for id in upserts {
-            if let Some(item) = data.get(&id) {
-                self.upsert(id, item.data.clone(), item.amount);
-            }
-        }
-        for id in drops {
-            self.remove(id);
+        for item in order {
+            run.insert(item.id, item.data.clone(), item.amount);
         }
         let build = tb.map(|t| t.elapsed().as_secs_f64() * 1000.0);
+
         let ts = timed.then(std::time::Instant::now);
-        let status = self.solve(); // warm when a basis was already loaded.
+        let status = run.net.solve();
         if let (Some(build), Some(ts)) = (build, ts) {
             eprintln!(
-                "    flow: delta {build:>6.1} ms ({} arcs), solve {:>6.1} ms",
-                self.arc_count(),
+                "    flow: build {build:>6.1} ms ({} arcs), solve {:>6.1} ms",
+                run.arc_count(),
                 ts.elapsed().as_secs_f64() * 1000.0,
             );
         }
         debug_assert_eq!(status, SolveStatus::Optimal);
-        self.loaded = sigs;
 
-        // Determinism guard: in debug (or under FLORECON_VERIFY_WARM) rebuild a
-        // fresh cold leaf on the same id set and assert equal *objective*. A
-        // min-cost-flow optimum is unique in cost but can be degenerate in which
-        // equal-cost arcs carry flow, so we assert the objective (the real
-        // failure mode is a warm re-solve drifting to a worse objective), not
-        // the grouping (see the `warm_flow_matches_cold_*` equivalence tests).
-        if cfg!(debug_assertions) || std::env::var_os("FLORECON_VERIFY_WARM").is_some() {
-            let mut cold = Flow::new(self.spec.clone());
-            let mut ids: Vec<ExtId> = data.keys().copied().collect();
-            ids.sort_unstable();
-            for id in ids {
-                if let Some(item) = data.get(&id) {
-                    cold.upsert(id, item.data.clone(), item.amount);
-                }
-            }
-            cold.solve();
-            let (warm_obj, cold_obj) = (self.objective(), cold.objective());
-            assert!(
-                (warm_obj - cold_obj).abs() < 1e-6,
-                "warm flow solve diverged from a fresh cold rebuild: \
-                 warm objective {warm_obj} != cold objective {cold_obj}"
-            );
-        }
-
-        let groups = self
+        let groups = run
             .matched_arcs()
             .into_iter()
             .map(|(src, snk, f)| Group {
@@ -569,7 +421,7 @@ where
                 reason: Some("min-cost flow".to_string()),
             })
             .collect();
-        let unmatched: HashMap<ExtId, i64> = self
+        let unmatched: HashMap<ExtId, i64> = run
             .unmatched_allocations()
             .into_iter()
             .map(|a| (a.id, a.amount))
@@ -601,14 +453,11 @@ where
 /// means you want the raw edges (per-arc reshaping, who-matched-whom analysis);
 /// note they carry the optimizer's optimal-face degeneracy that aggregation
 /// collapses, so canonical run-to-run identity comes only after coalescing.
-///
-/// The returned leaf is *stateful* -- it keeps its basis warm across solves --
-/// but that is invisible to the caller: a one-shot solve just runs it once.
 pub fn flow<E>(spec: FlowSpec<E>) -> Box<dyn Strategy<E>>
 where
     E: Clone + 'static,
 {
-    Box::new(Flow::new(spec))
+    Box::new(Flow { spec })
 }
 
 /// Stable, well-mixed upsert order (SplitMix64 over the id), so the ambiguous
@@ -656,7 +505,7 @@ mod tests {
 
     #[test]
     fn basic_recon() {
-        let mut s = flow(demo());
+        let s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 1)]);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].net, 0); // clean
@@ -669,7 +518,7 @@ mod tests {
         // A partial-match shape: id 3 (-250) draws from id 1 (100) and id 2
         // (200). Bare `flow` exposes that as *two arcs* (the primitive
         // matching); `settle`/`coalesce` fold them into one {1,2,3} settlement.
-        let mut s = flow(demo());
+        let s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, 200, 1), item(3, -250, 0)]);
         assert_eq!(r.groups.len(), 2, "one group per positive-flow arc");
         // Every arc is a clean two-member, net-0 edge sharing the -250 sink.
@@ -689,11 +538,11 @@ mod tests {
     }
 
     #[test]
-    fn streaming_add_is_warm() {
-        let mut s = flow(demo());
+    fn streaming_add_re_solves() {
+        let s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0)]);
         assert_eq!(r.groups.len(), 1);
-        // Stream a second pair into the same (warm) leaf.
+        // Re-run with a second pair added: the stateless leaf rebuilds and solves.
         let r = s.run(vec![
             item(1, 100, 0),
             item(2, -100, 0),
@@ -706,7 +555,7 @@ mod tests {
 
     #[test]
     fn out_of_window_unmatched() {
-        let mut s = flow(demo());
+        let s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 100)]); // far apart
         assert_eq!(r.groups.len(), 0);
         let mut rem: Vec<ExtId> = r.residual.iter().map(|i| i.id).collect();
@@ -715,8 +564,8 @@ mod tests {
     }
 
     #[test]
-    fn correction_reprice_is_warm() {
-        let mut s = flow(demo());
+    fn correction_reprice_re_solves() {
+        let s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0), item(3, -50, 0)]);
         assert!(
             r.groups
@@ -733,11 +582,11 @@ mod tests {
     }
 
     #[test]
-    fn remove_is_warm() {
-        let mut s = flow(demo());
+    fn remove_re_solves() {
+        let s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0)]);
         assert_eq!(r.groups.len(), 1);
-        // Drop id 2 from the bag; the warm leaf removes it and re-solves.
+        // Drop id 2 from the bag; the next run rebuilds without it.
         let r = s.run(vec![item(1, 100, 0)]);
         assert_eq!(r.groups.len(), 0);
         assert_eq!(r.residual.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1]);
@@ -752,7 +601,7 @@ mod tests {
             .window(5)
             .block_key(|t: &Tx| t.date)
             .cost_lot(|_a: &Tx, a_amt, _b: &Tx, b_amt| (a_amt.abs() == b_amt.abs()).then_some(1.0));
-        let mut s = flow(spec);
+        let s = flow(spec);
         let r = s.run(vec![item(1, 100, 0), item(2, -100, 0)]);
         assert_eq!(r.groups.len(), 1);
         assert_eq!(r.groups[0].net, 0);

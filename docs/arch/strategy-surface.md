@@ -53,7 +53,7 @@ These types are the algebra's vocabulary and stay as-is:
 struct Item<E> { id: ExtId, original: i64, amount: i64, data: E }  // a lot in the active numeraire
 struct Group  { members: Vec<Allocation>, origin: String, net: i64, reason: Option<String> }
 struct Resolution<E> { groups: Vec<Group>, residual: Vec<Item<E>> }
-trait  Strategy<E> { fn run(&mut self, bag: Vec<Item<E>>) -> Resolution<E>; }
+trait  Strategy<E> { fn run(&self, bag: Vec<Item<E>>) -> Resolution<E>; }
 ```
 
 Invariant every node preserves: **`groups ⊎ residual = input`** (disjoint in
@@ -110,7 +110,7 @@ input ──▶ seq/partition_by/             ──▶ exact_1to1/agg_net/  ─
 | Combinator | Signature (sketch) | Role |
 |---|---|---|
 | `seq` | `seq(Vec<Strategy>)` | cascade: each step runs on the prior residual |
-| `partition_by` | `partition_by(key: Fn(&E)->K, factory: Fn()->Strategy)` | shard by key equality; **one warm child per shard**, uniform subtree |
+| `partition_by` | `partition_by(key: Fn(&E)->K, factory: Fn()->Strategy)` | shard by key equality; a **fresh child per shard** each run, uniform subtree |
 | `partition_by_with` *(new)* | `partition_by_with(key: Fn(&E)->K, factory: Fn(&K)->Strategy)` | as above, but the **factory gets the key** so plain Rust picks a per-key subtree |
 | `when` *(new)* | `when(pred: Fn(&E)->bool, inner)` | route matching items into `inner`; non-matching (and `inner`'s residual) pass through |
 | `windowed` | `windowed(order: Fn(&E)->i64, width, inner)` | sort + sweep bands with carry; locality for the cheap leaves |
@@ -120,7 +120,7 @@ input ──▶ seq/partition_by/             ──▶ exact_1to1/agg_net/  ─
 | `identity` *(new)* | `identity()` | no-op passthrough; the unit of `seq` |
 
 **Two loop shapes.** `fixed_point(inner, n)` is *convergence-driven*: it re-runs
-one warm `inner` on its own residual until the residual stops changing (or `n`
+`inner` on its own residual until the residual stops changing (or `n`
 passes elapse). The complementary shape is *schedule-driven* — run a fixed
 sequence of stages whose parameters vary by index, the canonical use being an
 **expanding-window** ladder (match same-day, then ±1wk, then ±1mo), each stage
@@ -135,8 +135,9 @@ A one-line `for_n(n, |i| …)` sugar over that `seq` reads better and signals
 "schedule, not converge", but it is *sugar*, not a core primitive — the
 expressive content already lives in `seq`. Reach for `fixed_point` when the
 parameters are fixed and you iterate to stability; reach for the scheduled
-`seq`/`for_n` when the parameters must change per pass (and rebuild a fresh
-child each pass, so a warm basis is never reused against re-priced edges).
+`seq`/`for_n` when the parameters must change per pass. (Strategies are
+stateless, so every pass rebuilds cold anyway — there is no warm basis to worry
+about carrying across re-priced edges.)
 
 **`branch` is removed; there is no `cond`.** Predicate routing is expressed two
 ways, chosen by whether you want *cascade* or *hard partition*:
@@ -148,9 +149,9 @@ ways, chosen by whether you want *cascade* or *hard partition*:
   `agg_net`s on the leftovers), so `seq + when` is the faithful, more readable
   expression. `when(p, inner)` is the only one-sided primitive; `identity()` is
   its do-nothing arm.
-- **Hard partition (no cross-talk, warm shards):** `partition_by_with(key, |k|
+- **Hard partition (no cross-talk, disjoint shards):** `partition_by_with(key, |k|
   …)`. Use it only when an item must land in *exactly one* key-chosen subtree
-  with its own warm state and never cascade into a sibling.
+  and never cascade into a sibling.
 
 We deliberately reject a first-match `cond([(pred, inner), …])`: its priority/
 fallthrough semantics are a *race* (order matters, overlapping predicates
@@ -336,14 +337,14 @@ Notes:
   `cost`/`cost_lot` and `match_keys`/`match_keys_lot` for default-method
   ergonomics. The builder stores the lot-aware closure and `.cost(...)` simply
   wraps an amount-ignoring one. Same defaults, no trait machinery.
-- **`Arc<dyn Fn>` for `Clone`.** `flow`'s warm-vs-cold determinism guard rebuilds
-  a cold leaf via `spec.clone()`; `Arc` makes that a pointer bump and is strictly
-  better than today's `M: Clone` deep-clone for any spec holding real data.
+- **`Arc<dyn Fn>` for `Clone`.** `flow` clones its `FlowSpec` into a fresh cold
+  build each `run` via `spec.clone()`; `Arc` makes that a pointer bump and is
+  strictly better than a `M: Clone` deep-clone for any spec holding real data.
 - **Cost:** one indirect call per candidate arc instead of a monomorphized
   inline. Real but in line with the rest of the algebra's dispatch, and `cost`
   is O(candidate arcs). Acceptable; the consistency win dominates.
-- The leaf internals (`Entry`, `by_key`, warm basis, readback) are unchanged —
-  only the `model.foo(tx)` calls become `spec.foo(tx)` closure calls.
+- The leaf internals (`Entry`, `by_key`, the network build, readback) are
+  unchanged — only the `model.foo(tx)` calls become `spec.foo(tx)` closure calls.
 
 A tiered-cost helper (the Python `cost_spec(tier(...))` shape) is genuinely
 useful but **domain sugar**, so it ships as an optional SDK helper, not core:
@@ -370,7 +371,7 @@ tiered(&[
 | **rename** | `flow(model)` | now `flow(spec: FlowSpec)` |
 | **add** | `when(pred, inner)` | the one-sided guard the prototype used 3× (cascade routing) |
 | **add** | `identity()` | the unit of `seq`; replaces empty `seq()` idiom |
-| **add** | `partition_by_with(key, \|k\| …)` | `partition_by` with a key-aware factory: per-key subtree, hard-disjoint warm shards |
+| **add** | `partition_by_with(key, \|k\| …)` | `partition_by` with a key-aware factory: per-key subtree, hard-disjoint shards |
 | **add** | `Group::{size,abs_net,max_abs,min_side,clean}` | closure ergonomics; replaces the group-expr atoms |
 | **change** | `soak_small(max_bps,max_abs,…)` → `soak_small(tol,…)` | one tolerance type everywhere (§6.D) |
 | **reject** | `cond([(pred, inner), …])` | first-match *race* semantics (order-dependent, shadowing); not needed |
