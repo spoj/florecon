@@ -21,6 +21,10 @@ release version:
     sed -i -E '0,/^version = "[^"]*"/s//version = "'"$v"'"/' Cargo.toml
     sed -i -E '0,/^version = "[^"]*"/s//version = "'"$v"'"/' florecon-derive/Cargo.toml
     sed -i -E '0,/^version = "[^"]*"/s//version = "'"$v"'"/' hosts/python/pyproject.toml
+    # Keep florecon's requirement on its derive crate in sync (major.minor), so
+    # minor bumps that cross a 0.x boundary still resolve against the path dep.
+    mm="${v%.*}"
+    sed -i -E 's/(florecon-derive = \{ version = ")[^"]*(")/\1'"$mm"'\2/' Cargo.toml
     bash scripts/check-versions.sh "v$v"
     cargo build -q          # refresh Cargo.lock
     just lint
