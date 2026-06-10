@@ -17,11 +17,14 @@ cloning the florecon repo:
 florecon new my-recon       # scaffold a Rust plugin (needs a Rust toolchain)
 cd my-recon
 florecon author             # fast native loop on data/sample.csv
+florecon check              # type-check only
 florecon ship               # build the production solver.wasm
+florecon package            # optional: bundle the wasm into dist/*.whl
 ```
 
-Then load `target/wasm32-unknown-unknown/release/solver.wasm` with the host
-below. See the scaffolded `README.md` for the full journey.
+Then either load `target/wasm32-unknown-unknown/release/solver.wasm` with the
+host below or hand off the wheel from `dist/`. See the scaffolded `README.md`
+for the full journey.
 
 ## Running a plugin
 
