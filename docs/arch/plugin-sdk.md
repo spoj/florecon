@@ -106,9 +106,11 @@ The matching primitives are already generic over the author's own row type and t
 closures**, not data:
 
 ```rust
-pub fn agg_net<E, FK>(key: FK, tol: impl Into<Tol>) -> Box<dyn Strategy<E>>  where FK: Fn(&E) -> u64;
-pub fn signal_group<E, FS>(signals: FS, tol: impl Into<Tol>, cap: usize) -> ...  where FS: Fn(&E) -> Vec<u64>;
-pub fn pivot<E, FA>(amount: FA, inner: ...) -> ...  where FA: Fn(&E) -> i64;
+pub fn agg_net<E, FK, FP>(key: FK, accept: FP) -> Box<dyn Strategy<E>>
+    where FK: Fn(&Item<E>) -> u64, FP: Fn(&GroupView<E>) -> bool;
+pub fn signal_group<E, FS, FP>(signals: FS, accept: FP, cap: usize) -> ...
+    where FS: Fn(&Item<E>) -> Vec<u64>, FP: Fn(&GroupView<E>) -> bool;
+pub fn pivot<E, FA>(amount: FA, inner: ...) -> ...  where FA: Fn(&Item<E>) -> i64;
 pub fn flow<M: Model>(model: M) -> Box<dyn Strategy<M::Tx>>;       // Model is a plain Rust trait
 ```
 
@@ -127,7 +129,7 @@ of the model. The SDK is the **engine + the strategy library + wiring**, minus t
    PlanNode ─┤  serialize closures + payload as data    │   Strategy<E>     (trait, leaves+combinators)
    Sel       ┤  ───────────────────────────────────▶    │   Model           (flow cost, plain trait)
    CostSpec  ┤                                           │   Recon<E>        (stateful engine, algebra-free)
-   plan_compile ┘                                        │   Item/Group/Resolution/Tol, Report
+   plan_compile ┘                                        │   Item/Group/GroupView/Resolution, Report
    arrow.rs (schema authority)                           │   (combinators take real Rust closures)
 ```
 
@@ -278,12 +280,15 @@ struct Row { amount: i64, account: u64, day: i64, memo: Vec<u64>, usd: i64 }
 
 fn strategy() -> Box<dyn Strategy<Row>> {
     seq(vec![
-        agg_net(|r: &Row| r.account, Tol::Rel { bps: 10, floor: 0 }),
-        exact_1to1_any(),
-        signal_group(|r: &Row| r.memo.clone(), Tol::Abs(0), 256),
-        pivot(|r: &Row| r.usd, flow(MyCost { window: 30 })),   // custom Model, direct
-        soak_small("rounding", /* ... */),
-        soak_all("unmatched", /* ... */),
+        agg_net(|r: &Item<Row>| r.data.account, |g| g.net().abs() <= 10 * g.min_leg() / 10_000),
+        exact_1to1(|_: &Item<Row>| Some(0)),
+        signal_group(|r: &Item<Row>| r.data.memo.clone(), |g| g.net() == 0, 256),
+        pivot(|r: &Item<Row>| r.data.usd, flow(MyCost { window: 30 })),  // custom Model, direct
+        when(                                                            // soak the rounding tail
+            |i: &Item<Row>| i.amount != 0 && i.amount.abs() <= i.original / 50,
+            partition_by(|i: &Item<Row>| i.id, |_| soak("rounding")),
+        ),
+        partition_by(|i: &Item<Row>| i.id, |_| soak("unmatched")),       // soak the rest
     ])
 }
 ```
@@ -348,7 +353,7 @@ correct across solves* is the macro + `Recon`.
 | `Strategy<E>` trait + combinators (closure-based) | `strategy.rs` | **keep**, this is the low-end core |
 | `Model` + `flow` | `flow.rs` | **keep**, direct cost trait |
 | `Recon<E>` engine + freeze/group/report | `plan.rs` (Recon half) | **extract** to `sdk::engine`, drop `Workspace`/`Plan` coupling |
-| `Item/Group/Resolution/Tol`, `Report`/`GroupOut`/... | `strategy.rs`, `report.rs` | **keep** |
+| `Item/Group/GroupView/Resolution`, `Report`/`GroupOut`/... | `strategy.rs`, `report.rs` | **keep** |
 | `export_plugin!` + ABI harness + `DescribeDoc` | new, generalize `wasm.rs` | **new** (drops `Init{plan}`, adds `describe`, generic over `Plugin::Row`) |
 
 ### 4.4 What leaves the SDK (the "algebra")

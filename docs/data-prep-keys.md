@@ -138,9 +138,9 @@ need slack.)
 |---|---|---|
 | Canonical / composite / symmetric keys | **data prep** (`derive`) | precomputable; keeps solver key a scalar |
 | Reciprocity, shared-ref, trace, amount buckets | **data prep** (`derive`) | all are equality keys |
-| Netting to zero | solver (`agg_net`, `signal`, `running_zero`) | needs the bag |
-| **Relative tolerance** | solver (`Tol::Rel { bps, floor }`) | `bps` of the bucket's smallest leg — a bag property |
-| Ordering windows | solver (`windowed`, `running_zero`) | needs the sorted bag |
+| Netting to zero | solver (`agg_net`, `signal_group`, `cumulative`) | needs the bag |
+| **Relative tolerance** | solver (acceptance closure, e.g. `\|g\| g.net().abs() <= bps * g.min_leg() / 10_000`) | `bps` of the bucket's smallest leg — a bag property |
+| Ordering windows | solver (`windowed`, `cumulative`) | needs the sorted bag |
 | Numeraire change | solver (`pivot`) | conserving projection |
 | Global arbitration | solver (`flow`) | min-cost over the residual |
 | Stage naming / "why matched" | solver (`label` → `reason`) | metadata channel on the group |

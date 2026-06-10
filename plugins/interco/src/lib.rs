@@ -19,7 +19,7 @@
 use florecon::export_plugin;
 use florecon::sdk::{Domain, Plugin, Record};
 use florecon::strategy::{
-    FlowSpec, Strategy, agg_net, exact_1to1, partition_by, seq, settle, signal_group,
+    FlowSpec, Item, Strategy, agg_net, coalesce, exact_1to1, flow, partition_by, seq, signal_group,
 };
 use florecon::token::fnv1a;
 
@@ -175,16 +175,20 @@ impl Plugin for IntercoPlugin {
 
     fn strategy(&self) -> Box<dyn Strategy<Row>> {
         partition_by(
-            |t: &Row| t.unit,
-            || {
+            |t: &Item<Row>| t.data.unit,
+            |_| {
                 partition_by(
-                    |t: &Row| t.ccy,
-                    || {
+                    |t: &Item<Row>| t.data.ccy,
+                    |_| {
                         seq(vec![
-                            agg_net(|t: &Row| t.objsub, TOL),
-                            exact_1to1(|_t: &Row| Some(0)),
-                            signal_group(|t: &Row| t.tokens.clone(), TOL, CAP),
-                            settle(interco_spec(1000.0)),
+                            agg_net(|t: &Item<Row>| t.data.objsub, |g| g.net().abs() <= TOL),
+                            exact_1to1(|_t: &Item<Row>| Some(0)),
+                            signal_group(
+                                |t: &Item<Row>| t.data.tokens.clone(),
+                                |g| g.net().abs() <= TOL,
+                                CAP,
+                            ),
+                            coalesce("flow", flow(interco_spec(1000.0))),
                         ])
                     },
                 )

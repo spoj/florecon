@@ -20,19 +20,28 @@ groups; **combinators** arrange leaves. Every node conserves signed amount.
 Leaves:
 
 - `exact_1to1` — pair a row with an equal-and-opposite row sharing a key.
-- `agg_net` — accept a bucket (by a key) that nets to zero within a `Tol`.
+- `agg_net` — accept a bucket (by a key) that nets to zero, gated by an
+  acceptance closure over the bucket.
 - `signal_group` — group rows sharing a free-text token that net to zero.
+- `cumulative` — close ordered running-balance clearing segments.
+- `subset_sum` — atomic many-to-one clearing by value search.
 - `flow` — a min-cost-flow arbiter (the [`engine`]): pairs opposite-sign rows by
   proximity in an ordering and a cost model, splitting a row across
   counterparties when needed. The domain is described by a `FlowSpec` of
   closures (penalty, window, block key, match keys, pair cost).
-- `soak_all` / `soak_small` / `soak_if` — sweep leftovers into variance or
-  write-off buckets.
+- `soak` — sweep leftovers into one variance/write-off group (shape it with
+  `partition_by`, filter it with `when`).
 
 Combinators:
 
 - `seq` — run steps in order; each sees only the previous step's leftovers.
-- `partition_by` / `partition_by_with` — shard by a key and run a sub-strategy
+- `accept_if` — gate an inner strategy's groups by a closure over a `GroupView`
+  (legs + each row's `original` + payload); rejected groups dissolve back to
+  residual. The one acceptance/materiality concept — there is no tolerance type.
+- `reclaim` — make a discovered grouping whole-line (reclaim ground tails);
+  pair with `accept_if` for the classic N:M tolerance match.
+- `coalesce` — fuse interlocking groups into settlement clusters.
+- `partition_by` — shard by a key (over the whole `Item`) and run a sub-strategy
   per shard (e.g. per company pair, per currency).
 - `when` / `identity` — route rows through a guarded sub-strategy, else pass on.
 - `windowed` — restrict matching to a sliding window over an ordering.
@@ -47,12 +56,12 @@ use florecon::strategy::*;
 
 // Per company-pair, per currency: net clean buckets, pair exacts, bridge on
 // references, then let the flow engine arbitrate the remainder.
-let strategy = partition_by(|t: &Tx| t.pair, move || {
-    partition_by(|t: &Tx| t.ccy, move || {
+let strategy = partition_by(|t: &Item<Tx>| t.data.pair, |_| {
+    partition_by(|t: &Item<Tx>| t.data.ccy, |_| {
         seq(vec![
-            agg_net(|t: &Tx| t.account, Tol::Abs(100)),
-            exact_1to1(|_: &Tx| Some(0)),
-            signal_group(|t: &Tx| t.tokens.clone(), Tol::Abs(0), 256),
+            agg_net(|t: &Item<Tx>| t.data.account, |g| g.net().abs() <= 100),
+            exact_1to1(|_: &Item<Tx>| Some(0)),
+            signal_group(|t: &Item<Tx>| t.data.tokens.clone(), |g| g.net() == 0, 256),
             flow(FlowSpec::new()
                 .window(30)
                 .penalty(1000.0)

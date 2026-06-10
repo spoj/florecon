@@ -230,7 +230,7 @@ impl<E> FlowRun<E> {
     /// the positive-base side. This is flow's primitive output: the **matching
     /// itself**, one edge per arc -- not a settlement view. Grouping arcs into
     /// connected-component settlements is [`super::coalesce`]'s job (and is what
-    /// the `settle`/`whole_*` combinators compose on top).
+    /// [`super::reclaim`] composes on top).
     ///
     /// Sorted canonically by `(src, snk, amount)` so the readback is stable run
     /// to run, independent of this build's internal arc-vec layout (insertion
@@ -448,8 +448,8 @@ where
 /// atomic -- **one two-member group per positive-flow arc** (`{source: +f,
 /// sink: -f}`, net 0), plus the residual -- and nothing else. It deliberately
 /// does *not* fold those arcs into settlement clusters; grouping is a separate
-/// concern owned by the composition layer (`coalesce`, and the `settle` /
-/// `whole_net` sugar built on it). Reaching for bare `flow`
+/// concern owned by the composition layer ([`super::coalesce`], and the
+/// [`super::reclaim`] sugar built on it). Reaching for bare `flow`
 /// means you want the raw edges (per-arc reshaping, who-matched-whom analysis);
 /// note they carry the optimizer's optimal-face degeneracy that aggregation
 /// collapses, so canonical run-to-run identity comes only after coalescing.
@@ -517,7 +517,7 @@ mod tests {
     fn bare_flow_emits_raw_arcs_not_settlements() {
         // A partial-match shape: id 3 (-250) draws from id 1 (100) and id 2
         // (200). Bare `flow` exposes that as *two arcs* (the primitive
-        // matching); `settle`/`coalesce` fold them into one {1,2,3} settlement.
+        // matching); `coalesce` folds them into one {1,2,3} settlement.
         let s = flow(demo());
         let r = s.run(vec![item(1, 100, 0), item(2, 200, 1), item(3, -250, 0)]);
         assert_eq!(r.groups.len(), 2, "one group per positive-flow arc");

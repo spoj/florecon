@@ -33,7 +33,7 @@
 use crate::ExtId;
 pub use crate::error::ApiError;
 pub use crate::report::{AllocationOut, Component, GroupOut, ProjectionError, Report, Status};
-use crate::strategy::{Allocation, Item, Strategy, Tol};
+use crate::strategy::{Allocation, Item, Strategy};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -163,11 +163,11 @@ impl GroupView<'_> {
     pub fn contains_any(&self, ids: &[ExtId]) -> bool {
         ids.iter().any(|&id| self.rec.contains(id))
     }
-    /// Whether the net balances within `tol`, measured against the group's leg
-    /// magnitudes — the same predicate strategy leaves use to accept a bucket.
-    pub fn clean(&self, tol: impl Into<Tol>) -> bool {
-        let tol = tol.into();
-        self.net().abs() <= tol.slack_for(self.rec.allocations.iter().map(|a| a.amount))
+    /// Whether the net balances within an absolute `tol` (minor units). The
+    /// host-facing "clean match" pin predicate; the wire ABI passes a plain
+    /// integer slack.
+    pub fn clean(&self, tol: i64) -> bool {
+        self.net().abs() <= tol
     }
     pub fn origin(&self) -> &str {
         self.rec.label.origin()
@@ -642,7 +642,7 @@ mod tests {
     /// A workspace over bare `i64` rows: the value *is* the conserved amount,
     /// and the strategy pairs opposite-equal amounts (a clean 1-to-1).
     fn recon() -> Recon<i64> {
-        Recon::new(exact_1to1(|_: &i64| Some(0)), |&a| a)
+        Recon::new(exact_1to1(|_: &Item<i64>| Some(0)), |&a| a)
     }
 
     fn alloc(id: ExtId, amount: i64) -> Allocation {

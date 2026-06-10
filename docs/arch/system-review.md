@@ -34,7 +34,7 @@ that nothing is created or lost.
   PLUGIN    │  lf_solver / interco:  #[derive(Record)] + Config +   │   domain logic,
   (guest)   │  one strategy() closure tree + project()              │   closures
             └───────────────────────────┬──────────────────────────┘
-                                         │  Strategy<E> algebra (Item/Group/Tol)
+                                         │  Strategy<E> algebra (Item/Group/GroupView)
   ─────────────────────────────────  SDK seam (sdk/plugin.rs, sdk/record.rs)
             ┌───────────────────────────┴──────────────────────────┐
   KERNEL    │  Recon (stateful workspace)  ·  strategy combinators  │   generic,

@@ -11,7 +11,7 @@
 
 use florecon::export_plugin;
 use florecon::sdk::{Domain, Plugin, Record};
-use florecon::strategy::{Strategy, Tol, agg_net, exact_1to1, partition_by, seq};
+use florecon::strategy::{Item, Strategy, agg_net, exact_1to1, partition_by, seq};
 use florecon::token::fnv1a;
 use serde::Deserialize;
 
@@ -81,11 +81,11 @@ impl Plugin for Solver {
     fn strategy(&self) -> Box<dyn Strategy<Row>> {
         let tol = self.config.tol;
         partition_by(
-            |r: &Row| r.key,
-            move || {
+            |r: &Item<Row>| r.data.key,
+            move |_| {
                 seq(vec![
-                    agg_net(|_r: &Row| 0u64, Tol::Abs(tol)),
-                    exact_1to1(|_r: &Row| Some(0)),
+                    agg_net(|_r: &Item<Row>| 0u64, move |g| g.net().abs() <= tol),
+                    exact_1to1(|_r: &Item<Row>| Some(0)),
                 ])
             },
         )
