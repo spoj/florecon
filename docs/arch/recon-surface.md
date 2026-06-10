@@ -191,7 +191,7 @@ impl GroupView<'_> {
     fn size(&self) -> usize;
     fn is_singleton(&self) -> bool;     // size == 1
     fn is_match(&self) -> bool;         // size >= 2
-    fn clean(&self, tol: Tol) -> bool;  // |net| within tol of the group scale
+    fn clean(&self, tol: i64) -> bool;  // |net| within an absolute integer tol
     fn contains(&self, id: ExtId) -> bool;
     fn contains_any(&self, ids: &[ExtId]) -> bool;
 }
