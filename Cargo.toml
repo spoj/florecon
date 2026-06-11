@@ -1,46 +1,19 @@
 [package]
 name = "florecon"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-description = "Incremental financial reconciliation by min-cost flow: a conserving combinator algebra over a network-simplex core. Nothing created, nothing lost."
+description = "Reconciliation as partitioning: parse a bag of entries into groups. A small combinator algebra over identity, with a min-cost-flow leaf."
 license = "MIT"
 repository = "https://github.com/spoj/florecon"
 readme = "README.md"
-keywords = ["reconciliation", "min-cost-flow", "network-simplex", "finance", "matching"]
-categories = ["finance", "algorithms", "mathematics"]
-
-[package.metadata.docs.rs]
-# Build docs with the full authoring SDK (Arrow Table, Plugin, derive(Record)).
-features = ["sdk"]
+keywords = ["reconciliation", "min-cost-flow", "partition", "matching", "finance"]
+categories = ["finance", "algorithms"]
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
-log = "0.4"
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
-arrow = { version = "53", default-features = false, features = ["ipc"], optional = true }
-florecon-derive = { version = "0.4", path = "florecon-derive", optional = true }
-
-[features]
-serde = ["dep:serde", "dep:serde_json"]
-# The plugin authoring SDK: columnar Arrow Table, Plugin trait, DescribeDoc,
-# derive(Record), the wasm ABI driver + export_plugin! macro, and conformance.
-sdk = ["serde", "dep:arrow", "dep:florecon-derive"]
-
-[dev-dependencies]
-csv = "1.3"
-parquet = "53.0"
-serde_json = "1"
+netsimplex = { version = "0.1", path = "netsimplex" }
 
 [workspace]
-members = [".", "florecon-derive", "plugins/interco"]
-# A self-contained author starter with its own workspace + profiles; built and
-# run by CI as a real plugin (so it can't drift), but not a member here.
-exclude = ["examples/starter-plugin"]
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
+members = [".", "netsimplex"]

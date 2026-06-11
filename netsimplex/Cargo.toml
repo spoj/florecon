@@ -1,0 +1,14 @@
+[package]
+name = "netsimplex"
+version = "0.1.0"
+edition = "2024"
+description = "A domain-agnostic min-cost transportation solver (bounded-variable network simplex)."
+license = "MIT"
+
+[dependencies]
+log = "0.4"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+serde = ["dep:serde", "dep:serde_json"]

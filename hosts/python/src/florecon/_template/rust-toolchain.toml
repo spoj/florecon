@@ -1,5 +1,0 @@
-[toolchain]
-# Pin the toolchain so the shipped wasm is reproducible across your machine and
-# CI, and auto-install the wasm target (no manual `rustup target add`).
-channel = "stable"
-targets = ["wasm32-unknown-unknown"]
