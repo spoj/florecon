@@ -54,7 +54,8 @@ fn agg_net_keeps_balanced_bucket() {
 #[test]
 fn agg_net_tolerance_is_an_inline_closure() {
     let b = bag(&[(1, 1000), (2, -997)]); // net 3
-    let strict = agg_net(|_: &Entry<i64>| 0, |g| g.net(amount) == 0).run(bag(&[(1, 1000), (2, -997)]));
+    let strict =
+        agg_net(|_: &Entry<i64>| 0, |g| g.net(amount) == 0).run(bag(&[(1, 1000), (2, -997)]));
     assert_eq!(strict.groups.len(), 0);
     // "within 5 of zero" — author writes the inequality
     let loose = agg_net(|_: &Entry<i64>| 0, |g| g.net(amount).abs() <= 5).run(b);
@@ -69,9 +70,27 @@ fn signal_group_buckets_shared_tokens() {
         toks: Vec<u64>,
     }
     let b = vec![
-        Entry::new(1, R { amt: 100, toks: vec![7] }),
-        Entry::new(2, R { amt: -100, toks: vec![7] }),
-        Entry::new(3, R { amt: 5, toks: vec![9] }),
+        Entry::new(
+            1,
+            R {
+                amt: 100,
+                toks: vec![7],
+            },
+        ),
+        Entry::new(
+            2,
+            R {
+                amt: -100,
+                toks: vec![7],
+            },
+        ),
+        Entry::new(
+            3,
+            R {
+                amt: 5,
+                toks: vec![9],
+            },
+        ),
     ];
     let r = signal_group(|e: &Entry<R>| e.toks.clone(), |g| g.net(|e| e.amt) == 0, 16).run(b);
     assert_eq!(r.groups.len(), 1);
@@ -139,7 +158,10 @@ fn partition_by_shards_and_when_routes() {
     assert_conserved(&r, &[1, 2, 3, 4]);
     assert_eq!(r.groups.len(), 0, "opposite signs land in different shards");
 
-    let s2 = when(|e: &Entry<i64>| e.data.abs() == 100, exact_1to1(|_: &Entry<i64>| Some(0), amount));
+    let s2 = when(
+        |e: &Entry<i64>| e.data.abs() == 100,
+        exact_1to1(|_: &Entry<i64>| Some(0), amount),
+    );
     let r2 = s2.run(bag(&[(1, 100), (2, -100), (3, 5)]));
     assert_eq!(r2.groups.len(), 1);
     assert!(r2.residual.iter().any(|e| e.id == 3));
@@ -172,7 +194,8 @@ fn soak_consumes_all_and_partition_makes_singletons() {
 
 #[test]
 fn labeled_stamps_reason() {
-    let r = labeled("clean pair", exact_1to1(|_: &Entry<i64>| Some(0), amount)).run(bag(&[(1, 1), (2, -1)]));
+    let r = labeled("clean pair", exact_1to1(|_: &Entry<i64>| Some(0), amount))
+        .run(bag(&[(1, 1), (2, -1)]));
     assert_eq!(r.groups[0].reason.as_deref(), Some("clean pair"));
 }
 

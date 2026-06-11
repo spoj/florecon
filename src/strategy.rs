@@ -143,7 +143,11 @@ impl<'a, E> GroupView<'a, E> {
 
     /// Largest lane magnitude; `0` if empty.
     pub fn max_leg(&self, amount: impl Fn(&Entry<E>) -> i64) -> i64 {
-        self.members.iter().map(|e| amount(e).abs()).max().unwrap_or(0)
+        self.members
+            .iter()
+            .map(|e| amount(e).abs())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Smallest non-zero lane magnitude; `0` if every leg is zero.
@@ -177,7 +181,10 @@ fn split<E>(bag: Vec<Entry<E>>, matched: Vec<Vec<Id>>, origin: &str) -> Resoluti
         .into_iter()
         .map(|ids| Group::new(ids, origin))
         .collect();
-    let residual = bag.into_iter().filter(|e| !in_group.contains(&e.id)).collect();
+    let residual = bag
+        .into_iter()
+        .filter(|e| !in_group.contains(&e.id))
+        .collect();
     Resolution { groups, residual }
 }
 
@@ -235,7 +242,10 @@ impl<E> Strategy<E> for Labeled<E> {
 }
 
 /// Stamp a human `reason` on every group a subtree forms.
-pub fn labeled<E: 'static>(tag: impl Into<String>, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>> {
+pub fn labeled<E: 'static>(
+    tag: impl Into<String>,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>> {
     Box::new(Labeled {
         tag: tag.into(),
         inner,
@@ -338,11 +348,19 @@ impl<E, FO: Fn(&Entry<E>) -> i64> Strategy<E> for Windowed<E, FO> {
 /// Restrict matching to non-overlapping windows of `width` over an `order`.
 /// Matches do not span window boundaries — widen `width` (or use `flow`'s own
 /// window) for cross-boundary reach.
-pub fn windowed<E: 'static, FO>(order: FO, width: i64, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>>
+pub fn windowed<E: 'static, FO>(
+    order: FO,
+    width: i64,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>>
 where
     FO: Fn(&Entry<E>) -> i64 + 'static,
 {
-    Box::new(Windowed { order, width, inner })
+    Box::new(Windowed {
+        order,
+        width,
+        inner,
+    })
 }
 
 struct FixedPoint<E> {
@@ -378,7 +396,10 @@ impl<E> Strategy<E> for FixedPoint<E> {
 
 /// Iterate `inner` on its own residual until the residual stops changing (or
 /// `max_passes` elapse).
-pub fn fixed_point<E: 'static>(inner: Box<dyn Strategy<E>>, max_passes: usize) -> Box<dyn Strategy<E>> {
+pub fn fixed_point<E: 'static>(
+    inner: Box<dyn Strategy<E>>,
+    max_passes: usize,
+) -> Box<dyn Strategy<E>> {
     Box::new(FixedPoint { inner, max_passes })
 }
 
@@ -410,7 +431,10 @@ impl<E: Clone, FP: Fn(&GroupView<E>) -> bool> Strategy<E> for AcceptIf<E, FP> {
 
 /// Gate an inner strategy's groups by a closure over a [`GroupView`]; rejected
 /// groups dissolve back to residual (whole). This is the one acceptance concept.
-pub fn accept_if<E: Clone + 'static, FP>(pred: FP, inner: Box<dyn Strategy<E>>) -> Box<dyn Strategy<E>>
+pub fn accept_if<E: Clone + 'static, FP>(
+    pred: FP,
+    inner: Box<dyn Strategy<E>>,
+) -> Box<dyn Strategy<E>>
 where
     FP: Fn(&GroupView<E>) -> bool + 'static,
 {
@@ -440,7 +464,9 @@ impl<E> Strategy<E> for Soak {
 /// [`partition_by`] (`partition_by(|e| e.id, |_| soak(o))` = singletons) and
 /// filter it with [`when`].
 pub fn soak<E: 'static>(origin: impl Into<String>) -> Box<dyn Strategy<E>> {
-    Box::new(Soak { origin: origin.into() })
+    Box::new(Soak {
+        origin: origin.into(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -675,8 +701,11 @@ where
                 .cmp(&(self.amount)(a))
                 .then(tie(a.id, self.seed).cmp(&tie(b.id, self.seed)))
         });
-        let negs: Vec<(&Entry<E>, i64)> =
-            bag.iter().filter(|e| (self.amount)(e) < 0).map(|e| (e, -(self.amount)(e))).collect();
+        let negs: Vec<(&Entry<E>, i64)> = bag
+            .iter()
+            .filter(|e| (self.amount)(e) < 0)
+            .map(|e| (e, -(self.amount)(e)))
+            .collect();
         let mut matched: Vec<Vec<Id>> = Vec::new();
         for anchor in anchors {
             if used.contains(&anchor.id) {
@@ -688,7 +717,10 @@ where
                 .filter(|(e, _)| !used.contains(&e.id))
                 .map(|(e, v)| (e.id, *v))
                 .collect();
-            pool.sort_by(|a, b| b.1.cmp(&a.1).then(tie(a.0, self.seed).cmp(&tie(b.0, self.seed))));
+            pool.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then(tie(a.0, self.seed).cmp(&tie(b.0, self.seed)))
+            });
             if let Some(subset) = subset_search(&pool, target, self.band, self.max_group) {
                 used.insert(anchor.id);
                 let mut ids = vec![anchor.id];
@@ -749,7 +781,12 @@ fn subset_search(pool: &[(Id, i64)], target: i64, band: i64, max_group: usize) -
 /// negatives summing within `band`. `band` is a *search* parameter (candidate
 /// pruning), not an acceptance test — gate precisely with a downstream
 /// [`accept_if`]. Seeded and reproducible.
-pub fn subset_sum<E: 'static, FA>(amount: FA, band: i64, max_group: usize, seed: u64) -> Box<dyn Strategy<E>>
+pub fn subset_sum<E: 'static, FA>(
+    amount: FA,
+    band: i64,
+    max_group: usize,
+    seed: u64,
+) -> Box<dyn Strategy<E>>
 where
     FA: Fn(&Entry<E>) -> i64 + 'static,
 {

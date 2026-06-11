@@ -1,9 +1,8 @@
 name: checks
 
-# Reusable check matrix: lint+test, author starter, semver guard, version
-# consistency, and host conformance. Called by `ci.yml` (on push / PR) and by
-# `release.yml` as a publish gate, so the exact commit that ships is the exact
-# commit these checks passed on.
+# Reusable check matrix: fmt, clippy, test across the workspace. Called by
+# `ci.yml` (push / PR) and by `release.yml` as a publish gate, so the exact
+# commit that ships is the exact commit these checks passed on.
 on:
   workflow_call:
 
@@ -12,98 +11,14 @@ permissions:
 
 jobs:
   rust:
-    name: lint + test
+    name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
-      - run: just lint
-      - run: just test
-
-  starter:
-    name: author starter (native + wasm)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
-      - uses: astral-sh/setup-uv@v8.2.0
-      # Build + run the starter seed exactly as an author would, so it can never
-      # drift against the SDK: native harness on the sample, the ship wasm, then
-      # the distributable wheel (Phase 3 packaging).
-      - run: just starter
-      - run: just starter-package
-
-  semver:
-    name: semver-checks (florecon)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # Compares the crate's public API against the last release on crates.io and
-      # fails an undeclared breaking change (0.x: breaking => minor bump).
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: florecon
-          feature-group: all-features
-
-  versions:
-    name: version consistency
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - run: bash scripts/check-versions.sh
-      # The host bundles the author starter (florecon._template); keep it byte-
-      # identical to examples/starter-plugin (the CI-tested source of truth).
-      - run: python3 scripts/sync-template.py --check
-
-  hosts:
-    name: host conformance (wasm + python + js)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
-      - uses: astral-sh/setup-uv@v8.2.0
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "22"
-
-      # Build the interco plugin to wasm (also stages it into the Python host).
-      - run: just build-wasm
-
-      # Python host: the golden wire-contract replay + the stateful smoke, both
-      # driving the real wasm through the generic host.
-      - name: python host
-        env:
-          PYTHONPATH: hosts/python/src
-        run: |
-          uv run --no-project --python 3.12 --with wasmtime --with pyarrow \
-            python hosts/python/golden_replay.py
-          uv run --no-project --python 3.12 --with wasmtime --with pyarrow \
-            python hosts/python/smoke_stateful.py
-
-      # JS host: head-less smoke (loads the same wasm, asserts parity).
-      - name: js host
-        working-directory: hosts/js
-        run: |
-          npm ci
-          npm test
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features

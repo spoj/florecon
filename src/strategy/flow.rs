@@ -184,7 +184,10 @@ impl<E> Strategy<E> for Flow<E> {
             .into_iter()
             .map(|ids| Group::new(ids, "flow"))
             .collect();
-        let residual = bag.into_iter().filter(|e| !in_group.contains(&e.id)).collect();
+        let residual = bag
+            .into_iter()
+            .filter(|e| !in_group.contains(&e.id))
+            .collect();
         Resolution { groups, residual }
     }
 }
