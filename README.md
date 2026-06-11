@@ -150,10 +150,15 @@ The journey then has two phases:
    cd app && uv run python run.py
    ```
 
-`florecon author` / `ship` / `check` are thin, cross-platform `cargo` wrappers
-(they need a Rust toolchain). The worked starter — the exact thing `florecon new`
-scaffolds — is [`examples/starter-plugin`](examples/starter-plugin) (its README
-walks the full path); `plugins/interco` is the larger real example (intercompany
+   If you want a distributable artifact instead of loading the wasm from
+   `target/`, `florecon package` builds the same release wasm, embeds it in a
+   wheel, and writes `dist/*.whl`.
+
+`florecon author` / `ship` / `package` / `check` are thin, cross-platform
+`cargo` wrappers (they need a Rust toolchain). The worked starter — the exact
+thing `florecon new` scaffolds — is
+[`examples/starter-plugin`](examples/starter-plugin) (its README walks the full
+path); `plugins/interco` is the larger real example (intercompany
 reconciliation).
 
 ## Developing florecon itself

@@ -115,5 +115,7 @@ cd my-recon
 florecon author
 ```
 
+Then use `florecon check` / `ship` / `package` as the plugin matures.
+
 (In the florecon repo this seed uses a `path` dependency so CI tests it against
 the working tree; the scaffolded copy pins the published crate.)
