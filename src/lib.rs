@@ -24,6 +24,7 @@
 //! assert_eq!(r.groups[0].size(), 2);
 //! ```
 
+pub mod alloc;
 pub mod strategy;
 pub mod token;
 

@@ -646,6 +646,10 @@ where
 /// Bucket entries by `key` (return `None` to opt an entry out, as in
 /// [`exact_1to1`]); keep each bucket the `accept` closure approves (typically
 /// "nets to ~0 on some lane"). Rejected buckets dissolve to residual.
+///
+/// A convenience: it is exactly `partition_by(key, |_| accept_if(accept,
+/// soak(..)))` (the shard is the key, the gate is [`accept_if`]) — but keyed
+/// netting is the single most common reconciliation step, so it earns a name.
 pub fn agg_net<E: 'static, FK, FP>(key: FK, accept: FP) -> Box<dyn Strategy<E>>
 where
     FK: Fn(&Entry<E>) -> Option<u64> + 'static,
