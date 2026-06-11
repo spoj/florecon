@@ -1,6 +1,6 @@
 [package]
 name = "florecon"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Reconciliation as partitioning: parse a bag of entries into groups. A small combinator algebra over identity, with a min-cost-flow leaf."
 license = "MIT"

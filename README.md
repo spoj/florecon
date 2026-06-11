@@ -14,7 +14,7 @@ let strategy = seq(vec![
     // clean opposite-and-equal pairs sharing an account
     exact_1to1(|e: &Entry<Tx>| Some(e.account), |e| e.amount),
     // buckets that net to within 5 (the tolerance is just an inline closure)
-    agg_net(|e: &Entry<Tx>| e.account, |g| g.net(|e| e.amount).abs() <= 5),
+    agg_net(|e: &Entry<Tx>| Some(e.account), |g| g.net(|e| e.amount).abs() <= 5),
     // the min-cost-flow arbiter on what's left, emitting whole-row clusters
     flow(FlowSpec::new()
         .amount(|t: &Tx| t.amount)
@@ -47,7 +47,7 @@ Conservation is **identity**, not arithmetic: nothing lost, nothing invented.
 ## The surface
 
 ```
-combinators  seq  partition_by  when  windowed  fixed_point  accept_if  labeled  identity  soak
+combinators  seq  partition_by  when  windowed  fixed_point  restart  accept_if  explain  identity  soak
 leaves       exact_1to1  agg_net  signal_group  cumulative  subset_sum  flow(FlowSpec)
 ```
 

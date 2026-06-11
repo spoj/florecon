@@ -50,8 +50,10 @@ pub struct Group {
     pub members: Vec<Id>,
     /// Which primitive produced it (the machine tag).
     pub origin: String,
-    /// Optional human-facing explanation, stamped by [`labeled`].
-    pub reason: Option<String>,
+    /// A trail of human notes, appended outward by each enclosing [`explain`]
+    /// (innermost first). The framework never interprets these — that is left
+    /// to the caller.
+    pub reason: Vec<String>,
 }
 
 impl Group {
@@ -59,7 +61,7 @@ impl Group {
         Group {
             members,
             origin: origin.into(),
-            reason: None,
+            reason: Vec::new(),
         }
     }
 
@@ -227,27 +229,30 @@ pub fn identity<E: 'static>() -> Box<dyn Strategy<E>> {
     Box::new(Identity)
 }
 
-struct Labeled<E> {
-    tag: String,
+struct Explain<E> {
+    note: String,
     inner: Box<dyn Strategy<E>>,
 }
-impl<E> Strategy<E> for Labeled<E> {
+impl<E> Strategy<E> for Explain<E> {
     fn run(&self, bag: Vec<Entry<E>>) -> Resolution<E> {
         let mut r = self.inner.run(bag);
         for g in &mut r.groups {
-            g.reason = Some(self.tag.clone());
+            g.reason.push(self.note.clone());
         }
         r
     }
 }
 
-/// Stamp a human `reason` on every group a subtree forms.
-pub fn labeled<E: 'static>(
-    tag: impl Into<String>,
+/// Append a human note to every group a subtree forms. Notes accumulate as the
+/// result bubbles outward (innermost [`explain`] first), so a group carries the
+/// full trail from the specific leaf to the general context. The framework does
+/// not interpret the trail — downstream decides what it means.
+pub fn explain<E: 'static>(
+    note: impl Into<String>,
     inner: Box<dyn Strategy<E>>,
 ) -> Box<dyn Strategy<E>> {
-    Box::new(Labeled {
-        tag: tag.into(),
+    Box::new(Explain {
+        note: note.into(),
         inner,
     })
 }
@@ -324,31 +329,55 @@ struct Windowed<E, FO> {
     width: i64,
     inner: Box<dyn Strategy<E>>,
 }
-impl<E, FO: Fn(&Entry<E>) -> i64> Strategy<E> for Windowed<E, FO> {
+impl<E: Clone, FO: Fn(&Entry<E>) -> i64> Strategy<E> for Windowed<E, FO> {
     fn run(&self, bag: Vec<Entry<E>>) -> Resolution<E> {
-        // Tile the order axis into non-overlapping windows of `width`; run
-        // `inner` independently per window (locality for the cheap leaves).
-        let w = self.width.max(1);
-        let mut tiles: BTreeMap<i64, Vec<Entry<E>>> = BTreeMap::new();
-        for e in bag {
-            let t = (self.order)(&e).div_euclid(w);
-            tiles.entry(t).or_default().push(e);
-        }
+        // A *moving* window: sweep an anchor over the entries in order; the
+        // window is everything within `width` ahead of the anchor. Windows
+        // overlap, so any two entries within `width` can co-occur — the match
+        // is found when anchored at the earlier of the two. Matched members are
+        // retired from later windows; the rest stay live.
+        let w = self.width.max(0);
+        let mut sorted: Vec<&Entry<E>> = bag.iter().collect();
+        sorted.sort_by_key(|e| ((self.order)(e), e.id));
+        let ord: Vec<i64> = sorted.iter().map(|e| (self.order)(e)).collect();
+        let mut used: HashSet<Id> = HashSet::new();
         let mut groups = Vec::new();
-        let mut residual = Vec::new();
-        for (_t, ents) in tiles {
-            let r = self.inner.run(ents);
-            groups.extend(r.groups);
-            residual.extend(r.residual);
+        for a in 0..sorted.len() {
+            if used.contains(&sorted[a].id) {
+                continue;
+            }
+            let hi = ord[a] + w;
+            let mut window: Vec<Entry<E>> = Vec::new();
+            for b in a..sorted.len() {
+                if ord[b] > hi {
+                    break;
+                }
+                if !used.contains(&sorted[b].id) {
+                    window.push(sorted[b].clone());
+                }
+            }
+            if window.len() < 2 {
+                continue;
+            }
+            let r = self.inner.run(window);
+            for g in r.groups {
+                for id in &g.members {
+                    used.insert(*id);
+                }
+                groups.push(g);
+            }
         }
+        let residual = bag.into_iter().filter(|e| !used.contains(&e.id)).collect();
         Resolution { groups, residual }
     }
 }
 
-/// Restrict matching to non-overlapping windows of `width` over an `order`.
-/// Matches do not span window boundaries — widen `width` (or use `flow`'s own
-/// window) for cross-boundary reach.
-pub fn windowed<E: 'static, FO>(
+/// Restrict matching to a *moving* window of span `width` over an `order`: any
+/// two entries within `width` on the order axis may match (the window is swept,
+/// overlapping, anchored at each still-live entry). A matched member is retired
+/// from later windows. Wrap a matcher, not `soak`. `inner` runs per anchor, so
+/// keep `width` tight enough to bound the pools.
+pub fn windowed<E: Clone + 'static, FO>(
     order: FO,
     width: i64,
     inner: Box<dyn Strategy<E>>,
@@ -401,6 +430,58 @@ pub fn fixed_point<E: 'static>(
     max_passes: usize,
 ) -> Box<dyn Strategy<E>> {
     Box::new(FixedPoint { inner, max_passes })
+}
+
+struct Restart<E, FS, FB> {
+    seeds: Vec<u64>,
+    score: FS,
+    build: FB,
+    _e: std::marker::PhantomData<fn() -> E>,
+}
+impl<E, FS, FB> Strategy<E> for Restart<E, FS, FB>
+where
+    E: Clone,
+    FS: Fn(&Resolution<E>) -> i64,
+    FB: Fn(u64) -> Box<dyn Strategy<E>>,
+{
+    fn run(&self, bag: Vec<Entry<E>>) -> Resolution<E> {
+        let mut best: Option<(i64, Resolution<E>)> = None;
+        for &seed in &self.seeds {
+            let r = (self.build)(seed).run(bag.clone());
+            let s = (self.score)(&r);
+            // Strict `>` keeps the earliest seed on a tie — deterministic.
+            if best.as_ref().is_none_or(|(bs, _)| s > *bs) {
+                best = Some((s, r));
+            }
+        }
+        best.map(|(_, r)| r).unwrap_or(Resolution {
+            groups: Vec::new(),
+            residual: bag,
+        })
+    }
+}
+
+/// Run a seeded subtree once per seed and keep the highest-scoring partition.
+/// `build(seed)` constructs the attempt (pass the seed into a seeded leaf like
+/// [`subset_sum`]); `score` rates a [`Resolution`] (higher wins, earliest seed
+/// breaks ties). The residual carries whole entries, so score what's *left*,
+/// e.g. `|r| -(r.residual.len() as i64)` or `|r| -r.residual.iter().map(|e|
+/// e.amount.abs()).sum::<i64>()`.
+pub fn restart<E: Clone + 'static, FS, FB>(
+    seeds: Vec<u64>,
+    score: FS,
+    build: FB,
+) -> Box<dyn Strategy<E>>
+where
+    FS: Fn(&Resolution<E>) -> i64 + 'static,
+    FB: Fn(u64) -> Box<dyn Strategy<E>> + 'static,
+{
+    Box::new(Restart {
+        seeds,
+        score,
+        build,
+        _e: std::marker::PhantomData,
+    })
 }
 
 struct AcceptIf<E, FP> {
@@ -541,13 +622,15 @@ struct AggNet<E, FK, FP> {
 }
 impl<E, FK, FP> Strategy<E> for AggNet<E, FK, FP>
 where
-    FK: Fn(&Entry<E>) -> u64,
+    FK: Fn(&Entry<E>) -> Option<u64>,
     FP: Fn(&GroupView<E>) -> bool,
 {
     fn run(&self, bag: Vec<Entry<E>>) -> Resolution<E> {
         let mut by_key: BTreeMap<u64, Vec<&Entry<E>>> = BTreeMap::new();
         for e in &bag {
-            by_key.entry((self.key)(e)).or_default().push(e);
+            if let Some(k) = (self.key)(e) {
+                by_key.entry(k).or_default().push(e);
+            }
         }
         let mut matched: Vec<Vec<Id>> = Vec::new();
         for (_k, ents) in by_key {
@@ -560,11 +643,12 @@ where
     }
 }
 
-/// Bucket entries by `key`; keep each bucket the `accept` closure approves
-/// (typically "nets to ~0 on some lane"). Rejected buckets dissolve to residual.
+/// Bucket entries by `key` (return `None` to opt an entry out, as in
+/// [`exact_1to1`]); keep each bucket the `accept` closure approves (typically
+/// "nets to ~0 on some lane"). Rejected buckets dissolve to residual.
 pub fn agg_net<E: 'static, FK, FP>(key: FK, accept: FP) -> Box<dyn Strategy<E>>
 where
-    FK: Fn(&Entry<E>) -> u64 + 'static,
+    FK: Fn(&Entry<E>) -> Option<u64> + 'static,
     FP: Fn(&GroupView<E>) -> bool + 'static,
 {
     Box::new(AggNet {
@@ -691,35 +775,35 @@ where
     FA: Fn(&Entry<E>) -> i64,
 {
     fn run(&self, bag: Vec<Entry<E>>) -> Resolution<E> {
-        // Atomic many-to-one clearing: for each positive anchor (descending,
-        // seeded tie-break), find a subset of still-free negatives summing to
-        // within `band` of the anchor. Bounded DFS (max_group small).
+        // Atomic clearing in BOTH directions: the largest-magnitude lot (either
+        // sign) anchors and draws a subset of still-free OPPOSITE-sign lots
+        // summing to within `band` of it. Each anchor sees the whole free
+        // opposite-sign pool (no positional window); only lots already
+        // committed to an earlier, larger anchor are off-limits. Bounded DFS.
         let mut used: HashSet<Id> = HashSet::new();
-        let mut anchors: Vec<&Entry<E>> = bag.iter().filter(|e| (self.amount)(e) > 0).collect();
+        let mut anchors: Vec<&Entry<E>> = bag.iter().filter(|e| (self.amount)(e) != 0).collect();
         anchors.sort_by(|a, b| {
             (self.amount)(b)
-                .cmp(&(self.amount)(a))
+                .abs()
+                .cmp(&(self.amount)(a).abs())
                 .then(tie(a.id, self.seed).cmp(&tie(b.id, self.seed)))
         });
-        let negs: Vec<(&Entry<E>, i64)> = bag
-            .iter()
-            .filter(|e| (self.amount)(e) < 0)
-            .map(|e| (e, -(self.amount)(e)))
-            .collect();
         let mut matched: Vec<Vec<Id>> = Vec::new();
         for anchor in anchors {
             if used.contains(&anchor.id) {
                 continue;
             }
-            let target = (self.amount)(anchor);
-            let mut pool: Vec<(Id, i64)> = negs
+            let a = (self.amount)(anchor);
+            let opp = -a.signum();
+            let target = a.abs();
+            let mut pool: Vec<(Id, i64)> = bag
                 .iter()
-                .filter(|(e, _)| !used.contains(&e.id))
-                .map(|(e, v)| (e.id, *v))
+                .filter(|e| !used.contains(&e.id) && (self.amount)(e).signum() == opp)
+                .map(|e| (e.id, (self.amount)(e).abs()))
                 .collect();
-            pool.sort_by(|a, b| {
-                b.1.cmp(&a.1)
-                    .then(tie(a.0, self.seed).cmp(&tie(b.0, self.seed)))
+            pool.sort_by(|x, y| {
+                y.1.cmp(&x.1)
+                    .then(tie(x.0, self.seed).cmp(&tie(y.0, self.seed)))
             });
             if let Some(subset) = subset_search(&pool, target, self.band, self.max_group) {
                 used.insert(anchor.id);
@@ -777,10 +861,11 @@ fn subset_search(pool: &[(Id, i64)], target: i64, band: i64, max_group: usize) -
     }
 }
 
-/// Atomic whole-lot many-to-one clearing: each positive anchor draws a subset of
-/// negatives summing within `band`. `band` is a *search* parameter (candidate
-/// pruning), not an acceptance test — gate precisely with a downstream
-/// [`accept_if`]. Seeded and reproducible.
+/// Atomic whole-lot clearing in **both directions**: the largest-magnitude lot
+/// (either sign) anchors and draws a subset of opposite-sign lots summing within
+/// `band`; each anchor sees the entire free opposite-sign pool. `band` is a
+/// *search* parameter (candidate pruning), not an acceptance test — gate
+/// precisely with a downstream [`accept_if`]. Seeded and reproducible.
 pub fn subset_sum<E: 'static, FA>(
     amount: FA,
     band: i64,
