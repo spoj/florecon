@@ -1,9 +1,0 @@
-[project]
-name = "starter-app"
-version = "0.1.0"
-description = "Run the starter-plugin wasm on real data, in Python."
-requires-python = ">=3.10"
-dependencies = [
-    "florecon-host",
-    "polars",
-]

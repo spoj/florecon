@@ -1,185 +1,64 @@
 # florecon
 
-florecon reconciles financial ledgers as a **conserving strategy algebra** over a
-network-simplex core. You compose a matching strategy from small combinators, run
-it over a bag of rows, and get back groups plus the signed amount each row
-contributes to each group. Nothing is created and nothing is lost: what goes in
-equals the grouped allocations plus the leftovers, *by construction* — so a bad
-strategy yields a bad proposal, never a broken ledger.
-
-It is a Rust crate. A domain is packaged as one self-describing WebAssembly
-plugin via the authoring SDK; hosts stay dumb columnar-table carriers.
-
-Money is `i64` **minor units** (cents), so netting is exact.
-
-## The algebra
-
-A `Strategy` maps a bag of `Item`s to `(groups, residual)`. **Leaves** form
-groups; **combinators** arrange leaves. Every node conserves signed amount.
-
-Leaves:
-
-- `exact_1to1` — pair a row with an equal-and-opposite row sharing a key.
-- `agg_net` — accept a bucket (by a key) that nets to zero, gated by an
-  acceptance closure over the bucket.
-- `signal_group` — group rows sharing a free-text token that net to zero.
-- `cumulative` — close ordered running-balance clearing segments.
-- `subset_sum` — atomic many-to-one clearing by value search.
-- `flow` — a min-cost-flow arbiter (the [`engine`]): pairs opposite-sign rows by
-  proximity in an ordering and a cost model, splitting a row across
-  counterparties when needed. The domain is described by a `FlowSpec` of
-  closures (penalty, window, block key, match keys, pair cost).
-- `soak` — sweep leftovers into one variance/write-off group (shape it with
-  `partition_by`, filter it with `when`).
-
-Combinators:
-
-- `seq` — run steps in order; each sees only the previous step's leftovers.
-- `accept_if` — gate an inner strategy's groups by a closure over a `GroupView`
-  (legs + each row's `original` + payload); rejected groups dissolve back to
-  residual. The one acceptance/materiality concept — there is no tolerance type.
-- `reclaim` — make a discovered grouping whole-line (reclaim ground tails);
-  pair with `accept_if` for the classic N:M tolerance match.
-- `coalesce` — fuse interlocking groups into settlement clusters.
-- `partition_by` — shard by a key (over the whole `Item`) and run a sub-strategy
-  per shard (e.g. per company pair, per currency).
-- `when` / `identity` — route rows through a guarded sub-strategy, else pass on.
-- `windowed` — restrict matching to a sliding window over an ordering.
-- `pivot` — run a sub-strategy in a different amount lane, translating back.
-- `fixed_point` — repeat a sub-strategy on its own leftovers until it converges.
-
-Predicates, keys, costs and orders are **plain Rust closures**, not a serialized
-expression language.
+**Reconciliation as partitioning.** Given a bag of entries (each a stable id
+plus an opaque payload), parse it into a list of groups. That is the whole
+problem.
 
 ```rust
 use florecon::strategy::*;
 
-// Per company-pair, per currency: net clean buckets, pair exacts, bridge on
-// references, then let the flow engine arbitrate the remainder.
-let strategy = partition_by(|t: &Item<Tx>| t.data.pair, |_| {
-    partition_by(|t: &Item<Tx>| t.data.ccy, |_| {
-        seq(vec![
-            agg_net(|t: &Item<Tx>| t.data.account, |g| g.net().abs() <= 100),
-            exact_1to1(|_: &Item<Tx>| Some(0)),
-            signal_group(|t: &Item<Tx>| t.data.tokens.clone(), |g| g.net() == 0, 256),
-            flow(FlowSpec::new()
-                .window(30)
-                .penalty(1000.0)
-                .block_key(|t: &Tx| t.day)
-                .cost(|a: &Tx, b: &Tx| Some(1.0 + (a.day - b.day).abs() as f64))),
-        ])
-    })
-});
+#[derive(Clone)]
+struct Tx { amount: i64, day: i64, account: u64 }
+
+let strategy = seq(vec![
+    // clean opposite-and-equal pairs sharing an account
+    exact_1to1(|e: &Entry<Tx>| Some(e.account), |e| e.amount),
+    // buckets that net to within 5 (the tolerance is just an inline closure)
+    agg_net(|e: &Entry<Tx>| e.account, |g| g.net(|e| e.amount).abs() <= 5),
+    // the min-cost-flow arbiter on what's left, emitting whole-row clusters
+    flow(FlowSpec::new()
+        .amount(|t: &Tx| t.amount)
+        .penalty(1000.0)
+        .window(7)
+        .block_key(|t: &Tx| t.day)
+        .cost(|a: &Tx, b: &Tx| Some(1.0 + (a.day - b.day).abs() as f64))),
+]);
 ```
 
-## The workspace
+## The model
 
-[`Recon`] is the stateful facade: stream rows in, solve, sign off what you trust.
-A group lives on two orthogonal axes — a **lifecycle** (`Proposed`, owned by the
-solver and recomputed each solve, vs `Pinned`, a human decision kept verbatim)
-and a provenance label. The operations decompose into four orthogonal families:
+- **`Entry<E> { id, data }`** — a stable `Id` and an opaque payload. Derefs to
+  the payload, so `|e| e.amount` reaches a field while `e.id` names identity.
+- **`Group { members: Vec<Id>, origin, reason }`** — a set of *whole* entries.
+- **`Strategy<E>: bag -> (groups, residual)`** — a pure function. The output is a
+  partition: every input id lands in exactly one group or in residual.
 
-```text
-ledger      upsert(id, item) · remove(&ids)
-machine     solve()
-lifecycle   pin(id) · pin_where(pred) · unpin(id)
-partition   merge(allocs, label, reason) · detach(id, ids) · dissolve(id)
+There is **no privileged numeraire**. Every number a leaf needs — an amount to
+net, a value to search, a flow supply — is a closure over the payload. So:
+
+- multi-currency is just different closures (`agg_net(key, |g| g.net(|e| e.usd) == 0)`);
+- there is no `pivot`, no `original`, no fractional allocation;
+- a match is judged by an **acceptance closure** over a `GroupView`
+  (`|g| g.net(|e| e.amount).abs() <= 5 * g.min_leg(|e| e.amount) / 10_000`) —
+  no tolerance type, the author writes the inequality and picks the lane.
+
+Conservation is **identity**, not arithmetic: nothing lost, nothing invented.
+
+## The surface
+
+```
+combinators  seq  partition_by  when  windowed  fixed_point  accept_if  labeled  identity  soak
+leaves       exact_1to1  agg_net  signal_group  cumulative  subset_sum  flow(FlowSpec)
 ```
 
-`solve` recomputes the proposed pool from `items − pinned mass`; pinned groups
-keep stable ids. `merge` asserts a pinned group over exact allocation amounts
-(atomic). `pin_where(pred)` is the one bulk-pin primitive — "pin every clean
-match", "pin these singletons", and more are just predicates. Conservation is
-verified at the solve boundary.
+`flow` keeps using min-cost flow internally (the [`netsimplex`](netsimplex/)
+crate — a standalone network-simplex transportation solver) to *discover* the
+optimal matching, but reads it back as **whole-row connected-component
+clusters** — a row is never split. The break, if any, is just the cluster's net,
+which a downstream `accept_if` can gate.
 
-## The result
+## Workspace
 
-`report()` returns an allocation **hypergraph**:
-
-- `groups` — `group_id`, `status` (`live`/`frozen`), `net`, `size`, `origin`,
-  `reason`.
-- `allocations` — one row's signed contribution to one group: `id`, `group_id`,
-  `amount`.
-
-A row may contribute to several groups, so the allocations are the source of
-truth and a single row-to-group assignment is a projection you choose:
-`Report::strict_assignments` (refuses split rows) or `connected_components`
-(settlement clusters).
-
-## Authoring a plugin
-
-Implement [`sdk::Plugin`] — declare the raw input columns, the stable row id, the
-projection to a typed row, the conserved numeraire, and the strategy — then
-`export_plugin!` emits a self-describing wasm module. The declared schema is
-**enforced** at ingest: a missing or mistyped column fails loudly, and a
-`RowView` access to an undeclared column panics rather than silently reading
-zero. The conformance kit (`sdk::conformance::assert_conformance`) mechanically
-proves identity/derivation/warm-start integrity from one Arrow batch.
-
-Authoring is meant to be LLM-assisted Rust: the closures *are* the strategy
-language (full expressivity, and the compiler is your correctness oracle), so
-there is no separate DSL. You never clone this repo — the author CLI ships with
-the host, so from your own data project:
-
-```bash
-uv add florecon-host        # (or: pip install florecon-host)
-florecon new my-recon       # scaffold a plugin (crates.io dep, domain = my-recon)
-cd my-recon
-```
-
-The journey then has two phases:
-
-1. **Author (Rust only, fast).** Iterate the strategy natively against a CSV
-   sample — no wasm, no Python. The expensive solver lives in the `florecon`
-   dependency (built once at `-O3`, then cached), so your strategy recompiles in
-   under a second and runs at near-release speed:
-
-   ```bash
-   florecon author          # build + run the strategy once on data/sample.csv
-   florecon check           # type-check only (fastest feedback)
-   ```
-
-   Edit the four marked spots in `solver/src/lib.rs`, re-run, read the report and
-   the conservation line. Repeat.
-
-2. **Ship + consume (wasm + Python).** When the strategy fits, build the
-   production wasm and run it where the data already lives:
-
-   ```bash
-   florecon ship            # the perf-tuned solver.wasm
-   cd app && uv run python run.py
-   ```
-
-`florecon author` / `ship` / `check` are thin, cross-platform `cargo` wrappers
-(they need a Rust toolchain). The worked starter — the exact thing `florecon new`
-scaffolds — is [`examples/starter-plugin`](examples/starter-plugin) (its README
-walks the full path); `plugins/interco` is the larger real example (intercompany
-reconciliation).
-
-## Developing florecon itself
-
-```bash
-cargo test --workspace --features sdk      # lib + plugin + doctests
-cargo clippy --workspace --all-targets --features sdk -- -D warnings
-just build-wasm                            # interco plugin -> wasm, staged into hosts/python/
-just smoke-py                              # drive that wasm through the generic Python host
-just golden-check                          # the cross-language wire contract (Rust + Python)
-just starter                               # build + run the author starter (kept honest by CI)
-python scripts/sync-template.py            # refresh the host-bundled copy of that starter
-```
-
-The author CLI (`florecon._cli`) lives in `hosts/python`; the starter it ships
-is bundled from `examples/starter-plugin` by `scripts/sync-template.py` (CI runs
-it with `--check`). The `engine::Snapshot` (behind the `serde` feature) persists
-a warm basis.
-
-## Design docs
-
-- `docs/arch/strategy-surface.md` — the algebra.
-- `docs/arch/recon-surface.md` — the workspace surface.
-- `docs/arch/sdk-surface.md` — the plugin SDK and wire.
-- `docs/arch/plugin-sdk.md` — the original architecture shift (historical).
-
-[`Recon`]: https://docs.rs/florecon
-[`engine`]: https://docs.rs/florecon
-[`sdk::Plugin`]: https://docs.rs/florecon
+- **`florecon`** — the strategy algebra (this crate).
+- **`netsimplex`** — the domain-agnostic min-cost transportation solver behind
+  `flow`.
