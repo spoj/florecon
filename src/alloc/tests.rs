@@ -91,11 +91,19 @@ fn scenario_support_chain_to_cost_object() {
     let it_usage = Measure::build(&["recipient"], &[(&[("recipient", recipient_biza)], 1)]);
     let fin_usage = Measure::build(&["recipient"], &[(&[("recipient", recipient_biza)], 1)]);
 
-    let support = it.allocate(&it_usage).combine(&fin.allocate(&fin_usage), |a, b| a + b);
-    assert_eq!(support.get(&Key::of(&[("recipient", recipient_biza)])), 1500);
+    let support = it
+        .allocate(&it_usage)
+        .combine(&fin.allocate(&fin_usage), |a, b| a + b);
+    assert_eq!(
+        support.get(&Key::of(&[("recipient", recipient_biza)])),
+        1500
+    );
 
     let biza = support.marginalize(&[]); // collapse recipient -> scalar 1500
-    let sales = Measure::build(&["customer", "product"], &[(&[("customer", 1), ("product", 10)], 1)]);
+    let sales = Measure::build(
+        &["customer", "product"],
+        &[(&[("customer", 1), ("product", 10)], 1)],
+    );
     let out = biza.allocate(&sales);
     assert_eq!(out.total(), 1500);
     assert_eq!(cell(&out, &[("customer", 1), ("product", 10)]), 1500);
@@ -108,10 +116,22 @@ fn scenario_slice_warehouse_for_driver_and_pool() {
     let cube = Measure::build(
         &["metric", "year", "geog", "product"],
         &[
-            (&[("metric", 1), ("year", 2024), ("geog", 1), ("product", 10)], 30),
-            (&[("metric", 1), ("year", 2024), ("geog", 1), ("product", 11)], 70),
-            (&[("metric", 1), ("year", 2023), ("geog", 1), ("product", 10)], 999), // other year
-            (&[("metric", 2), ("year", 2024), ("geog", 1), ("product", ANY)], 1000), // rent
+            (
+                &[("metric", 1), ("year", 2024), ("geog", 1), ("product", 10)],
+                30,
+            ),
+            (
+                &[("metric", 1), ("year", 2024), ("geog", 1), ("product", 11)],
+                70,
+            ),
+            (
+                &[("metric", 1), ("year", 2023), ("geog", 1), ("product", 10)],
+                999,
+            ), // other year
+            (
+                &[("metric", 2), ("year", 2024), ("geog", 1), ("product", ANY)],
+                1000,
+            ), // rent
         ],
     );
 
@@ -119,7 +139,9 @@ fn scenario_slice_warehouse_for_driver_and_pool() {
     assert_eq!(*rev.axes(), ["geog", "product"].into_iter().collect());
     assert_eq!(rev.total(), 100); // 2023 excluded
 
-    let rent = cube.slice(&[("metric", 2), ("year", 2024)]).marginalize(&["geog"]);
+    let rent = cube
+        .slice(&[("metric", 2), ("year", 2024)])
+        .marginalize(&["geog"]);
     assert_eq!(rent.total(), 1000);
 
     let out = rent.allocate(&rev);
@@ -133,8 +155,14 @@ fn scenario_reciprocal_services_then_to_cost_object() {
     // finance and IT support each other AND business team A; A sells (cust 1, prod X).
     let (fin0, it0) = (300i128, 300i128); // primary costs
     // recipients: finance=1, it=2, bizA=3
-    let fin_usage = Measure::build(&["recipient"], &[(&[("recipient", 2)], 1), (&[("recipient", 3)], 1)]);
-    let it_usage = Measure::build(&["recipient"], &[(&[("recipient", 1)], 1), (&[("recipient", 3)], 1)]);
+    let fin_usage = Measure::build(
+        &["recipient"],
+        &[(&[("recipient", 2)], 1), (&[("recipient", 3)], 1)],
+    );
+    let it_usage = Measure::build(
+        &["recipient"],
+        &[(&[("recipient", 1)], 1), (&[("recipient", 3)], 1)],
+    );
     let send = |amt: Money, usage: &Measure| Measure::build(&[], &[(&[], amt)]).allocate(usage);
 
     let settle = |s: &(Money, Money)| {
@@ -151,7 +179,10 @@ fn scenario_reciprocal_services_then_to_cost_object() {
     assert_eq!(biza_in, fin0 + it0); // inter-service flows cancel -> 600
 
     let biza = Measure::build(&[], &[(&[], biza_in)]);
-    let sales = Measure::build(&["customer", "product"], &[(&[("customer", 1), ("product", 10)], 1)]);
+    let sales = Measure::build(
+        &["customer", "product"],
+        &[(&[("customer", 1), ("product", 10)], 1)],
+    );
     let out = biza.allocate(&sales);
     assert_eq!(out.total(), 600);
     assert_eq!(cell(&out, &[("customer", 1), ("product", 10)]), 600);
@@ -169,24 +200,46 @@ fn scenario_budget_completed_from_actual_shape() {
     );
     let budget = Measure::build(
         &["customer"],
-        &[(&[("customer", 1)], 1000), (&[("customer", 2)], 500), (&[("customer", 3)], 300)],
+        &[
+            (&[("customer", 1)], 1000),
+            (&[("customer", 2)], 500),
+            (&[("customer", 3)], 300),
+        ],
     );
 
     let b = budget.allocate(&actual);
     assert_eq!(b.total(), 1800);
-    assert_eq!(cell(&b, &[("customer", 1), ("product", 10), ("geog", 1)]), 600);
-    assert_eq!(cell(&b, &[("customer", 1), ("product", 11), ("geog", 1)]), 400);
-    assert_eq!(cell(&b, &[("customer", 2), ("product", 10), ("geog", 2)]), 500);
+    assert_eq!(
+        cell(&b, &[("customer", 1), ("product", 10), ("geog", 1)]),
+        600
+    );
+    assert_eq!(
+        cell(&b, &[("customer", 1), ("product", 11), ("geog", 1)]),
+        400
+    );
+    assert_eq!(
+        cell(&b, &[("customer", 2), ("product", 10), ("geog", 2)]),
+        500
+    );
     assert_eq!(b.pending().total(), 300); // new customer parks on ANY/ANY
-    assert_eq!(cell(&b, &[("customer", 3), ("product", ANY), ("geog", ANY)]), 300);
+    assert_eq!(
+        cell(&b, &[("customer", 3), ("product", ANY), ("geog", ANY)]),
+        300
+    );
 
     let mix_p = actual.marginalize(&["product"]); // p10=160, p11=40
     let mix_g = actual.marginalize(&["geog"]); // g1=100, g2=100
     let done = b.rake("product", &mix_p).rake("geog", &mix_g);
     assert_eq!(done.total(), 1800);
     assert!(done.pending().is_empty());
-    assert_eq!(cell(&done, &[("customer", 3), ("product", 10), ("geog", 1)]), 120);
-    assert_eq!(cell(&done, &[("customer", 3), ("product", 11), ("geog", 2)]), 30);
+    assert_eq!(
+        cell(&done, &[("customer", 3), ("product", 10), ("geog", 1)]),
+        120
+    );
+    assert_eq!(
+        cell(&done, &[("customer", 3), ("product", 11), ("geog", 2)]),
+        30
+    );
 }
 
 #[test]
@@ -212,8 +265,14 @@ fn scenario_rent_completed_by_revenue() {
     let mix_p = rev.marginalize(&["product"]); // p10=30, p11=70
     let done = a.rake("product", &mix_p);
     assert!(done.pending().is_empty());
-    assert_eq!(cell(&done, &[("geog", 2), ("product", 10), ("time", 1)]), 150);
-    assert_eq!(cell(&done, &[("geog", 2), ("product", 11), ("time", 1)]), 350);
+    assert_eq!(
+        cell(&done, &[("geog", 2), ("product", 10), ("time", 1)]),
+        150
+    );
+    assert_eq!(
+        cell(&done, &[("geog", 2), ("product", 11), ("time", 1)]),
+        350
+    );
 }
 
 #[test]
@@ -227,11 +286,17 @@ fn group_by_routes_per_company_and_recombines() {
     );
     let headcount = Measure::build(
         &["company", "dept"],
-        &[(&[("company", 1), ("dept", 10)], 1), (&[("company", 1), ("dept", 11)], 2)],
+        &[
+            (&[("company", 1), ("dept", 10)], 1),
+            (&[("company", 1), ("dept", 11)], 2),
+        ],
     );
     let floor = Measure::build(
         &["company", "dept"],
-        &[(&[("company", 2), ("dept", 10)], 3), (&[("company", 2), ("dept", 11)], 1)],
+        &[
+            (&[("company", 2), ("dept", 10)], 3),
+            (&[("company", 2), ("dept", 11)], 1),
+        ],
     );
 
     let out = cost.group_by("company", |co, sub| match co {
@@ -240,8 +305,14 @@ fn group_by_routes_per_company_and_recombines() {
     });
 
     assert_eq!(out.total(), 1300);
-    assert_eq!(cell(&out, &[("company", 1), ("dept", 11), ("time", 1)]), 600);
-    assert_eq!(cell(&out, &[("company", 2), ("dept", 10), ("time", 1)]), 300);
+    assert_eq!(
+        cell(&out, &[("company", 1), ("dept", 11), ("time", 1)]),
+        600
+    );
+    assert_eq!(
+        cell(&out, &[("company", 2), ("dept", 10), ("time", 1)]),
+        300
+    );
 }
 
 #[test]
@@ -277,8 +348,14 @@ fn vacuum_coarsens_least_strict_dims_first() {
     );
     let v = m.vacuum(10, &["customer", "product"]);
     assert_eq!(v.total(), 103);
-    assert_eq!(cell(&v, &[("time", 1), ("product", 10), ("customer", 100)]), 100);
-    assert_eq!(cell(&v, &[("time", 1), ("product", ANY), ("customer", ANY)]), 3);
+    assert_eq!(
+        cell(&v, &[("time", 1), ("product", 10), ("customer", 100)]),
+        100
+    );
+    assert_eq!(
+        cell(&v, &[("time", 1), ("product", ANY), ("customer", ANY)]),
+        3
+    );
     assert!(v.cells().all(|(k, _)| k.get("time") != Some(ANY))); // time protected
 }
 
@@ -315,10 +392,56 @@ fn combine_select_partition() {
 
 #[test]
 fn largest_remainder_exact_and_negative() {
-    let k = [Key::of(&[("a", 0)]), Key::of(&[("a", 1)]), Key::of(&[("a", 2)])];
+    let k = [
+        Key::of(&[("a", 0)]),
+        Key::of(&[("a", 1)]),
+        Key::of(&[("a", 2)]),
+    ];
     let keys: Vec<&Key> = k.iter().collect();
-    assert_eq!(largest_remainder(100, &[1, 1, 1], 3, &keys), vec![34, 33, 33]);
-    assert_eq!(largest_remainder(-100, &[1, 1, 1], 3, &keys).iter().sum::<Money>(), -100);
+    assert_eq!(
+        largest_remainder(100, &[1, 1, 1], 3, &keys),
+        vec![34, 33, 33]
+    );
+    assert_eq!(
+        largest_remainder(-100, &[1, 1, 1], 3, &keys)
+            .iter()
+            .sum::<Money>(),
+        -100
+    );
+}
+
+#[test]
+fn derive_a_mapping_from_data_then_allocate_through_it() {
+    // a mapping between two grains IS a Measure over (from, to); `allocate`
+    // applies it. Here we DERIVE a channel->product coupling from last year's
+    // revenue (the data), then REUSE it to push this year's channel-level
+    // marketing spend down to products.
+    let last_year = Measure::build(
+        &["channel", "product", "month"],
+        &[
+            (&[("channel", 1), ("product", 10), ("month", 1)], 30),
+            (&[("channel", 1), ("product", 11), ("month", 1)], 10),
+            (&[("channel", 1), ("product", 10), ("month", 2)], 30),
+            (&[("channel", 2), ("product", 11), ("month", 1)], 50),
+        ],
+    );
+
+    // derive the common mapping: collapse to the (channel, product) coupling.
+    let mapping = last_year.marginalize(&["channel", "product"]);
+    assert_eq!(cell(&mapping, &[("channel", 1), ("product", 10)]), 60);
+    assert_eq!(cell(&mapping, &[("channel", 1), ("product", 11)]), 10);
+    assert_eq!(cell(&mapping, &[("channel", 2), ("product", 11)]), 50);
+
+    // apply it: this year's spend is only by channel.
+    let spend = Measure::build(
+        &["channel"],
+        &[(&[("channel", 1)], 700), (&[("channel", 2)], 200)],
+    );
+    let by_product = spend.allocate(&mapping);
+    assert_eq!(by_product.total(), 900);
+    assert_eq!(cell(&by_product, &[("channel", 1), ("product", 10)]), 600); // 700 * 60/70
+    assert_eq!(cell(&by_product, &[("channel", 1), ("product", 11)]), 100); // 700 * 10/70
+    assert_eq!(cell(&by_product, &[("channel", 2), ("product", 11)]), 200);
 }
 
 #[test]
@@ -360,7 +483,8 @@ fn ipf_fits_full_cube_to_two_marginal_budgets() {
     );
 
     let step = |x: &Measure| target_bc.allocate(&target_ab.allocate(x));
-    let same = |a: &Measure, b: &Measure| a.len() == b.len() && a.cells().all(|(k, v)| b.get(k) == v);
+    let same =
+        |a: &Measure, b: &Measure| a.len() == b.len() && a.cells().all(|(k, v)| b.get(k) == v);
     let fitted = fixed_point(seed, step, same, 50);
 
     assert_eq!(fitted.total(), 100);

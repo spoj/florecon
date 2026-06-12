@@ -100,7 +100,12 @@ impl Key {
     }
 
     fn project_set(&self, axes: &BTreeSet<Axis>) -> Key {
-        Key(self.0.iter().copied().filter(|(a, _)| axes.contains(a)).collect())
+        Key(self
+            .0
+            .iter()
+            .copied()
+            .filter(|(a, _)| axes.contains(a))
+            .collect())
     }
 
     fn merge(&self, other: &Key) -> Key {
@@ -134,7 +139,10 @@ pub struct Measure {
 impl Measure {
     /// An empty measure over `axes` (axes also grow as cells are added).
     pub fn with_axes(axes: BTreeSet<Axis>) -> Measure {
-        Measure { axes, cells: HashMap::new() }
+        Measure {
+            axes,
+            cells: HashMap::new(),
+        }
     }
 
     /// Declare axes, then a list of `(coords, value)`.
@@ -329,7 +337,12 @@ impl Measure {
     pub fn slice(&self, at: &[(Axis, Coord)]) -> Measure {
         let at = at.to_vec();
         let drop: BTreeSet<Axis> = at.iter().map(|(a, _)| *a).collect();
-        let keep: Vec<Axis> = self.axes.iter().copied().filter(|a| !drop.contains(a)).collect();
+        let keep: Vec<Axis> = self
+            .axes
+            .iter()
+            .copied()
+            .filter(|a| !drop.contains(a))
+            .collect();
         self.select(move |k, _| at.iter().all(|&(a, c)| k.get(a) == Some(c)))
             .marginalize(&keep)
     }
@@ -396,7 +409,9 @@ impl Measure {
     fn bucket(&self, shared: &BTreeSet<Axis>) -> HashMap<Key, Vec<(Key, Money)>> {
         let mut m: HashMap<Key, Vec<(Key, Money)>> = HashMap::new();
         for (k, v) in &self.cells {
-            m.entry(k.project_set(shared)).or_default().push((k.clone(), *v));
+            m.entry(k.project_set(shared))
+                .or_default()
+                .push((k.clone(), *v));
         }
         m
     }
@@ -411,7 +426,9 @@ fn largest_remainder(amt: Money, weights: &[Money], wtotal: i128, keys: &[&Key])
     let mut rem = vec![0i128; n];
     let mut sum_base = 0i128;
     for i in 0..n {
-        let num = amt.checked_mul(weights[i]).expect("allocate: weight*amount overflow");
+        let num = amt
+            .checked_mul(weights[i])
+            .expect("allocate: weight*amount overflow");
         base[i] = num.div_euclid(wtotal);
         rem[i] = num.rem_euclid(wtotal);
         sum_base += base[i];
